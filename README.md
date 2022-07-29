@@ -24,7 +24,7 @@ you should probably review the code before letting it loose on your backups.
 In addition, the following Borg features are not compatible:
 
 - Repositories touched with Borg 2.x
-- Encryption (except repokey)
+- Encryption (except repokey, and you need to edit the config to remove the newlines from the key there)
 - Accessing a repository remotely (unless you sshfs it)
 
 ## Usage
