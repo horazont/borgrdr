@@ -24,7 +24,6 @@ you should probably review the code before letting it loose on your backups.
 In addition, the following Borg features are not compatible:
 
 - Repositories touched with Borg 2.x
-- Any compression except lz4
 - Encryption (except repokey)
 - Accessing a repository remotely (unless you sshfs it)
 

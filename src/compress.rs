@@ -97,6 +97,126 @@ impl Compressor for Lz4 {
 	}
 }
 
+pub struct Lzma();
+
+impl Lzma {
+	fn check(header: &[u8]) -> bool {
+		if header.len() < 2 {
+			return false;
+		}
+		header[0] == 0x02 && header[1] == 0x00
+	}
+
+	fn detect(header: &[u8]) -> Option<Self> {
+		if Self::check(header) {
+			Some(Self())
+		} else {
+			None
+		}
+	}
+}
+
+impl Compressor for Lzma {
+	fn decompress(&self, src: &[u8]) -> io::Result<Vec<u8>> {
+		if !Self::check(src) {
+			return Err(io::Error::new(
+				io::ErrorKind::InvalidData,
+				"missing \\x02\\x00 leader for lzma compressed data",
+			));
+		}
+		// strip off id bytes
+		let src = &src[2..];
+		lzma::decompress(&src[..]).map_err(|x| io::Error::new(io::ErrorKind::InvalidData, x))
+	}
+}
+
+pub struct Zlib();
+
+impl Zlib {
+	fn check(header: &[u8]) -> bool {
+		if header.len() < 2 {
+			return false;
+		}
+		let cmf = header[0];
+		let flg = header[1];
+		let is_deflate = cmf & 0x0f == 8;
+		let check_ok = (cmf as u16 * 256u16 + flg as u16) % 31 == 0;
+		check_ok && is_deflate
+	}
+
+	fn detect(header: &[u8]) -> Option<Self> {
+		if Self::check(header) {
+			Some(Self())
+		} else {
+			None
+		}
+	}
+}
+
+impl Compressor for Zlib {
+	fn decompress(&self, src: &[u8]) -> io::Result<Vec<u8>> {
+		let mut decompressor = flate2::Decompress::new(true);
+		let mut buffer = Vec::with_capacity(BUFFER_GUESS);
+		loop {
+			let cur_slice = &src[decompressor.total_in() as usize..];
+			match decompressor.decompress_vec(
+				cur_slice,
+				&mut buffer,
+				flate2::FlushDecompress::Finish,
+			) {
+				Ok(flate2::Status::StreamEnd) => {
+					buffer.shrink_to_fit();
+					return Ok(buffer);
+				}
+				Ok(flate2::Status::Ok) | Ok(flate2::Status::BufError) => {
+					if buffer.capacity() >= MAX_OBJECT_SIZE {
+						return Err(io::Error::new(
+							io::ErrorKind::InvalidData,
+							"zlib output too large",
+						));
+					}
+					buffer.reserve(buffer.len());
+				}
+				Err(e) => return Err(io::Error::new(io::ErrorKind::InvalidData, e)),
+			}
+		}
+	}
+}
+
+pub struct Zstd();
+
+impl Zstd {
+	fn check(header: &[u8]) -> bool {
+		if header.len() < 2 {
+			return false;
+		}
+		header[0] == 0x03 && header[1] == 0x00
+	}
+
+	fn detect(header: &[u8]) -> Option<Self> {
+		if Self::check(header) {
+			Some(Self())
+		} else {
+			None
+		}
+	}
+}
+
+impl Compressor for Zstd {
+	fn decompress(&self, src: &[u8]) -> io::Result<Vec<u8>> {
+		if !Self::check(src) {
+			return Err(io::Error::new(
+				io::ErrorKind::InvalidData,
+				"missing \\x02\\x00 leader for lzma compressed data",
+			));
+		}
+		// strip off id bytes
+		let src = &src[2..];
+		zstd::stream::decode_all(&src[..])
+			.map_err(|x| io::Error::new(io::ErrorKind::InvalidData, x))
+	}
+}
+
 macro_rules! try_compressor {
 	($data:ident, $x:ty) => {
 		if let Some(c) = <$x>::detect($data) {
@@ -107,6 +227,9 @@ macro_rules! try_compressor {
 
 pub fn detect_compression(data: &[u8]) -> Option<Box<dyn Compressor>> {
 	try_compressor!(data, Lz4);
+	try_compressor!(data, Lzma);
 	try_compressor!(data, Uncompressed);
+	try_compressor!(data, Zstd);
+	try_compressor!(data, Zlib);
 	None
 }
