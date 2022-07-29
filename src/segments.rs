@@ -12,7 +12,7 @@ use byteorder::{ByteOrder, LittleEndian};
 use num_enum::{IntoPrimitive, TryFromPrimitive};
 
 #[serde_as]
-#[derive(Deserialize, Clone, PartialEq, Eq)]
+#[derive(Deserialize, Clone, Copy, PartialEq, Eq)]
 pub struct Id(#[serde_as(as = "Bytes")] pub [u8; 32]);
 
 impl Id {
