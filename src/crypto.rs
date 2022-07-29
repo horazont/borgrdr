@@ -17,7 +17,26 @@ pub enum KeyType {
 pub trait Key {
 	fn decrypt(&self, src: &[u8]) -> Vec<u8>;
 	fn encrypt(&self, src: &[u8]) -> Vec<u8>;
-	fn key_type() -> KeyType;
+}
+
+impl<T: Key> Key for &T {
+	fn decrypt(&self, src: &[u8]) -> Vec<u8> {
+		(**self).decrypt(src)
+	}
+
+	fn encrypt(&self, src: &[u8]) -> Vec<u8> {
+		(**self).encrypt(src)
+	}
+}
+
+impl<T: Key> Key for Box<T> {
+	fn decrypt(&self, src: &[u8]) -> Vec<u8> {
+		(**self).decrypt(src)
+	}
+
+	fn encrypt(&self, src: &[u8]) -> Vec<u8> {
+		(**self).encrypt(src)
+	}
 }
 
 pub trait ContentHasher {
@@ -33,10 +52,6 @@ impl Plaintext {
 }
 
 impl Key for Plaintext {
-	fn key_type() -> KeyType {
-		KeyType::Unencrypted
-	}
-
 	fn decrypt(&self, src: &[u8]) -> Vec<u8> {
 		assert!(src[0] == 0x02);
 		src[1..].to_vec()

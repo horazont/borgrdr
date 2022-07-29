@@ -1,12 +1,14 @@
 use std::env::args;
 
+use borgrdr::fs_store::FsStore;
 use borgrdr::repository::Repository;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
 	let argv: Vec<String> = args().collect();
 
-	let repo = Repository::open(argv[1].clone())?;
-	let manifest = repo.read_manifest()?.unwrap();
+	let store = FsStore::open(argv[1].clone())?;
+	let repo = Repository::open(store)?;
+	let manifest = repo.manifest();
 	println!("Repository manifest:");
 	println!("  Version   : {}", manifest.version());
 	println!("  Timestamp : {}", manifest.timestamp());

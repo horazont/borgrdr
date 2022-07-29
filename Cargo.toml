@@ -16,3 +16,4 @@ lz4 = "^1.23"
 ring = "^0.16"
 serde_with = "^1"
 rmpv = { version = "^1", features = ["with-serde"] }
+bytes = "^1"

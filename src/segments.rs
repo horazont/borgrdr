@@ -21,6 +21,12 @@ impl Id {
 	}
 }
 
+impl AsRef<Id> for Id {
+	fn as_ref(&self) -> &Id {
+		self
+	}
+}
+
 impl fmt::Debug for Id {
 	fn fmt<'f>(&self, f: &'f mut fmt::Formatter) -> fmt::Result {
 		for (i, b) in self.0.iter().enumerate() {
