@@ -1,0 +1,18 @@
+[package]
+name = "borgrdr"
+version = "0.1.0"
+edition = "2021"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[dependencies]
+rmp-serde = "^1.1"
+byteorder = "^1"
+num_enum = "^0.5"
+crc = "^3"
+memmap = "^0.7"
+serde = { version = "*", features = ["derive"] }
+lz4 = "^1.23"
+ring = "^0.16"
+serde_with = "^1"
+rmpv = { version = "^1", features = ["with-serde"] }
