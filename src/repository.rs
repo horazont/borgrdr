@@ -1,19 +1,16 @@
-use std::borrow::Borrow;
-use std::collections::HashMap;
 use std::fs;
-use std::hash::Hash;
 use std::io;
 use std::path::{Path, PathBuf};
 
-use serde::Deserialize;
+use serde::de::DeserializeOwned;
 
 use rmp_serde;
-use rmpv;
 
 use super::compress;
 use super::crypto;
 use super::crypto::Key;
 use super::segments::{Id, Segment, SegmentReader};
+use super::structs::{Archive, Manifest};
 
 pub struct Repository {
 	root: PathBuf,
@@ -52,6 +49,41 @@ impl Repository {
 			}
 		}
 		Ok(None)
+	}
+
+	fn read_raw<K: crypto::Key>(&self, id: &Id, key: &mut K) -> io::Result<Vec<u8>> {
+		let data = match self.get(id)? {
+			Some(v) => v,
+			None => {
+				return Err(io::Error::new(
+					io::ErrorKind::NotFound,
+					format!("object with id {:?} not found in repository", id),
+				))
+			}
+		};
+		let data = key.decrypt(&data[..]);
+		let compressor = match compress::detect_compression(&data[..]) {
+			None => {
+				return Err(io::Error::new(
+					io::ErrorKind::InvalidData,
+					format!("unknown decompressor ({:?})", &data[..2]),
+				))
+			}
+			Some(v) => v,
+		};
+		let data = compressor.decompress(&data[..])?;
+		Ok(data)
+	}
+
+	fn read_object<T: DeserializeOwned>(&self, id: &Id) -> io::Result<T> {
+		let data = self.read_raw(id, &mut crypto::Plaintext::new())?;
+		let item: T = rmp_serde::from_read(&data[..])
+			.map_err(|x| io::Error::new(io::ErrorKind::InvalidData, x))?;
+		Ok(item)
+	}
+
+	pub fn read_archive(&self, id: &Id) -> io::Result<Archive> {
+		self.read_object(id)
 	}
 
 	pub fn read_manifest(&self) -> io::Result<Option<Manifest>> {
@@ -169,59 +201,5 @@ impl<'x> Iterator for ReverseSegmentFileIter<'x> {
 			}
 			None => None,
 		}
-	}
-}
-
-#[derive(Deserialize, Debug)]
-pub struct ManifestArchiveEntry {
-	id: Id,
-	time: String,
-}
-
-impl ManifestArchiveEntry {
-	pub fn id(&self) -> &Id {
-		&self.id
-	}
-
-	pub fn timestamp(&self) -> &str {
-		&self.time
-	}
-}
-
-#[derive(Deserialize, Debug)]
-pub struct Manifest {
-	version: u8,
-	archives: HashMap<String, ManifestArchiveEntry>,
-	timestamp: String,
-	item_keys: Vec<String>,
-	config: HashMap<String, rmpv::Value>,
-}
-
-impl Manifest {
-	pub fn version(&self) -> u8 {
-		self.version
-	}
-
-	pub fn archives(&self) -> &HashMap<String, ManifestArchiveEntry> {
-		&self.archives
-	}
-
-	pub fn archive<K: Hash + Eq>(&self, name: &K) -> Option<&ManifestArchiveEntry>
-	where
-		String: Borrow<K>,
-	{
-		self.archives.get(name)
-	}
-
-	pub fn timestamp(&self) -> &str {
-		&self.timestamp
-	}
-
-	pub fn item_keys(&self) -> &[String] {
-		&self.item_keys
-	}
-
-	pub fn config(&self) -> &HashMap<String, rmpv::Value> {
-		&self.config
 	}
 }

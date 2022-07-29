@@ -14,6 +14,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 	println!("\nArchives:");
 	for (k, v) in manifest.archives().iter() {
 		println!("{}  [{}] id={:?}", k, v.timestamp(), v.id());
+		let archive = repo.read_archive(v.id())?;
+		println!("  Version: {}", archive.version());
+		println!("  Name: {:?}", archive.name());
+		println!("  Hostname: {:?}", archive.hostname());
+		println!("  Username: {:?}", archive.username());
+		println!("  Start time: {:?}", archive.start_time());
+		println!("  End time: {:?}", archive.end_time());
+		println!("  Comment: {:?}", archive.comment());
+		println!("  Items: {:?}", archive.items());
 	}
 	Ok(())
 }
