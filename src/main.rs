@@ -2,7 +2,7 @@ use std::collections::HashMap;
 use std::env::args;
 use std::io;
 
-use chrono::{Utc, TimeZone, DateTime};
+use chrono::{DateTime, TimeZone, Utc};
 
 use borgrdr::fs_store::FsStore;
 use borgrdr::repository::Repository;
@@ -71,7 +71,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 			eprint!(" {:?}", item.path());
 			eprintln!();
 			if archive_matches {
-				let path_matches = file_name.as_ref().map(|x| item.path() == x).unwrap_or(false);
+				let path_matches = file_name
+					.as_ref()
+					.map(|x| item.path() == x)
+					.unwrap_or(false);
 				if path_matches {
 					chunks_to_extract = Some(item.chunks().iter().map(|x| *x.id()).collect());
 				}

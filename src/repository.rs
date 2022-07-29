@@ -3,7 +3,7 @@ use std::io::BufRead;
 
 use serde::de::DeserializeOwned;
 
-use bytes::{Bytes, Buf};
+use bytes::{Buf, Bytes};
 
 use rmp_serde;
 
@@ -12,7 +12,7 @@ use super::crypto;
 use super::crypto::Key;
 use super::segments::Id;
 use super::store::ObjectStore;
-use super::structs::{Archive, Manifest, ArchiveItem};
+use super::structs::{Archive, ArchiveItem, Manifest};
 
 pub trait SecretProvider {
 	fn prompt_secret(&mut self) -> io::Result<Bytes>;
@@ -97,8 +97,11 @@ impl<S: ObjectStore> Repository<S> {
 		}
 	}
 
-	pub fn archive_items<A: AsRef<Id>, I: Iterator<Item = A>>(&self, iter: I) -> ItemIter<'_, S, I> {
-		ItemIter{
+	pub fn archive_items<A: AsRef<Id>, I: Iterator<Item = A>>(
+		&self,
+		iter: I,
+	) -> ItemIter<'_, S, I> {
+		ItemIter {
 			repo: self,
 			stream: self.open_stream(iter),
 			poisoned: false,
@@ -163,7 +166,7 @@ impl<'x, A: AsRef<Id>, S: ObjectStore, I: Iterator<Item = A>> io::BufRead
 						self.curr = None;
 						return Ok(&[]);
 					}
-				}
+				},
 				Some(false) => break,
 			}
 		}
@@ -182,7 +185,7 @@ impl<'x, A: AsRef<Id>, S: ObjectStore, I: Iterator<Item = A>> Iterator for ItemI
 
 	fn next(&mut self) -> Option<Self::Item> {
 		if self.poisoned {
-			return None
+			return None;
 		}
 		match self.stream.fill_buf() {
 			Ok(v) if v.len() == 0 => return None,
@@ -192,7 +195,9 @@ impl<'x, A: AsRef<Id>, S: ObjectStore, I: Iterator<Item = A>> Iterator for ItemI
 			}
 			Ok(_) => (),
 		}
-		match rmp_serde::from_read(&mut self.stream).map_err(|x| io::Error::new(io::ErrorKind::InvalidData, x)) {
+		match rmp_serde::from_read(&mut self.stream)
+			.map_err(|x| io::Error::new(io::ErrorKind::InvalidData, x))
+		{
 			Ok(v) => Some(Ok(v)),
 			Err(e) => {
 				self.poisoned = true;
