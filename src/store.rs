@@ -8,4 +8,5 @@ use super::segments::Id;
 
 pub trait ObjectStore {
 	fn retrieve<K: AsRef<Id>>(&self, id: K) -> io::Result<Bytes>;
+	fn read_config(&self) -> io::Result<Bytes>;
 }

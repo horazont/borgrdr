@@ -25,7 +25,7 @@ In addition, the following Borg features are not compatible:
 
 - Repositories touched with Borg 2.x
 - Any compression except lz4
-- Encryption
+- Encryption (except repokey)
 - Accessing a repository remotely (unless you sshfs it)
 
 ## Usage

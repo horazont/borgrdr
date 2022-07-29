@@ -7,6 +7,8 @@ use bytes::{Buf, Bytes};
 
 use rmp_serde;
 
+use configparser::ini::Ini;
+
 use super::compress;
 use super::crypto;
 use super::crypto::Key;
@@ -14,28 +16,84 @@ use super::segments::Id;
 use super::store::ObjectStore;
 use super::structs::{Archive, ArchiveItem, Manifest};
 
-pub trait SecretProvider {
-	fn prompt_secret(&mut self) -> io::Result<Bytes>;
+pub trait PassphraseProvider {
+	fn prompt_secret(&self) -> io::Result<Bytes>;
+}
+
+pub struct EnvPassphrase(Result<Bytes, (io::ErrorKind, &'static str)>);
+
+impl EnvPassphrase {
+	pub fn new() -> Self {
+		Self(match std::env::var("BORG_PASSPHRASE") {
+			Ok(v) => Ok(v.into_bytes().into()),
+			Err(std::env::VarError::NotPresent) => {
+				Err((io::ErrorKind::NotFound, "BORG_PASSPHRASE is not set"))
+			}
+			Err(std::env::VarError::NotUnicode(_)) => Err((
+				io::ErrorKind::InvalidData,
+				"BORG_PASSPHRASE is not valid unicode (sorry)",
+			)),
+		})
+	}
+}
+
+impl PassphraseProvider for EnvPassphrase {
+	fn prompt_secret(&self) -> io::Result<Bytes> {
+		match self.0.as_ref() {
+			Ok(v) => Ok(v.clone()),
+			Err((kind, msg)) => Err(io::Error::new(*kind, *msg)),
+		}
+	}
+}
+
+struct SecretProvider<'x> {
+	passphrase: &'x Box<dyn PassphraseProvider>,
+	config: &'x Ini,
+}
+
+impl<'x> crypto::SecretProvider for SecretProvider<'x> {
+	fn encrypted_key(&self) -> io::Result<Bytes> {
+		let v = self.config.get("repository", "key").unwrap().to_string();
+		Ok(v.into())
+	}
+
+	fn passphrase(&self) -> io::Result<Bytes> {
+		self.passphrase.prompt_secret()
+	}
 }
 
 pub struct Repository<S> {
 	store: S,
 	manifest: Manifest,
-	key: Box<dyn Key>,
+	secret_provider: Box<dyn PassphraseProvider>,
+	config: Ini,
 }
 
 impl<S: ObjectStore> Repository<S> {
-	pub fn open(store: S) -> io::Result<Self> {
+	pub fn open(store: S, secret_provider: Box<dyn PassphraseProvider>) -> io::Result<Self> {
+		let mut config = Ini::new();
+		config
+			.read(String::from_utf8(store.read_config()?.into()).unwrap())
+			.map_err(|x| io::Error::new(io::ErrorKind::InvalidData, x))?;
 		// once we implement crypto support, we need two things:
 		// - the ability to query the repokey from the ObjectStore
 		// - a way to ask for a passphrase (by passing a callback)
-		let key = Box::new(crypto::Plaintext::new());
-		let manifest = Self::read_manifest(&store, &key)?;
+		let manifest = Self::read_manifest(&store, &config, &secret_provider)?;
 		Ok(Self {
 			store,
 			manifest,
-			key,
+			secret_provider,
+			config,
 		})
+	}
+
+	fn detect_crypto(
+		store: &S,
+		config: &Ini,
+		passphrase: &Box<dyn PassphraseProvider>,
+		for_data: &[u8],
+	) -> io::Result<Box<dyn Key>> {
+		crypto::detect_crypto(for_data, &SecretProvider { config, passphrase })
 	}
 
 	fn read_object<T: DeserializeOwned>(&self, id: &Id) -> io::Result<T> {
@@ -44,7 +102,8 @@ impl<S: ObjectStore> Repository<S> {
 	}
 
 	fn decode_raw(&self, data: &[u8]) -> io::Result<Bytes> {
-		let data = self.key.decrypt(&data[..]);
+		let key = Self::detect_crypto(&self.store, &self.config, &self.secret_provider, data)?;
+		let data = key.decrypt(&data[..])?;
 		let compressor = match compress::detect_compression(&data[..]) {
 			None => {
 				return Err(io::Error::new(
@@ -66,9 +125,14 @@ impl<S: ObjectStore> Repository<S> {
 		self.read_object(id)
 	}
 
-	fn read_manifest(store: &S, key: &impl Key) -> io::Result<Manifest> {
+	fn read_manifest(
+		store: &S,
+		config: &Ini,
+		passphrase: &Box<dyn PassphraseProvider>,
+	) -> io::Result<Manifest> {
 		let data = store.retrieve(&Id::zero())?;
-		let data = key.decrypt(&data[..]);
+		let key = Self::detect_crypto(store, config, passphrase, &data[..])?;
+		let data = key.decrypt(&data[..])?;
 		let compressor = match compress::detect_compression(&data[..]) {
 			None => {
 				return Err(io::Error::new(

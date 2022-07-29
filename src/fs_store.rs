@@ -1,5 +1,6 @@
 use std::fs;
 use std::io;
+use std::io::Read;
 use std::path::{Path, PathBuf};
 
 use bytes::Bytes;
@@ -50,6 +51,15 @@ impl ObjectStore for FsStore {
 			io::ErrorKind::NotFound,
 			format!("key {:?} does not exist", id),
 		))
+	}
+
+	fn read_config(&self) -> io::Result<Bytes> {
+		let mut path = self.root.clone();
+		path.push("config");
+		let mut f = fs::File::open(path)?;
+		let mut buf = Vec::new();
+		f.read_to_end(&mut buf)?;
+		Ok(buf.into())
 	}
 }
 

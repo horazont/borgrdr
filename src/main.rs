@@ -35,7 +35,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 	let archive_name = argv.get(2);
 	let file_name = argv.get(3);
 	let mut chunks_to_extract: Option<Vec<Id>> = None;
-	let repo = Repository::open(store)?;
+	let repo = Repository::open(store, Box::new(borgrdr::repository::EnvPassphrase::new()))?;
 	let manifest = repo.manifest();
 	eprintln!("Repository manifest:");
 	eprintln!("  Version   : {}", manifest.version());
