@@ -27,3 +27,21 @@ In addition, the following Borg features are not compatible:
 - Any compression except lz4
 - Encryption
 - Accessing a repository remotely (unless you sshfs it)
+
+## Usage
+
+```console
+$ cargo run /path/to/your/repo
+```
+
+will print a listing of all archives and files within them,
+in snail tempo.
+
+```console
+$ cargo run /path/to/your/repo archivename filepath
+```
+
+will first print the listing (to stderr)
+and then the contents of the file referenced by `archivename` and `filepath` to stdout.
+
+If you point this at a directory or symlink… no idea what happens, try it! :-)
