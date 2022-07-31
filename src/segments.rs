@@ -12,7 +12,7 @@ use byteorder::{ByteOrder, LittleEndian};
 use num_enum::{IntoPrimitive, TryFromPrimitive};
 
 #[serde_as]
-#[derive(Deserialize, Clone, Copy, PartialEq, Eq)]
+#[derive(Deserialize, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct Id(#[serde_as(as = "Bytes")] pub [u8; 32]);
 
 impl Id {
@@ -220,5 +220,16 @@ impl<R: io::Read> SegmentReader<R> {
 	pub fn read(&mut self) -> io::Result<Option<Segment>> {
 		self.read_header()?;
 		read_segment(&mut self.inner)
+	}
+}
+
+impl<R: io::Read + io::Seek> SegmentReader<R> {
+	pub fn read_pos(&mut self) -> io::Result<Option<(u64, Segment)>> {
+		let pos = self.inner.stream_position()?;
+		self.read_header()?;
+		match read_segment(&mut self.inner)? {
+			Some(segment) => Ok(Some((pos, segment))),
+			None => Ok(None),
+		}
 	}
 }

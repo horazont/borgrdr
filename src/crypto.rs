@@ -1,7 +1,8 @@
 use std::io;
 use std::num::NonZeroU32;
+use std::sync::Mutex;
 
-use ring::digest::{Context, SHA256};
+use ring::digest::{Context as DigestContext, SHA256};
 
 use bytes::{Bytes, BytesMut};
 
@@ -14,6 +15,46 @@ use super::segments::Id;
 pub trait SecretProvider {
 	fn encrypted_key(&self) -> io::Result<Bytes>;
 	fn passphrase(&self) -> io::Result<Bytes>;
+}
+
+pub struct Context {
+	repokey_keys: Mutex<Option<Keys>>,
+	keyfile_keys: Mutex<Option<Keys>>,
+}
+
+impl Context {
+	pub fn new() -> Self {
+		Self {
+			repokey_keys: Mutex::new(None),
+			keyfile_keys: Mutex::new(None),
+		}
+	}
+
+	fn get_repokey_keys(&self, provider: impl SecretProvider) -> io::Result<Keys> {
+		let mut repokey_lock = self.repokey_keys.lock().unwrap();
+		if let Some(keys) = repokey_lock.as_ref() {
+			return Ok(keys.clone());
+		}
+
+		let keybox = provider.encrypted_key()?;
+		let passphrase = provider.passphrase()?;
+		let keys = decrypt_keybox(keybox, passphrase)?;
+		*repokey_lock = Some(keys.clone());
+		Ok(keys)
+	}
+
+	fn get_keyfile_keys(&self, provider: impl SecretProvider) -> io::Result<Keys> {
+		let path = match std::env::var("BORG_KEYFILE") {
+			Ok(v) => v,
+			Err(_) => {
+				return Err(io::Error::new(
+					io::ErrorKind::NotFound,
+					"BORG_KEYFILE not set, but keyfile crypto requested",
+				))
+			}
+		};
+		todo!();
+	}
 }
 
 #[serde_as]
@@ -70,6 +111,7 @@ struct KeyboxInner {
 	chunk_seed: i32,
 }
 
+#[derive(Clone)]
 struct Keys {
 	encryption_key: Bytes,
 	encryption_hmac_key: ring::hmac::Key,
@@ -168,7 +210,7 @@ impl Key for Plaintext {
 
 impl ContentHasher for Plaintext {
 	fn id(&self, content: &[u8]) -> Id {
-		let mut ctx = Context::new(&SHA256);
+		let mut ctx = DigestContext::new(&SHA256);
 		ctx.update(content);
 		Id(ctx.finish().as_ref().try_into().unwrap())
 	}
@@ -215,6 +257,7 @@ impl Key for Aes {
 }
 
 pub fn detect_crypto<P: SecretProvider>(
+	context: &Context,
 	data: &[u8],
 	secret_provider: &P,
 ) -> io::Result<Box<dyn Key>> {

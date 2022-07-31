@@ -1,20 +1,26 @@
+use std::collections::HashMap;
 use std::fs;
 use std::io;
-use std::io::Read;
+use std::io::{Read, Seek};
 use std::path::{Path, PathBuf};
+use std::sync::RwLock;
 
 use bytes::Bytes;
 
-use super::segments::{Id, Segment, SegmentReader};
+use super::segments::{read_segment, Id, Segment, SegmentReader};
 use super::store::ObjectStore;
 
 pub struct FsStore {
 	root: PathBuf,
+	segment_cache: RwLock<HashMap<Id, Option<(u64, u64, u64)>>>,
 }
 
 impl FsStore {
 	pub fn open<P: Into<PathBuf>>(p: P) -> io::Result<Self> {
-		Ok(Self { root: p.into() })
+		Ok(Self {
+			root: p.into(),
+			segment_cache: RwLock::new(HashMap::new()),
+		})
 	}
 
 	fn iter_segment_files(&self) -> io::Result<ReverseSegmentFileIter<'_>> {
@@ -25,17 +31,52 @@ impl FsStore {
 impl ObjectStore for FsStore {
 	fn retrieve<K: AsRef<Id>>(&self, id: K) -> io::Result<Bytes> {
 		let id = id.as_ref();
+		{
+			let lock = self.segment_cache.read().unwrap();
+			match lock.get(id) {
+				Some(Some((dir, file, offset))) => {
+					let mut path = self.root.clone();
+					path.push("data");
+					path.push(dir.to_string());
+					path.push(file.to_string());
+					let mut file = fs::File::open(path)?;
+					file.seek(io::SeekFrom::Start(*offset))?;
+					let segment = read_segment(file)?;
+					match segment {
+						Some(Segment::Put { ref key, ref data }) => {
+							assert_eq!(key, id);
+							return Ok(data.to_owned().to_vec().into());
+						}
+						_ => panic!("cache pointed at invalid segment"),
+					}
+				}
+				Some(None) => {
+					return Err(io::Error::new(
+						io::ErrorKind::NotFound,
+						format!("key {:?} not in repository", id),
+					));
+				}
+				None => (),
+			}
+		}
+		let mut lock = self.segment_cache.write().unwrap();
 		for item in self.iter_segment_files()? {
-			let item = item?;
+			let (dir, file, item) = item?;
 			let mut rdr = SegmentReader::new(fs::File::open(item)?);
-			while let Some(segment) = rdr.read()? {
+			while let Some((offset, segment)) = rdr.read_pos()? {
 				match segment {
 					Segment::Put { ref key, ref data } => {
+						if !lock.contains_key(key) {
+							lock.insert(*key, Some((dir, file, offset)));
+						}
 						if key == id {
 							return Ok(data.to_owned().to_vec().into());
 						}
 					}
 					Segment::Delete { ref key } => {
+						if !lock.contains_key(key) {
+							lock.insert(*key, None);
+						}
 						if key == id {
 							return Err(io::Error::new(
 								io::ErrorKind::NotFound,
@@ -112,7 +153,7 @@ impl<'x> ReverseSegmentFileIter<'x> {
 }
 
 impl<'x> Iterator for ReverseSegmentFileIter<'x> {
-	type Item = io::Result<PathBuf>;
+	type Item = io::Result<(u64, u64, PathBuf)>;
 
 	fn next(&mut self) -> Option<Self::Item> {
 		match self.curr.take() {
@@ -127,7 +168,7 @@ impl<'x> Iterator for ReverseSegmentFileIter<'x> {
 					Err(e) => return Some(Err(e)),
 					Ok(Some(v)) if v < file => {
 						self.curr = Some((dir, v));
-						return Some(Ok(buf));
+						return Some(Ok((dir, file, buf)));
 					}
 					Ok(_) => (),
 				};
@@ -141,7 +182,7 @@ impl<'x> Iterator for ReverseSegmentFileIter<'x> {
 							Err(e) => return Some(Err(e)),
 							Ok(None) => {
 								// nothing more to see, exit,
-								return Some(Ok(buf));
+								return Some(Ok((dir, file, buf)));
 							}
 							Ok(Some(v)) => v,
 						};
@@ -151,7 +192,7 @@ impl<'x> Iterator for ReverseSegmentFileIter<'x> {
 						// nothing more to see, exit
 					}
 				};
-				return Some(Ok(buf));
+				return Some(Ok((dir, file, buf)));
 			}
 			None => None,
 		}

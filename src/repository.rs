@@ -66,6 +66,7 @@ pub struct Repository<S> {
 	store: S,
 	manifest: Manifest,
 	secret_provider: Box<dyn PassphraseProvider>,
+	crypto_ctx: crypto::Context,
 	config: Ini,
 }
 
@@ -78,11 +79,13 @@ impl<S: ObjectStore> Repository<S> {
 		// once we implement crypto support, we need two things:
 		// - the ability to query the repokey from the ObjectStore
 		// - a way to ask for a passphrase (by passing a callback)
-		let manifest = Self::read_manifest(&store, &config, &secret_provider)?;
+		let crypto_ctx = crypto::Context::new();
+		let manifest = Self::read_manifest(&store, &config, &crypto_ctx, &secret_provider)?;
 		Ok(Self {
 			store,
 			manifest,
 			secret_provider,
+			crypto_ctx,
 			config,
 		})
 	}
@@ -90,10 +93,11 @@ impl<S: ObjectStore> Repository<S> {
 	fn detect_crypto(
 		store: &S,
 		config: &Ini,
+		crypto_ctx: &crypto::Context,
 		passphrase: &Box<dyn PassphraseProvider>,
 		for_data: &[u8],
 	) -> io::Result<Box<dyn Key>> {
-		crypto::detect_crypto(for_data, &SecretProvider { config, passphrase })
+		crypto::detect_crypto(crypto_ctx, for_data, &SecretProvider { config, passphrase })
 	}
 
 	fn read_object<T: DeserializeOwned>(&self, id: &Id) -> io::Result<T> {
@@ -102,7 +106,13 @@ impl<S: ObjectStore> Repository<S> {
 	}
 
 	fn decode_raw(&self, data: &[u8]) -> io::Result<Bytes> {
-		let key = Self::detect_crypto(&self.store, &self.config, &self.secret_provider, data)?;
+		let key = Self::detect_crypto(
+			&self.store,
+			&self.config,
+			&self.crypto_ctx,
+			&self.secret_provider,
+			data,
+		)?;
 		let data = key.decrypt(&data[..])?;
 		let compressor = match compress::detect_compression(&data[..]) {
 			None => {
@@ -128,10 +138,11 @@ impl<S: ObjectStore> Repository<S> {
 	fn read_manifest(
 		store: &S,
 		config: &Ini,
+		crypto_ctx: &crypto::Context,
 		passphrase: &Box<dyn PassphraseProvider>,
 	) -> io::Result<Manifest> {
 		let data = store.retrieve(&Id::zero())?;
-		let key = Self::detect_crypto(store, config, passphrase, &data[..])?;
+		let key = Self::detect_crypto(store, config, crypto_ctx, passphrase, &data[..])?;
 		let data = key.decrypt(&data[..])?;
 		let compressor = match compress::detect_compression(&data[..]) {
 			None => {
