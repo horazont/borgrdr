@@ -1,3 +1,4 @@
+use std::fmt;
 use std::io;
 use std::io::BufRead;
 
@@ -15,6 +16,33 @@ use super::crypto::Key;
 use super::segments::Id;
 use super::store::ObjectStore;
 use super::structs::{Archive, ArchiveItem, Manifest};
+
+#[derive(Debug)]
+pub enum Error {
+	InvalidConfig(String),
+	NonUtf8Config,
+	InaccessibleConfig(io::Error),
+	ManifestNotFound,
+	ManifestInaccessible(io::Error),
+	ManifestVersionNotSupported(u8),
+}
+
+impl fmt::Display for Error {
+	fn fmt<'f>(&self, f: &'f mut fmt::Formatter) -> fmt::Result {
+		match self {
+			Self::InvalidConfig(err) => write!(f, "failed to parse repository config: {}", err),
+			Self::NonUtf8Config => write!(f, "failed to parse repository config: malformed utf-8"),
+			Self::InaccessibleConfig(err) => write!(f, "failed to read repository config: {}", err),
+			Self::ManifestNotFound => write!(f, "manifest not found"),
+			Self::ManifestInaccessible(err) => write!(f, "failed to read manifest: {}", err),
+			Self::ManifestVersionNotSupported(v) => {
+				write!(f, "unsupported manifest version: {}", v)
+			}
+		}
+	}
+}
+
+impl std::error::Error for Error {}
 
 pub trait PassphraseProvider {
 	fn prompt_secret(&self) -> io::Result<Bytes>;
@@ -71,16 +99,31 @@ pub struct Repository<S> {
 }
 
 impl<S: ObjectStore> Repository<S> {
-	pub fn open(store: S, secret_provider: Box<dyn PassphraseProvider>) -> io::Result<Self> {
+	pub fn open(store: S, secret_provider: Box<dyn PassphraseProvider>) -> Result<Self, Error> {
 		let mut config = Ini::new();
 		config
-			.read(String::from_utf8(store.read_config()?.into()).unwrap())
-			.map_err(|x| io::Error::new(io::ErrorKind::InvalidData, x))?;
+			.read(
+				String::from_utf8(
+					store
+						.read_config()
+						.map_err(Error::InaccessibleConfig)?
+						.into(),
+				)
+				.map_err(|_| Error::NonUtf8Config)?,
+			)
+			.map_err(Error::InvalidConfig)?;
 		// once we implement crypto support, we need two things:
 		// - the ability to query the repokey from the ObjectStore
 		// - a way to ask for a passphrase (by passing a callback)
 		let crypto_ctx = crypto::Context::new();
-		let manifest = Self::read_manifest(&store, &config, &crypto_ctx, &secret_provider)?;
+		let manifest = match Self::read_manifest(&store, &config, &crypto_ctx, &secret_provider) {
+			Ok(v) => v,
+			Err(e) if e.kind() == io::ErrorKind::NotFound => return Err(Error::ManifestNotFound),
+			Err(e) => return Err(Error::ManifestInaccessible(e)),
+		};
+		if manifest.version() != 1 {
+			return Err(Error::ManifestVersionNotSupported(manifest.version()));
+		}
 		Ok(Self {
 			store,
 			manifest,
@@ -88,6 +131,14 @@ impl<S: ObjectStore> Repository<S> {
 			crypto_ctx,
 			config,
 		})
+	}
+
+	pub fn store(&self) -> &S {
+		&self.store
+	}
+
+	pub fn store_mut(&mut self) -> &mut S {
+		&mut self.store
 	}
 
 	fn detect_crypto(

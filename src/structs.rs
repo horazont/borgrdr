@@ -1,8 +1,10 @@
 use std::borrow::Borrow;
 use std::collections::HashMap;
+use std::fmt;
 use std::hash::Hash;
 use std::path::PathBuf;
 
+use serde::de;
 use serde::Deserialize;
 
 use bytes::Bytes;
@@ -63,6 +65,110 @@ impl Manifest {
 	}
 }
 
+enum ChunkerParamsDiscriminator {
+	BuzhashImplied(u64),
+	BuzhashExplicit,
+	Fixed,
+}
+
+struct ChunkerParamsDiscriminatorVisitor();
+
+impl<'de> de::Visitor<'de> for ChunkerParamsDiscriminatorVisitor {
+	type Value = ChunkerParamsDiscriminator;
+
+	fn expecting(&self, formatter: &mut fmt::Formatter) -> fmt::Result {
+		formatter.write_str("`buzhash`, `fixed`, or a u64")
+	}
+
+	fn visit_str<E: de::Error>(self, s: &str) -> Result<Self::Value, E> {
+		match s {
+			"buzhash" => Ok(Self::Value::BuzhashExplicit),
+			"fixed" => Ok(Self::Value::Fixed),
+			_ => Err(E::invalid_value(
+				de::Unexpected::Str(s),
+				&"buzhash or fixed",
+			)),
+		}
+	}
+
+	fn visit_u64<E: de::Error>(self, v: u64) -> Result<Self::Value, E> {
+		Ok(Self::Value::BuzhashImplied(v))
+	}
+}
+
+impl<'de> de::Deserialize<'de> for ChunkerParamsDiscriminator {
+	fn deserialize<D: de::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+		deserializer.deserialize_str(ChunkerParamsDiscriminatorVisitor())
+	}
+}
+
+#[derive(Debug)]
+pub enum ChunkerParams {
+	Buzhash {
+		chunk_min_exp: u64,
+		chunk_max_exp: u64,
+		hash_mask_bits: u64,
+		hash_window_size: u64,
+	},
+	Fixed {
+		size: u64,
+		hdr_size: Option<u64>,
+	},
+}
+
+struct ChunkerParamsVisitor();
+
+impl<'de> de::Visitor<'de> for ChunkerParamsVisitor {
+	type Value = ChunkerParams;
+
+	fn expecting(&self, formatter: &mut fmt::Formatter) -> fmt::Result {
+		formatter.write_str("tuple struct ChunkerParams")
+	}
+
+	fn visit_seq<A: de::SeqAccess<'de>>(self, mut seq: A) -> Result<Self::Value, A::Error> {
+		let discriminator: ChunkerParamsDiscriminator = match seq.next_element()? {
+			Some(v) => v,
+			None => return Err(de::Error::invalid_length(0, &"2, 3, 4, or 5")),
+		};
+		let (offs, chunk_min_exp) = match discriminator {
+			ChunkerParamsDiscriminator::BuzhashImplied(chunk_min_exp) => (0, chunk_min_exp),
+			ChunkerParamsDiscriminator::BuzhashExplicit => (
+				1,
+				seq.next_element()?
+					.ok_or(de::Error::invalid_length(1, &"5"))?,
+			),
+			ChunkerParamsDiscriminator::Fixed => {
+				let size: u64 = seq
+					.next_element()?
+					.ok_or(de::Error::invalid_length(1, &"2 or 3"))?;
+				let hdr_size: Option<u64> = seq.next_element()?;
+				return Ok(ChunkerParams::Fixed { size, hdr_size });
+			}
+		};
+		let chunk_max_exp: u64 = seq
+			.next_element()?
+			.ok_or(de::Error::invalid_length(offs + 1, &"4/5"))?;
+		let hash_mask_bits: u64 = seq
+			.next_element()?
+			.ok_or(de::Error::invalid_length(offs + 2, &"4/5"))?;
+		let hash_window_size: u64 = seq
+			.next_element()?
+			.ok_or(de::Error::invalid_length(offs + 3, &"4/5"))?;
+		Ok(ChunkerParams::Buzhash {
+			chunk_max_exp,
+			chunk_min_exp,
+			hash_mask_bits,
+			hash_window_size,
+		})
+	}
+}
+
+impl<'de> de::Deserialize<'de> for ChunkerParams {
+	fn deserialize<D: de::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+		deserializer.deserialize_seq(ChunkerParamsVisitor())
+	}
+}
+
 #[derive(Deserialize, Debug)]
 pub struct Archive {
 	version: u8,
@@ -73,7 +179,7 @@ pub struct Archive {
 	time: String,
 	time_end: String,
 	comment: String,
-	chunker_params: (String, usize, usize, usize, usize),
+	chunker_params: ChunkerParams,
 	items: Vec<Id>,
 }
 
@@ -106,14 +212,8 @@ impl Archive {
 		&self.time_end
 	}
 
-	pub fn chunker_params(&self) -> (&str, usize, usize, usize, usize) {
-		(
-			&self.chunker_params.0,
-			self.chunker_params.1,
-			self.chunker_params.2,
-			self.chunker_params.3,
-			self.chunker_params.4,
-		)
+	pub fn chunker_params(&self) -> &ChunkerParams {
+		&self.chunker_params
 	}
 
 	pub fn comment(&self) -> &str {
@@ -149,8 +249,8 @@ pub struct ArchiveItem {
 	mode: u32,
 	uid: u32,
 	gid: u32,
-	user: Bytes,
-	group: Bytes,
+	user: Option<Bytes>,
+	group: Option<Bytes>,
 	atime: Option<i64>,
 	ctime: Option<i64>,
 	mtime: Option<i64>,
@@ -176,12 +276,12 @@ impl ArchiveItem {
 		self.gid
 	}
 
-	pub fn user(&self) -> &[u8] {
-		&self.user
+	pub fn user(&self) -> Option<&[u8]> {
+		self.user.as_ref().map(|x| &x[..])
 	}
 
-	pub fn group(&self) -> &[u8] {
-		&self.group
+	pub fn group(&self) -> Option<&[u8]> {
+		self.group.as_ref().map(|x| &x[..])
 	}
 
 	pub fn atime(&self) -> Option<i64> {

@@ -225,8 +225,8 @@ impl<R: io::Read> SegmentReader<R> {
 
 impl<R: io::Read + io::Seek> SegmentReader<R> {
 	pub fn read_pos(&mut self) -> io::Result<Option<(u64, Segment)>> {
-		let pos = self.inner.stream_position()?;
 		self.read_header()?;
+		let pos = self.inner.stream_position()?;
 		match read_segment(&mut self.inner)? {
 			Some(segment) => Ok(Some((pos, segment))),
 			None => Ok(None),

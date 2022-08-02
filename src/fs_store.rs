@@ -26,6 +26,36 @@ impl FsStore {
 	fn iter_segment_files(&self) -> io::Result<ReverseSegmentFileIter<'_>> {
 		ReverseSegmentFileIter::new(&self.root)
 	}
+
+	fn search_chunk(&self, id: &Id) -> io::Result<Option<Bytes>> {
+		let mut lock = self.segment_cache.write().unwrap();
+		for item in self.iter_segment_files()? {
+			let (dir, file, item) = item?;
+			let mut rdr = SegmentReader::new(fs::File::open(item)?);
+			while let Some((offset, segment)) = rdr.read_pos()? {
+				match segment {
+					Segment::Put { ref key, ref data } => {
+						if !lock.contains_key(key) {
+							lock.insert(*key, Some((dir, file, offset)));
+						}
+						if key == id {
+							return Ok(Some(data.to_owned().to_vec().into()));
+						}
+					}
+					Segment::Delete { ref key } => {
+						if !lock.contains_key(key) {
+							lock.insert(*key, None);
+						}
+						if key == id {
+							return Ok(None);
+						}
+					}
+					Segment::Commit => (),
+				}
+			}
+		}
+		Ok(None)
+	}
 }
 
 impl ObjectStore for FsStore {
@@ -34,14 +64,20 @@ impl ObjectStore for FsStore {
 		{
 			let lock = self.segment_cache.read().unwrap();
 			match lock.get(id) {
-				Some(Some((dir, file, offset))) => {
+				Some(Some((dir, fileno, offset))) => {
 					let mut path = self.root.clone();
 					path.push("data");
 					path.push(dir.to_string());
-					path.push(file.to_string());
+					path.push(fileno.to_string());
 					let mut file = fs::File::open(path)?;
 					file.seek(io::SeekFrom::Start(*offset))?;
-					let segment = read_segment(file)?;
+					let segment = match read_segment(file) {
+						Ok(v) => v,
+						Err(e) => panic!(
+							"failed to re-read cached segment in {}/{} @ {}: {:?}",
+							dir, fileno, offset, e
+						),
+					};
 					match segment {
 						Some(Segment::Put { ref key, ref data }) => {
 							assert_eq!(key, id);
@@ -59,6 +95,40 @@ impl ObjectStore for FsStore {
 				None => (),
 			}
 		}
+		match self.search_chunk(id)? {
+			Some(v) => return Ok(v),
+			None => {
+				return Err(io::Error::new(
+					io::ErrorKind::NotFound,
+					format!("key {:?} not in repository", id),
+				))
+			}
+		}
+	}
+
+	fn contains<K: AsRef<Id>>(&self, id: K) -> io::Result<bool> {
+		let id = id.as_ref();
+		{
+			let lock = self.segment_cache.read().unwrap();
+			match lock.get(id) {
+				Some(entry) => return Ok(entry.is_some()),
+				// not in cache, need to search
+				None => (),
+			}
+		}
+		Ok(self.search_chunk(id)?.is_some())
+	}
+
+	fn read_config(&self) -> io::Result<Bytes> {
+		let mut path = self.root.clone();
+		path.push("config");
+		let mut f = fs::File::open(path)?;
+		let mut buf = Vec::new();
+		f.read_to_end(&mut buf)?;
+		Ok(buf.into())
+	}
+
+	fn check_all_segments(&self) -> io::Result<()> {
 		let mut lock = self.segment_cache.write().unwrap();
 		for item in self.iter_segment_files()? {
 			let (dir, file, item) = item?;
@@ -69,38 +139,17 @@ impl ObjectStore for FsStore {
 						if !lock.contains_key(key) {
 							lock.insert(*key, Some((dir, file, offset)));
 						}
-						if key == id {
-							return Ok(data.to_owned().to_vec().into());
-						}
 					}
 					Segment::Delete { ref key } => {
 						if !lock.contains_key(key) {
 							lock.insert(*key, None);
-						}
-						if key == id {
-							return Err(io::Error::new(
-								io::ErrorKind::NotFound,
-								format!("key {:?} has been removed from the repository", id),
-							));
 						}
 					}
 					Segment::Commit => (),
 				}
 			}
 		}
-		Err(io::Error::new(
-			io::ErrorKind::NotFound,
-			format!("key {:?} does not exist", id),
-		))
-	}
-
-	fn read_config(&self) -> io::Result<Bytes> {
-		let mut path = self.root.clone();
-		path.push("config");
-		let mut f = fs::File::open(path)?;
-		let mut buf = Vec::new();
-		f.read_to_end(&mut buf)?;
-		Ok(buf.into())
+		Ok(())
 	}
 }
 
