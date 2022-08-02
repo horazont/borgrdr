@@ -116,19 +116,45 @@ impl<'x> Segment<'x> {
 	}
 }
 
+fn try_read_upto<R: io::Read>(mut src: R, mut out: &mut [u8]) -> io::Result<usize> {
+	let mut offs = 0;
+	loop {
+		let n = match src.read(&mut out[offs..]) {
+			Ok(0) => return Ok(offs),
+			Err(e) => return Err(e),
+			Ok(n) => n,
+		};
+		offs += n;
+		if offs == out.len() {
+			return Ok(offs);
+		}
+	}
+}
+
+const COMMIT_SEGMENT: [u8; 9] = *b"\x40\xf4\x3c\x25\x09\x00\x00\x00\x02";
+
 pub fn read_segment<R: io::Read>(mut src: R) -> io::Result<Option<Segment<'static>>> {
+	let mut main_buffer = [0u8; 9];
+	match try_read_upto(&mut src, &mut main_buffer[..])? {
+		0 => return Ok(None),
+		9 => (),
+		_ => {
+			return Err(io::Error::new(
+				io::ErrorKind::UnexpectedEof,
+				"partial segment",
+			))
+		}
+	}
+
+	if main_buffer == COMMIT_SEGMENT {
+		return Ok(Some(Segment::Commit));
+	}
+
 	let crc_impl = Crc::<u32>::new(&CRC32);
 	let mut crc_digest = crc_impl.digest();
-	let mut crc_raw = [0u8; 4];
-	let mut size_raw = [0u8; 4];
-	let mut tag = 0u8;
-	match src.read(&mut crc_raw[..])? {
-		0 => return Ok(None),
-		4 => (),
-		_ => return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "partial crc")),
-	}
-	src.read_exact(&mut size_raw[..])?;
-	src.read_exact(std::slice::from_mut(&mut tag))?;
+	let crc_raw = &main_buffer[..4];
+	let size_raw = &main_buffer[4..8];
+	let tag = main_buffer[8];
 
 	crc_digest.update(&size_raw[..]);
 	crc_digest.update(std::slice::from_ref(&tag));

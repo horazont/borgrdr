@@ -3,15 +3,17 @@ use std::env::args;
 use anyhow::{Context, Result};
 
 use borgrdr::fs_store::FsStore;
+use borgrdr::progress::{FnProgress, Progress};
 use borgrdr::repository::Repository;
 use borgrdr::store::ObjectStore;
 
 fn main() -> Result<()> {
 	let argv: Vec<String> = args().collect();
 
+	let mut progress_sink: FnProgress<_> = (|progress: Progress| println!("{:?}", progress)).into();
 	let store = FsStore::open(argv[1].clone())?;
 	eprintln!("checking segments ...");
-	store.check_all_segments()?;
+	store.check_all_segments(Some(&mut progress_sink))?;
 	eprintln!("segment check ok");
 	let repo = Repository::open(store, Box::new(borgrdr::repository::EnvPassphrase::new()))
 		.with_context(|| "failed to open repository")?;
