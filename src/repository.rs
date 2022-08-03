@@ -22,7 +22,6 @@ pub enum Error {
 	InvalidConfig(String),
 	NonUtf8Config,
 	InaccessibleConfig(io::Error),
-	ManifestNotFound,
 	ManifestInaccessible(io::Error),
 	ManifestVersionNotSupported(u8),
 }
@@ -33,7 +32,6 @@ impl fmt::Display for Error {
 			Self::InvalidConfig(err) => write!(f, "failed to parse repository config: {}", err),
 			Self::NonUtf8Config => write!(f, "failed to parse repository config: malformed utf-8"),
 			Self::InaccessibleConfig(err) => write!(f, "failed to read repository config: {}", err),
-			Self::ManifestNotFound => write!(f, "manifest not found"),
 			Self::ManifestInaccessible(err) => write!(f, "failed to read manifest: {}", err),
 			Self::ManifestVersionNotSupported(v) => {
 				write!(f, "unsupported manifest version: {}", v)
@@ -117,7 +115,6 @@ impl<S: ObjectStore> Repository<S> {
 			&secret_provider,
 		) {
 			Ok(v) => v,
-			Err(e) if e.kind() == io::ErrorKind::NotFound => return Err(Error::ManifestNotFound),
 			Err(e) => return Err(Error::ManifestInaccessible(e)),
 		};
 		if manifest.version() != 1 {
