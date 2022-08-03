@@ -2,8 +2,6 @@ use std::borrow::Cow;
 use std::fmt;
 use std::io;
 
-use crc::{Crc, CRC_32_ISO_HDLC as CRC32};
-
 use serde::Deserialize;
 use serde_with::{serde_as, Bytes};
 
@@ -150,8 +148,7 @@ pub fn read_segment<R: io::Read>(mut src: R) -> io::Result<Option<Segment<'stati
 		return Ok(Some(Segment::Commit));
 	}
 
-	let crc_impl = Crc::<u32>::new(&CRC32);
-	let mut crc_digest = crc_impl.digest();
+	let mut crc_digest = crc32fast::Hasher::new();
 	let crc_raw = &main_buffer[..4];
 	let size_raw = &main_buffer[4..8];
 	let tag = main_buffer[8];
