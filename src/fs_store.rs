@@ -1,4 +1,6 @@
+use std::borrow::Cow;
 use std::collections::HashMap;
+use std::fmt;
 use std::fs;
 use std::io;
 use std::io::{Read, Seek};
@@ -13,33 +15,108 @@ use super::progress::{Progress, ProgressSink};
 use super::segments::{read_segment, Id, Segment, SegmentReader};
 use super::store::ObjectStore;
 
+#[derive(Debug)]
+pub enum Error {
+	InvalidConfig(String),
+	MissingConfigKey(Cow<'static, str>, Cow<'static, str>),
+	InvalidConfigKey(
+		Cow<'static, str>,
+		Cow<'static, str>,
+		Box<dyn std::error::Error + Send + Sync + 'static>,
+	),
+	InaccessibleConfig(io::Error),
+	InaccessibleIndex(io::Error),
+}
+
+impl fmt::Display for Error {
+	fn fmt<'f>(&self, f: &'f mut fmt::Formatter) -> fmt::Result {
+		match self {
+			Self::InvalidConfig(err) => write!(f, "failed to parse repository config: {}", err),
+			Self::MissingConfigKey(section, name) => write!(
+				f,
+				"missing repository config key: [{:?}] {:?}",
+				section, name
+			),
+			Self::InvalidConfigKey(section, name, err) => write!(f, ""),
+			Self::InaccessibleConfig(err) => write!(f, "failed to read repository config: {}", err),
+			Self::InaccessibleIndex(err) => write!(f, "failed to access repository index: {}", err),
+		}
+	}
+}
+
+impl std::error::Error for Error {}
+
+fn get_config_key<T>(
+	cfg: &Ini,
+	f: impl Fn(&Ini, &str, &str) -> Result<Option<T>, String>,
+	section: &'static str,
+	name: &'static str,
+) -> Result<T, Error> {
+	match f(cfg, section, name) {
+		Ok(Some(v)) => Ok(v),
+		Ok(None) => Err(Error::MissingConfigKey(section.into(), name.into())),
+		Err(e) => Err(Error::InvalidConfigKey(
+			section.into(),
+			name.into(),
+			e.into(),
+		)),
+	}
+}
+
+fn split_fileno(segments_per_dir: u64, fileno: u64) -> (u64, u64) {
+	(fileno / segments_per_dir, fileno)
+}
+
 pub struct FsStore {
 	root: PathBuf,
-	segment_cache: RwLock<HashMap<Id, Option<(u64, u64, u64)>>>,
+	config: Ini,
+	segments_per_dir: u64,
+	latest_segment: u64,
+	segment_cache: RwLock<HashMap<Id, Option<(u64, u64)>>>,
 }
 
 impl FsStore {
-	pub fn open<P: Into<PathBuf>>(p: P) -> io::Result<Self> {
+	pub fn open<P: Into<PathBuf>>(p: P) -> Result<Self, Error> {
+		let root = p.into();
+		let mut config_path = root.clone();
+		config_path.push("config");
+		let mut config = Ini::new();
+		config
+			.read(fs::read_to_string(config_path).map_err(Error::InaccessibleConfig)?)
+			.map_err(Error::InvalidConfig)?;
+
+		let segments_per_dir =
+			get_config_key(&config, Ini::getuint, "repository", "segments_per_dir")?;
+
+		let latest_segment = Self::find_latest_segment(&root).map_err(Error::InaccessibleIndex)?;
+
 		Ok(Self {
-			root: p.into(),
+			root,
+			config,
+			segments_per_dir,
+			latest_segment,
 			segment_cache: RwLock::new(HashMap::new()),
 		})
 	}
 
 	fn iter_segment_files(&self) -> io::Result<ReverseSegmentFileIter<'_>> {
-		ReverseSegmentFileIter::new(&self.root)
+		Ok(ReverseSegmentFileIter::new(
+			&self.root,
+			self.latest_segment,
+			self.segments_per_dir,
+		))
 	}
 
 	fn search_chunk(&self, id: &Id) -> io::Result<Option<Bytes>> {
 		let mut lock = self.segment_cache.write().unwrap();
 		for item in self.iter_segment_files()? {
-			let (dir, file, item) = item?;
-			let mut rdr = SegmentReader::new(io::BufReader::new(fs::File::open(item)?));
+			let (fileno, item) = item?;
+			let mut rdr = SegmentReader::new(io::BufReader::new(item));
 			while let Some((offset, segment)) = rdr.read_pos()? {
 				match segment {
 					Segment::Put { ref key, ref data } => {
 						if !lock.contains_key(key) {
-							lock.insert(*key, Some((dir, file, offset)));
+							lock.insert(*key, Some((fileno, offset)));
 						}
 						if key == id {
 							return Ok(Some(data.to_owned().to_vec().into()));
@@ -59,6 +136,50 @@ impl FsStore {
 		}
 		Ok(None)
 	}
+
+	fn find_latest_segment<P: Into<PathBuf>>(at: P) -> io::Result<u64> {
+		let mut path = at.into();
+		let mut index_segment = None;
+		let mut hints_segment = None;
+		let mut integrity_segment = None;
+		for item in fs::read_dir(path)? {
+			let item = item?;
+			let file_name = match item.file_name().into_string() {
+				Ok(v) => v,
+				Err(_) => continue,
+			};
+			if file_name.starts_with("index.") {
+				index_segment = Some(file_name[6..].parse::<u64>().unwrap());
+			} else if file_name.starts_with("hints.") {
+				hints_segment = Some(file_name[6..].parse::<u64>().unwrap());
+			} else if file_name.starts_with("integrity.") {
+				integrity_segment = Some(file_name[10..].parse::<u64>().unwrap());
+			}
+		}
+
+		let index_segment = match index_segment {
+			Some(v) => v,
+			None => {
+				return Err(io::Error::new(
+					io::ErrorKind::NotFound,
+					"failed to find index file",
+				))
+			}
+		};
+		let hints_segment = hints_segment.unwrap_or(index_segment);
+		let integrity_segment = integrity_segment.unwrap_or(index_segment);
+		if index_segment != hints_segment || hints_segment != integrity_segment {
+			return Err(io::Error::new(
+				io::ErrorKind::InvalidData,
+				format!(
+					"inconsistent segment numbers: {}/{}/{}",
+					index_segment, hints_segment, integrity_segment
+				),
+			));
+		}
+
+		Ok(index_segment)
+	}
 }
 
 impl ObjectStore for FsStore {
@@ -67,18 +188,19 @@ impl ObjectStore for FsStore {
 		{
 			let lock = self.segment_cache.read().unwrap();
 			match lock.get(id) {
-				Some(Some((dir, fileno, offset))) => {
+				Some(Some((segment_no, offset))) => {
+					let (dir, file) = split_fileno(self.segments_per_dir, *segment_no);
 					let mut path = self.root.clone();
 					path.push("data");
 					path.push(dir.to_string());
-					path.push(fileno.to_string());
+					path.push(file.to_string());
 					let mut file = io::BufReader::new(fs::File::open(path)?);
 					file.seek(io::SeekFrom::Start(*offset))?;
 					let segment = match read_segment(file) {
 						Ok(v) => v,
 						Err(e) => panic!(
 							"failed to re-read cached segment in {}/{} @ {}: {:?}",
-							dir, fileno, offset, e
+							dir, segment_no, offset, e
 						),
 					};
 					match segment {
@@ -122,74 +244,17 @@ impl ObjectStore for FsStore {
 		Ok(self.search_chunk(id)?.is_some())
 	}
 
-	fn read_config(&self) -> io::Result<Bytes> {
-		let mut path = self.root.clone();
-		path.push("config");
-		let mut f = io::BufReader::new(fs::File::open(path)?);
-		let mut buf = Vec::new();
-		f.read_to_end(&mut buf)?;
-		Ok(buf.into())
+	fn get_repository_config_key(&self, key: &str) -> Option<String> {
+		self.config.get("repository", key)
 	}
 
 	fn get_latest_segment(&self) -> io::Result<u64> {
-		let mut path = self.root.clone();
-		let mut index_segment = None;
-		let mut hints_segment = None;
-		let mut integrity_segment = None;
-		for item in fs::read_dir(path)? {
-			let item = item?;
-			let file_name = match item.file_name().into_string() {
-				Ok(v) => v,
-				Err(_) => continue,
-			};
-			if file_name.starts_with("index.") {
-				index_segment = Some(file_name[6..].parse::<u64>().unwrap());
-			} else if file_name.starts_with("hints.") {
-				hints_segment = Some(file_name[6..].parse::<u64>().unwrap());
-			} else if file_name.starts_with("integrity.") {
-				integrity_segment = Some(file_name[10..].parse::<u64>().unwrap());
-			}
-		}
-
-		let index_segment = index_segment.expect("index segment number");
-		let hints_segment = hints_segment.unwrap_or(index_segment);
-		let integrity_segment = integrity_segment.unwrap_or(index_segment);
-		if index_segment != hints_segment || hints_segment != integrity_segment {
-			return Err(io::Error::new(
-				io::ErrorKind::InvalidData,
-				format!(
-					"inconsistent segment numbers: {}/{}/{}",
-					index_segment, hints_segment, integrity_segment
-				),
-			));
-		}
-
-		Ok(index_segment)
+		Ok(self.latest_segment)
 	}
 
 	fn check_all_segments(&self, mut progress: Option<&mut dyn ProgressSink>) -> io::Result<()> {
-		let mut config = Ini::new();
-		config
-			.read(
-				String::from_utf8(self.read_config()?.into())
-					.map_err(|x| io::Error::new(io::ErrorKind::InvalidData, x))?,
-			)
-			.map_err(|x| io::Error::new(io::ErrorKind::InvalidData, x))?;
-		let segments_per_dir = config
-			.getuint("repository", "segments_per_dir")
-			.map_err(|x| {
-				io::Error::new(
-					io::ErrorKind::InvalidData,
-					format!("segments_per_dir not convertible: {}", x),
-				)
-			})?
-			.ok_or(io::Error::new(
-				io::ErrorKind::InvalidData,
-				format!("segments_per_dir missing"),
-			))?;
-
-		let max_segment_number = self.get_latest_segment()?;
-
+		let max_segment_number = self.latest_segment;
+		let segments_per_dir = self.segments_per_dir;
 		let mut lock = self.segment_cache.write().unwrap();
 		// as we're going to read *all* segments, we'll now clear the map
 		// and reconstruct it.
@@ -200,9 +265,8 @@ impl ObjectStore for FsStore {
 		data_path.push("XXXXXXXX");
 
 		for segment_no in 0..=max_segment_number {
-			let dir = segment_no / segments_per_dir;
-			let file = segment_no % segments_per_dir;
-			if file == 0 {
+			let (dir, file) = split_fileno(segments_per_dir, segment_no);
+			if file % segments_per_dir == 0 {
 				progress.report(Progress::Range {
 					cur: segment_no,
 					max: max_segment_number,
@@ -227,7 +291,7 @@ impl ObjectStore for FsStore {
 			while let Some((offset, segment)) = reader.read_pos()? {
 				match segment {
 					Segment::Put { ref key, ref data } => {
-						lock.insert(*key, Some((dir, file, offset)));
+						lock.insert(*key, Some((segment_no, offset)));
 					}
 					Segment::Delete { ref key } => {
 						lock.insert(*key, None);
@@ -236,105 +300,54 @@ impl ObjectStore for FsStore {
 				}
 			}
 		}
-		progress.report(Progress::Range {
-			cur: max_segment_number,
-			max: max_segment_number,
-		});
+		progress.report(Progress::Complete);
 		Ok(())
 	}
 }
 
 struct ReverseSegmentFileIter<'x> {
 	root: &'x Path,
-	curr: Option<(u64, u64)>,
+	segment: Option<u64>,
+	segments_per_dir: u64,
 }
 
 impl<'x> ReverseSegmentFileIter<'x> {
-	fn new(root: &'x Path) -> io::Result<Self> {
-		let mut path = root.to_path_buf();
-		path.push("data");
-		let segment_dir = Self::find_largest(&path, None)?.unwrap();
-		path.push(segment_dir.to_string());
-		let file = Self::find_largest(&path, None)?.unwrap();
-		Ok(Self {
+	fn new(root: &'x Path, segment: u64, segments_per_dir: u64) -> Self {
+		Self {
 			root,
-			curr: Some((segment_dir, file)),
-		})
-	}
-
-	fn find_largest(path: &Path, less_than: Option<u64>) -> io::Result<Option<u64>> {
-		let mut largest: Option<u64> = None;
-		for item in fs::read_dir(path)? {
-			let item = item?;
-			let num = match item
-				.file_name()
-				.to_str()
-				.and_then(|x| x.parse::<u64>().ok())
-			{
-				Some(v) => v,
-				None => continue,
-			};
-			if let Some(cutoff) = less_than.as_ref() {
-				if num >= *cutoff {
-					continue;
-				}
-			}
-
-			if let Some(curr) = largest {
-				if curr < num {
-					largest = Some(num)
-				}
-			} else {
-				largest = Some(num)
-			}
+			segment: Some(segment + 1),
+			segments_per_dir,
 		}
-		Ok(largest)
 	}
 }
 
 impl<'x> Iterator for ReverseSegmentFileIter<'x> {
-	type Item = io::Result<(u64, u64, PathBuf)>;
+	type Item = io::Result<(u64, fs::File)>;
 
 	fn next(&mut self) -> Option<Self::Item> {
-		match self.curr.take() {
-			Some((dir, file)) => {
-				let mut buf = self.root.to_path_buf();
-				buf.push("data");
-				buf.push(dir.to_string());
-				let mut search_buf = buf.clone();
-				buf.push(file.to_string());
+		let mut buf = self.root.to_path_buf();
+		buf.push("data");
+		buf.push("XXXXXXXX");
+		buf.push("XXXX");
 
-				match Self::find_largest(&search_buf, Some(file)) {
-					Err(e) => return Some(Err(e)),
-					Ok(Some(v)) if v < file => {
-						self.curr = Some((dir, v));
-						return Some(Ok((dir, file, buf)));
-					}
-					Ok(_) => (),
-				};
+		while let Some(segment) = self.segment.as_mut().and_then(|x| {
+			let next = x.checked_sub(1)?;
+			*x = next;
+			Some(next)
+		}) {
+			let (dir, file) = split_fileno(self.segments_per_dir, segment);
+			buf.pop();
+			buf.pop();
+			buf.push(dir.to_string());
+			buf.push(file.to_string());
 
-				search_buf.pop();
-				match Self::find_largest(&search_buf, Some(dir)) {
-					Err(e) => return Some(Err(e)),
-					Ok(Some(new_dir)) if new_dir < dir => {
-						search_buf.push(new_dir.to_string());
-						let new_file = match Self::find_largest(&search_buf, None) {
-							Err(e) => return Some(Err(e)),
-							Ok(None) => {
-								// nothing more to see, exit,
-								return Some(Ok((dir, file, buf)));
-							}
-							Ok(Some(v)) => v,
-						};
-						self.curr = Some((new_dir, new_file));
-					}
-					Ok(_) => {
-						// nothing more to see, exit
-					}
-				};
-				return Some(Ok((dir, file, buf)));
-			}
-			None => None,
+			let fileobj = match fs::File::open(&buf) {
+				Ok(v) => v,
+				Err(e) if e.kind() == io::ErrorKind::NotFound => continue,
+				Err(e) => return Some(Err(e)),
+			};
+			return Some(Ok((segment, fileobj)));
 		}
+		None
 	}
 }

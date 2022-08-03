@@ -76,13 +76,18 @@ impl PassphraseProvider for EnvPassphrase {
 
 struct SecretProvider<'x> {
 	passphrase: &'x Box<dyn PassphraseProvider>,
-	config: &'x Ini,
+	repokey_data: Option<&'x str>,
 }
 
 impl<'x> crypto::SecretProvider for SecretProvider<'x> {
 	fn encrypted_key(&self) -> io::Result<Bytes> {
-		let v = self.config.get("repository", "key").unwrap().to_string();
-		Ok(v.into())
+		match self.repokey_data.as_ref() {
+			Some(v) => Ok(v.to_string().into()),
+			None => Err(io::Error::new(
+				io::ErrorKind::NotFound,
+				"no repository key available",
+			)),
+		}
 	}
 
 	fn passphrase(&self) -> io::Result<Bytes> {
@@ -93,30 +98,24 @@ impl<'x> crypto::SecretProvider for SecretProvider<'x> {
 pub struct Repository<S> {
 	store: S,
 	manifest: Manifest,
+	repokey_data: Option<String>,
 	secret_provider: Box<dyn PassphraseProvider>,
 	crypto_ctx: crypto::Context,
-	config: Ini,
 }
 
 impl<S: ObjectStore> Repository<S> {
 	pub fn open(store: S, secret_provider: Box<dyn PassphraseProvider>) -> Result<Self, Error> {
-		let mut config = Ini::new();
-		config
-			.read(
-				String::from_utf8(
-					store
-						.read_config()
-						.map_err(Error::InaccessibleConfig)?
-						.into(),
-				)
-				.map_err(|_| Error::NonUtf8Config)?,
-			)
-			.map_err(Error::InvalidConfig)?;
 		// once we implement crypto support, we need two things:
 		// - the ability to query the repokey from the ObjectStore
 		// - a way to ask for a passphrase (by passing a callback)
+		let repokey_data = store.get_repository_config_key("key");
 		let crypto_ctx = crypto::Context::new();
-		let manifest = match Self::read_manifest(&store, &config, &crypto_ctx, &secret_provider) {
+		let manifest = match Self::read_manifest(
+			&store,
+			repokey_data.as_ref().map(|x| x.as_ref()),
+			&crypto_ctx,
+			&secret_provider,
+		) {
 			Ok(v) => v,
 			Err(e) if e.kind() == io::ErrorKind::NotFound => return Err(Error::ManifestNotFound),
 			Err(e) => return Err(Error::ManifestInaccessible(e)),
@@ -129,7 +128,7 @@ impl<S: ObjectStore> Repository<S> {
 			manifest,
 			secret_provider,
 			crypto_ctx,
-			config,
+			repokey_data,
 		})
 	}
 
@@ -143,12 +142,19 @@ impl<S: ObjectStore> Repository<S> {
 
 	fn detect_crypto(
 		store: &S,
-		config: &Ini,
+		repokey_data: Option<&str>,
 		crypto_ctx: &crypto::Context,
 		passphrase: &Box<dyn PassphraseProvider>,
 		for_data: &[u8],
 	) -> io::Result<Box<dyn Key>> {
-		crypto::detect_crypto(crypto_ctx, for_data, &SecretProvider { config, passphrase })
+		crypto::detect_crypto(
+			crypto_ctx,
+			for_data,
+			&SecretProvider {
+				repokey_data,
+				passphrase,
+			},
+		)
 	}
 
 	fn read_object<T: DeserializeOwned>(&self, id: &Id) -> io::Result<T> {
@@ -159,7 +165,7 @@ impl<S: ObjectStore> Repository<S> {
 	fn decode_raw(&self, data: &[u8]) -> io::Result<Bytes> {
 		let key = Self::detect_crypto(
 			&self.store,
-			&self.config,
+			self.repokey_data.as_ref().map(|x| x.as_ref()),
 			&self.crypto_ctx,
 			&self.secret_provider,
 			data,
@@ -188,12 +194,12 @@ impl<S: ObjectStore> Repository<S> {
 
 	fn read_manifest(
 		store: &S,
-		config: &Ini,
+		repokey_data: Option<&str>,
 		crypto_ctx: &crypto::Context,
 		passphrase: &Box<dyn PassphraseProvider>,
 	) -> io::Result<Manifest> {
 		let data = store.retrieve(&Id::zero())?;
-		let key = Self::detect_crypto(store, config, crypto_ctx, passphrase, &data[..])?;
+		let key = Self::detect_crypto(store, repokey_data, crypto_ctx, passphrase, &data[..])?;
 		let data = key.decrypt(&data[..])?;
 		let compressor = match compress::detect_compression(&data[..]) {
 			None => {
