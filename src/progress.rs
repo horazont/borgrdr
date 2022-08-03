@@ -3,6 +3,7 @@ pub enum Progress {
 	Range { cur: u64, max: u64 },
 	Ratio(f64),
 	Count(u64),
+	Complete,
 }
 
 pub trait ProgressSink {
