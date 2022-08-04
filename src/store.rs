@@ -1,8 +1,7 @@
 //! Backend for accessing a borg repository
 use std::io;
-use std::io::BufRead;
 
-use bytes::{Buf, Bytes};
+use bytes::Bytes;
 
 use super::progress::ProgressSink;
 use super::segments::Id;

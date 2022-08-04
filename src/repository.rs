@@ -1,7 +1,6 @@
 use std::fmt;
 use std::future::Future;
 use std::io;
-use std::io::BufRead;
 use std::pin::Pin;
 use std::task::{Context, Poll};
 
@@ -14,8 +13,6 @@ use serde::de::DeserializeOwned;
 use bytes::{Buf, Bytes};
 
 use rmp_serde;
-
-use configparser::ini::Ini;
 
 use super::compress;
 use super::crypto;
@@ -150,7 +147,6 @@ impl<S: ObjectStore> Repository<S> {
 	}
 
 	fn detect_crypto(
-		store: &S,
 		repokey_data: Option<&str>,
 		crypto_ctx: &crypto::Context,
 		passphrase: &Box<dyn PassphraseProvider>,
@@ -173,7 +169,6 @@ impl<S: ObjectStore> Repository<S> {
 
 	fn decode_raw(&self, data: &[u8]) -> io::Result<Bytes> {
 		let key = Self::detect_crypto(
-			&self.store,
 			self.repokey_data.as_ref().map(|x| x.as_ref()),
 			&self.crypto_ctx,
 			&self.secret_provider,
@@ -208,7 +203,7 @@ impl<S: ObjectStore> Repository<S> {
 		passphrase: &Box<dyn PassphraseProvider>,
 	) -> io::Result<Manifest> {
 		let data = store.retrieve(&Id::zero()).await?;
-		let key = Self::detect_crypto(store, repokey_data, crypto_ctx, passphrase, &data[..])?;
+		let key = Self::detect_crypto(repokey_data, crypto_ctx, passphrase, &data[..])?;
 		let data = key.decrypt(&data[..])?;
 		let compressor = match compress::detect_compression(&data[..]) {
 			None => {
@@ -374,7 +369,7 @@ impl<'x, A: 'x + AsRef<Id>, S: ObjectStore, I: Stream<Item = A>> Stream for Item
 			if this.buffer.len() > 0 {
 				let mut buf = &this.buffer[..];
 				let old_len = buf.len();
-				let result = match rmp_serde::from_read(&mut buf) {
+				match rmp_serde::from_read(&mut buf) {
 					Ok(v) => {
 						let new_len = buf.len();
 						let to_drop = old_len - new_len;

@@ -1,7 +1,7 @@
 //! There seems to be no sensible crate providing aes ctr. that's... sad.
 use aes::cipher::{BlockEncrypt, KeyInit};
 
-use byteorder::{BigEndian, ByteOrder, LittleEndian};
+use byteorder::{BigEndian, ByteOrder};
 
 pub(crate) fn apply_ctr(key: &[u8], iv: &[u8], data: &mut [u8]) {
 	let aes_block = aes::Aes256::new_from_slice(key).expect("key size mismatch");

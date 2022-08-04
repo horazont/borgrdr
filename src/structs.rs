@@ -2,7 +2,6 @@ use std::borrow::Borrow;
 use std::collections::HashMap;
 use std::fmt;
 use std::hash::Hash;
-use std::path::PathBuf;
 
 use serde::de;
 use serde::Deserialize;

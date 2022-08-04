@@ -114,7 +114,7 @@ impl<'x> Segment<'x> {
 	}
 }
 
-fn try_read_upto<R: io::Read>(mut src: R, mut out: &mut [u8]) -> io::Result<usize> {
+fn try_read_upto<R: io::Read>(mut src: R, out: &mut [u8]) -> io::Result<usize> {
 	let mut offs = 0;
 	loop {
 		let n = match src.read(&mut out[offs..]) {

@@ -3,7 +3,7 @@ use std::collections::HashMap;
 use std::fmt;
 use std::fs;
 use std::io;
-use std::io::{Read, Seek};
+use std::io::Seek;
 use std::path::{Path, PathBuf};
 use std::sync::RwLock;
 
@@ -37,7 +37,11 @@ impl fmt::Display for Error {
 				"missing repository config key: [{:?}] {:?}",
 				section, name
 			),
-			Self::InvalidConfigKey(section, name, err) => write!(f, ""),
+			Self::InvalidConfigKey(section, name, err) => write!(
+				f,
+				"malformed config key {:?} in section {:?}: {}",
+				name, section, err
+			),
 			Self::InaccessibleConfig(err) => write!(f, "failed to read repository config: {}", err),
 			Self::InaccessibleIndex(err) => write!(f, "failed to access repository index: {}", err),
 		}
@@ -138,7 +142,7 @@ impl FsStore {
 	}
 
 	fn find_latest_segment<P: Into<PathBuf>>(at: P) -> io::Result<u64> {
-		let mut path = at.into();
+		let path = at.into();
 		let mut index_segment = None;
 		let mut hints_segment = None;
 		let mut integrity_segment = None;
@@ -179,10 +183,6 @@ impl FsStore {
 		}
 
 		Ok(index_segment)
-	}
-
-	fn get_latest_segment(&self) -> io::Result<u64> {
-		Ok(self.latest_segment)
 	}
 }
 
@@ -294,7 +294,7 @@ impl ObjectStore for FsStore {
 			let mut reader = SegmentReader::new(io::BufReader::new(reader));
 			while let Some((offset, segment)) = reader.read_pos()? {
 				match segment {
-					Segment::Put { ref key, ref data } => {
+					Segment::Put { ref key, .. } => {
 						lock.insert(*key, Some((segment_no, offset)));
 					}
 					Segment::Delete { ref key } => {

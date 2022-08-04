@@ -19,6 +19,7 @@ pub trait SecretProvider {
 
 pub struct Context {
 	repokey_keys: Mutex<Option<Keys>>,
+	#[allow(dead_code)] // not implemented
 	keyfile_keys: Mutex<Option<Keys>>,
 }
 
@@ -43,8 +44,8 @@ impl Context {
 		Ok(keys)
 	}
 
-	fn get_keyfile_keys(&self, provider: &impl SecretProvider) -> io::Result<Keys> {
-		let path = match std::env::var("BORG_KEYFILE") {
+	fn get_keyfile_keys(&self, _provider: &impl SecretProvider) -> io::Result<Keys> {
+		/* let path = match std::env::var("BORG_KEYFILE") {
 			Ok(v) => v,
 			Err(_) => {
 				return Err(io::Error::new(
@@ -52,7 +53,7 @@ impl Context {
 					"BORG_KEYFILE not set, but keyfile crypto requested",
 				))
 			}
-		};
+		}; */
 		todo!();
 	}
 }
@@ -83,7 +84,7 @@ impl Keybox {
 		buffer.into()
 	}
 
-	pub fn extract(self, passphrase: &[u8]) -> io::Result<Bytes> {
+	fn extract(self, passphrase: &[u8]) -> io::Result<Bytes> {
 		let kek = self.derive_kek(passphrase);
 		let mut data: BytesMut = (&self.data[..]).into();
 		aes_ctr::apply_ctr_int(&kek[..], 0, &mut data[..]);
@@ -104,10 +105,12 @@ impl Keybox {
 #[derive(Deserialize, Debug)]
 struct KeyboxInner {
 	version: u32,
+	#[allow(dead_code)]
 	repository_id: Bytes,
 	enc_key: Bytes,
 	enc_hmac_key: Bytes,
 	id_key: Bytes,
+	#[allow(dead_code)] // we are read-only
 	chunk_seed: i32,
 }
 
@@ -115,6 +118,7 @@ struct KeyboxInner {
 struct Keys {
 	encryption_key: Bytes,
 	encryption_hmac_key: ring::hmac::Key,
+	#[allow(dead_code)] // we are read-only
 	id_hmac_key: Bytes,
 }
 
@@ -122,7 +126,7 @@ struct Keys {
 fn decrypt_keybox(keybox: Bytes, passphrase: Bytes) -> io::Result<Keys> {
 	let keybox = match base64::decode(&keybox) {
 		Ok(v) => v,
-		Err(e) => {
+		Err(_) => {
 			return Err(io::Error::new(
 				io::ErrorKind::InvalidData,
 				"invalid base64 in keybox",
@@ -131,10 +135,27 @@ fn decrypt_keybox(keybox: Bytes, passphrase: Bytes) -> io::Result<Keys> {
 	};
 	let keybox: Keybox = rmp_serde::from_read(&mut &keybox[..])
 		.map_err(|x| io::Error::new(io::ErrorKind::InvalidData, x))?;
-	assert_eq!(keybox.algorithm, "sha256");
+	if keybox.version != 1 {
+		return Err(io::Error::new(
+			io::ErrorKind::InvalidData,
+			format!("unsupported keybox version: {}", keybox.version),
+		));
+	}
+	if keybox.algorithm != "sha256" {
+		return Err(io::Error::new(
+			io::ErrorKind::InvalidData,
+			format!("unsupported algorithm version: {}", keybox.algorithm),
+		));
+	}
 	let keybox_inner = keybox.extract(&passphrase[..])?;
 	let keybox_inner: KeyboxInner = rmp_serde::from_read(&mut &keybox_inner[..])
 		.map_err(|x| io::Error::new(io::ErrorKind::InvalidData, x))?;
+	if keybox_inner.version != 1 {
+		return Err(io::Error::new(
+			io::ErrorKind::InvalidData,
+			format!("unsupported inner keybox version: {}", keybox_inner.version),
+		));
+	}
 	Ok(Keys {
 		encryption_key: keybox_inner.enc_key,
 		encryption_hmac_key: ring::hmac::Key::new(
@@ -159,26 +180,17 @@ pub enum KeyType {
 
 pub trait Key {
 	fn decrypt(&self, src: &[u8]) -> io::Result<Vec<u8>>;
-	fn encrypt(&self, src: &[u8]) -> io::Result<Vec<u8>>;
 }
 
 impl<T: Key> Key for &T {
 	fn decrypt(&self, src: &[u8]) -> io::Result<Vec<u8>> {
 		(**self).decrypt(src)
 	}
-
-	fn encrypt(&self, src: &[u8]) -> io::Result<Vec<u8>> {
-		(**self).encrypt(src)
-	}
 }
 
 impl<T: Key> Key for Box<T> {
 	fn decrypt(&self, src: &[u8]) -> io::Result<Vec<u8>> {
 		(**self).decrypt(src)
-	}
-
-	fn encrypt(&self, src: &[u8]) -> io::Result<Vec<u8>> {
-		(**self).encrypt(src)
 	}
 }
 
@@ -198,13 +210,6 @@ impl Key for Plaintext {
 	fn decrypt(&self, src: &[u8]) -> io::Result<Vec<u8>> {
 		assert!(src[0] == 0x02);
 		Ok(src[1..].to_vec())
-	}
-
-	fn encrypt(&self, src: &[u8]) -> io::Result<Vec<u8>> {
-		let mut result = Vec::with_capacity(src.len() + 1);
-		result.push(0x02);
-		result.copy_from_slice(src);
-		Ok(result)
 	}
 }
 
@@ -250,10 +255,6 @@ impl Key for Aes {
 		aes_ctr::apply_ctr(&self.keys.encryption_key[..], &full_iv[..], &mut result[..]);
 		Ok(result)
 	}
-
-	fn encrypt(&self, src: &[u8]) -> io::Result<Vec<u8>> {
-		todo!();
-	}
 }
 
 pub fn detect_crypto<P: SecretProvider>(
@@ -262,10 +263,13 @@ pub fn detect_crypto<P: SecretProvider>(
 	secret_provider: &P,
 ) -> io::Result<Box<dyn Key>> {
 	match data[0] {
-		0x03 => {
-			Ok(Box::new(Aes::new(context.get_repokey_keys(secret_provider)?)))
-		}
+		0x00 => Ok(Box::new(Aes::new(
+			context.get_keyfile_keys(secret_provider)?,
+		))),
 		0x02 => Ok(Box::new(Plaintext::new())),
+		0x03 => Ok(Box::new(Aes::new(
+			context.get_repokey_keys(secret_provider)?,
+		))),
 		other => Err(io::Error::new(
 			io::ErrorKind::InvalidData,
 			format!("unsupported crypto type: {:?}", other),
