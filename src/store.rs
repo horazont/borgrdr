@@ -7,10 +7,10 @@ use bytes::{Buf, Bytes};
 use super::progress::ProgressSink;
 use super::segments::Id;
 
+#[async_trait::async_trait(?Send)]
 pub trait ObjectStore {
-	fn retrieve<K: AsRef<Id>>(&self, id: K) -> io::Result<Bytes>;
-	fn contains<K: AsRef<Id>>(&self, id: K) -> io::Result<bool>;
-	fn get_repository_config_key(&self, key: &str) -> Option<String>;
-	fn get_latest_segment(&self) -> io::Result<u64>;
-	fn check_all_segments(&self, progress: Option<&mut dyn ProgressSink>) -> io::Result<()>;
+	async fn retrieve<K: AsRef<Id>>(&self, id: K) -> io::Result<Bytes>;
+	async fn contains<K: AsRef<Id>>(&self, id: K) -> io::Result<bool>;
+	async fn get_repository_config_key(&self, key: &str) -> Option<String>;
+	async fn check_all_segments(&self, progress: Option<&mut dyn ProgressSink>) -> io::Result<()>;
 }

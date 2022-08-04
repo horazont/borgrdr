@@ -180,10 +180,15 @@ impl FsStore {
 
 		Ok(index_segment)
 	}
+
+	fn get_latest_segment(&self) -> io::Result<u64> {
+		Ok(self.latest_segment)
+	}
 }
 
+#[async_trait::async_trait(?Send)]
 impl ObjectStore for FsStore {
-	fn retrieve<K: AsRef<Id>>(&self, id: K) -> io::Result<Bytes> {
+	async fn retrieve<K: AsRef<Id>>(&self, id: K) -> io::Result<Bytes> {
 		let id = id.as_ref();
 		{
 			let lock = self.segment_cache.read().unwrap();
@@ -231,7 +236,7 @@ impl ObjectStore for FsStore {
 		}
 	}
 
-	fn contains<K: AsRef<Id>>(&self, id: K) -> io::Result<bool> {
+	async fn contains<K: AsRef<Id>>(&self, id: K) -> io::Result<bool> {
 		let id = id.as_ref();
 		{
 			let lock = self.segment_cache.read().unwrap();
@@ -244,15 +249,14 @@ impl ObjectStore for FsStore {
 		Ok(self.search_chunk(id)?.is_some())
 	}
 
-	fn get_repository_config_key(&self, key: &str) -> Option<String> {
+	async fn get_repository_config_key(&self, key: &str) -> Option<String> {
 		self.config.get("repository", key)
 	}
 
-	fn get_latest_segment(&self) -> io::Result<u64> {
-		Ok(self.latest_segment)
-	}
-
-	fn check_all_segments(&self, mut progress: Option<&mut dyn ProgressSink>) -> io::Result<()> {
+	async fn check_all_segments(
+		&self,
+		mut progress: Option<&mut dyn ProgressSink>,
+	) -> io::Result<()> {
 		let max_segment_number = self.latest_segment;
 		let segments_per_dir = self.segments_per_dir;
 		let mut lock = self.segment_cache.write().unwrap();

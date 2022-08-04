@@ -1,6 +1,13 @@
 use std::fmt;
+use std::future::Future;
 use std::io;
 use std::io::BufRead;
+use std::pin::Pin;
+use std::task::{Context, Poll};
+
+use futures::stream::Stream;
+
+use tokio::io::{AsyncBufRead, AsyncRead, ReadBuf};
 
 use serde::de::DeserializeOwned;
 
@@ -102,18 +109,23 @@ pub struct Repository<S> {
 }
 
 impl<S: ObjectStore> Repository<S> {
-	pub fn open(store: S, secret_provider: Box<dyn PassphraseProvider>) -> Result<Self, Error> {
+	pub async fn open(
+		store: S,
+		secret_provider: Box<dyn PassphraseProvider>,
+	) -> Result<Self, Error> {
 		// once we implement crypto support, we need two things:
 		// - the ability to query the repokey from the ObjectStore
 		// - a way to ask for a passphrase (by passing a callback)
-		let repokey_data = store.get_repository_config_key("key");
+		let repokey_data = store.get_repository_config_key("key").await;
 		let crypto_ctx = crypto::Context::new();
 		let manifest = match Self::read_manifest(
 			&store,
 			repokey_data.as_ref().map(|x| x.as_ref()),
 			&crypto_ctx,
 			&secret_provider,
-		) {
+		)
+		.await
+		{
 			Ok(v) => v,
 			Err(e) => return Err(Error::ManifestInaccessible(e)),
 		};
@@ -154,8 +166,8 @@ impl<S: ObjectStore> Repository<S> {
 		)
 	}
 
-	fn read_object<T: DeserializeOwned>(&self, id: &Id) -> io::Result<T> {
-		let data = self.store.retrieve(id)?;
+	async fn read_object<T: DeserializeOwned>(&self, id: &Id) -> io::Result<T> {
+		let data = self.store.retrieve(id).await?;
 		self.decode_object(&data[..])
 	}
 
@@ -185,17 +197,17 @@ impl<S: ObjectStore> Repository<S> {
 		rmp_serde::from_read(&data[..]).map_err(|x| io::Error::new(io::ErrorKind::InvalidData, x))
 	}
 
-	pub fn read_archive(&self, id: &Id) -> io::Result<Archive> {
-		self.read_object(id)
+	pub async fn read_archive(&self, id: &Id) -> io::Result<Archive> {
+		self.read_object(id).await
 	}
 
-	fn read_manifest(
+	async fn read_manifest(
 		store: &S,
 		repokey_data: Option<&str>,
 		crypto_ctx: &crypto::Context,
 		passphrase: &Box<dyn PassphraseProvider>,
 	) -> io::Result<Manifest> {
-		let data = store.retrieve(&Id::zero())?;
+		let data = store.retrieve(&Id::zero()).await?;
 		let key = Self::detect_crypto(store, repokey_data, crypto_ctx, passphrase, &data[..])?;
 		let data = key.decrypt(&data[..])?;
 		let compressor = match compress::detect_compression(&data[..]) {
@@ -215,123 +227,189 @@ impl<S: ObjectStore> Repository<S> {
 		&self.manifest
 	}
 
-	pub fn open_stream<A: AsRef<Id>, I: Iterator<Item = A>>(
-		&self,
+	pub fn open_stream<'x, A: 'x + AsRef<Id>, I: Stream<Item = A>>(
+		&'x self,
 		iter: I,
-	) -> StreamReader<'_, S, I> {
+	) -> StreamReader<'x, S, I> {
 		StreamReader {
 			repo: self,
 			curr: None,
+			next_poll: None,
 			iter,
 		}
 	}
 
-	pub fn archive_items<A: AsRef<Id>, I: Iterator<Item = A>>(
-		&self,
+	pub fn archive_items<'x, A: 'x + AsRef<Id>, I: Stream<Item = A>>(
+		&'x self,
 		iter: I,
-	) -> ItemIter<'_, S, I> {
+	) -> ItemIter<'x, S, I> {
 		ItemIter {
 			repo: self,
 			stream: self.open_stream(iter),
+			buffer: Vec::new(),
 			poisoned: false,
 		}
 	}
 }
 
-pub struct StreamReader<'x, S, I> {
-	repo: &'x Repository<S>,
-	curr: Option<Bytes>,
-	iter: I,
+pin_project_lite::pin_project! {
+	#[project = StreamReaderProj]
+	pub struct StreamReader<'x, S, I> {
+		repo: &'x Repository<S>,
+		curr: Option<Bytes>,
+		next_poll: Option<Pin<Box<dyn Future<Output = io::Result<Bytes>> + 'x>>>,
+		#[pin]
+		iter: I,
+	}
 }
 
-impl<'x, A: AsRef<Id>, S: ObjectStore, I: Iterator<Item = A>> StreamReader<'x, S, I> {
-	fn next_object(&mut self) -> io::Result<Option<Bytes>> {
-		let next_blob = self
-			.iter
-			.next()
-			.map(|x| self.repo.store.retrieve(x))
-			.transpose()?;
-		match next_blob {
-			None => return Ok(None),
-			Some(blob) => Ok(Some(self.repo.decode_raw(&blob)?.into())),
+impl<'p, 'x, A: 'x + AsRef<Id>, S: ObjectStore, I: Stream<Item = A>>
+	StreamReaderProj<'p, 'x, S, I>
+{
+	fn poll_next_object(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<Option<Bytes>>> {
+		if self.next_poll.is_none() {
+			let next_blob = match self.iter.as_mut().poll_next(cx) {
+				Poll::Pending => return Poll::Pending,
+				Poll::Ready(None) => return Poll::Ready(Ok(None)),
+				Poll::Ready(Some(id)) => id,
+			};
+			*self.next_poll = Some(self.repo.store.retrieve(next_blob));
+		}
+		let buf = match self.next_poll.as_mut().unwrap().as_mut().poll(cx) {
+			Poll::Pending => return Poll::Pending,
+			Poll::Ready(Ok(v)) => {
+				*self.next_poll = None;
+				v
+			}
+			Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
+		};
+		Poll::Ready(Ok(Some(self.repo.decode_raw(&buf)?.into())))
+	}
+}
+
+impl<'x, A: 'x + AsRef<Id>, S: ObjectStore, I: Stream<Item = A>> AsyncRead
+	for StreamReader<'x, S, I>
+{
+	fn poll_read(
+		mut self: Pin<&mut Self>,
+		cx: &mut Context<'_>,
+		buf: &mut ReadBuf<'_>,
+	) -> Poll<io::Result<()>> {
+		match self.as_mut().poll_fill_buf(cx) {
+			Poll::Ready(Ok(my_buf)) => {
+				let len = my_buf.len().min(buf.remaining());
+				buf.put_slice(&my_buf[..len]);
+				self.consume(len);
+				Poll::Ready(Ok(()))
+			}
+			Poll::Ready(Err(e)) => Poll::Ready(Err(e)),
+			Poll::Pending => Poll::Pending,
 		}
 	}
 }
 
-impl<'x, A: AsRef<Id>, S: ObjectStore, I: Iterator<Item = A>> io::Read for StreamReader<'x, S, I> {
-	fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
-		let src = self.fill_buf()?;
-		let to_copy = src.len().min(buf.len());
-		buf[..to_copy].copy_from_slice(&src[..to_copy]);
-		self.consume(to_copy);
-		Ok(to_copy)
-	}
-}
-
-impl<'x, A: AsRef<Id>, S: ObjectStore, I: Iterator<Item = A>> io::BufRead
+impl<'x, A: 'x + AsRef<Id>, S: ObjectStore, I: Stream<Item = A>> AsyncBufRead
 	for StreamReader<'x, S, I>
 {
-	fn consume(&mut self, amt: usize) {
+	fn consume(self: Pin<&mut Self>, amt: usize) {
 		if amt == 0 {
 			return;
 		}
+		let this = self.project();
 		// unwrap: if amt > 0, the caller must've called fill_buf and received
 		// a non-empty buffer; otherwise, it's ok to panic.
-		let curr = self.curr.as_mut().unwrap();
+		let curr = this.curr.as_mut().unwrap();
 		curr.advance(amt);
 		if curr.remaining() == 0 {
-			self.curr = None;
+			*this.curr = None;
 		}
 	}
 
-	fn fill_buf(&mut self) -> io::Result<&[u8]> {
+	fn poll_fill_buf(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<&[u8]>> {
+		let mut this = self.project();
 		loop {
-			// skip empty buffers
-			match self.curr.as_ref().map(|x| x.remaining() == 0) {
-				// empty
-				Some(true) | None => match self.next_object()? {
-					Some(next) => self.curr = Some(next),
-					None => {
-						self.curr = None;
-						return Ok(&[]);
+			match this.curr.as_ref().map(|x| x.remaining() == 0) {
+				// empty, need to get more
+				Some(true) | None => {
+					// more efficient when we're called again after Pending'
+					*this.curr = None;
+					*this.curr = match this.poll_next_object(cx) {
+						Poll::Pending => return Poll::Pending,
+						// still loop on in case this buffer is empty...
+						Poll::Ready(Ok(Some(buf))) => Some(buf),
+						Poll::Ready(Ok(None)) => return Poll::Ready(Ok(&[])),
+						Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
 					}
-				},
+				}
 				Some(false) => break,
 			}
 		}
-		Ok(self.curr.as_ref().unwrap().chunk())
+		Poll::Ready(Ok(this.curr.as_ref().unwrap().chunk()))
 	}
 }
 
-pub struct ItemIter<'x, S, I> {
-	repo: &'x Repository<S>,
-	stream: StreamReader<'x, S, I>,
-	poisoned: bool,
+pin_project_lite::pin_project! {
+	pub struct ItemIter<'x, S, I> {
+		repo: &'x Repository<S>,
+		#[pin]
+		stream: StreamReader<'x, S, I>,
+		// we need an internal buffer to handle objects straddling chunk
+		// boundaries; rmp_serde doesn't async, so we have to buffer
+		// ourselves, and deal with UnexpectedEof.
+		buffer: Vec<u8>,
+		poisoned: bool,
+	}
 }
 
-impl<'x, A: AsRef<Id>, S: ObjectStore, I: Iterator<Item = A>> Iterator for ItemIter<'x, S, I> {
+impl<'x, A: 'x + AsRef<Id>, S: ObjectStore, I: Stream<Item = A>> Stream for ItemIter<'x, S, I> {
 	type Item = io::Result<ArchiveItem>;
 
-	fn next(&mut self) -> Option<Self::Item> {
-		if self.poisoned {
-			return None;
+	fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+		let mut this = self.project();
+		if *this.poisoned {
+			return Poll::Ready(None);
 		}
-		match self.stream.fill_buf() {
-			Ok(v) if v.len() == 0 => return None,
-			Err(e) => {
-				self.poisoned = true;
-				return Some(Err(e));
+
+		loop {
+			if this.buffer.len() > 0 {
+				let mut buf = &this.buffer[..];
+				let old_len = buf.len();
+				let result = match rmp_serde::from_read(&mut buf) {
+					Ok(v) => {
+						let new_len = buf.len();
+						let to_drop = old_len - new_len;
+						this.buffer.drain(..to_drop);
+						return Poll::Ready(Some(Ok(v)));
+					}
+					Err(rmp_serde::decode::Error::InvalidDataRead(e))
+					| Err(rmp_serde::decode::Error::InvalidMarkerRead(e))
+						if e.kind() == io::ErrorKind::UnexpectedEof =>
+					{
+						// not enough data in buffer, do not advance and try again
+					}
+					Err(other) => {
+						*this.poisoned = true;
+						return Poll::Ready(Some(Err(io::Error::new(
+							io::ErrorKind::InvalidData,
+							other,
+						))));
+					}
+				};
 			}
-			Ok(_) => (),
-		}
-		match rmp_serde::from_read(&mut self.stream)
-			.map_err(|x| io::Error::new(io::ErrorKind::InvalidData, x))
-		{
-			Ok(v) => Some(Ok(v)),
-			Err(e) => {
-				self.poisoned = true;
-				return Some(Err(e));
-			}
+
+			let buf = match this.stream.as_mut().poll_fill_buf(cx) {
+				Poll::Pending => return Poll::Pending,
+				Poll::Ready(Ok(v)) if v.len() == 0 => return Poll::Ready(None),
+				Poll::Ready(Err(e)) => {
+					*this.poisoned = true;
+					return Poll::Ready(Some(Err(e)));
+				}
+				Poll::Ready(Ok(buf)) => buf,
+			};
+			this.buffer.extend_from_slice(buf);
+			// need this var, otherwise borrowck is unhappy in the line below
+			let bufsize = buf.len();
+			this.stream.as_mut().consume(bufsize);
 		}
 	}
 }

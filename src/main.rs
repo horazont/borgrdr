@@ -2,6 +2,8 @@ use std::collections::HashMap;
 use std::env::args;
 use std::io;
 
+use futures::stream::StreamExt;
+
 use chrono::{DateTime, TimeZone, Utc};
 
 use borgrdr::fs_store::FsStore;
@@ -28,14 +30,15 @@ fn convert_ts(ts: i64) -> DateTime<Utc> {
 	Utc.timestamp(secs, nanos)
 }
 
-fn main() -> Result<(), Box<dyn std::error::Error>> {
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
 	let argv: Vec<String> = args().collect();
 
 	let store = FsStore::open(argv[1].clone())?;
 	let archive_name = argv.get(2);
 	let file_name = argv.get(3);
 	let mut chunks_to_extract: Option<Vec<Id>> = None;
-	let repo = Repository::open(store, Box::new(borgrdr::repository::EnvPassphrase::new()))?;
+	let repo = Repository::open(store, Box::new(borgrdr::repository::EnvPassphrase::new())).await?;
 	let manifest = repo.manifest();
 	eprintln!("Repository manifest:");
 	eprintln!("  Version   : {}", manifest.version());
@@ -45,7 +48,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 	for (k, v) in manifest.archives().iter() {
 		let archive_matches = archive_name.as_ref().map(|x| &k == x).unwrap_or(false);
 		eprintln!("{}  [{}] id={:?}", k, v.timestamp(), v.id());
-		let archive = repo.read_archive(v.id())?;
+		let archive = repo.read_archive(v.id()).await?;
 		eprintln!("  Version: {}", archive.version());
 		eprintln!("  Name: {:?}", archive.name());
 		eprintln!("  Hostname: {:?}", archive.hostname());
@@ -54,7 +57,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 		eprintln!("  End time: {:?}", archive.end_time());
 		eprintln!("  Comment: {:?}", archive.comment());
 		eprintln!("  Items:");
-		for item in repo.archive_items(archive.items().iter()) {
+		let mut archive_item_stream =
+			repo.archive_items(futures::stream::iter(archive.items().iter()));
+		while let Some(item) = archive_item_stream.next().await {
 			let item = item?;
 			eprint!("    {} ", mode_to_str(item.mode()));
 			if let Some(sz) = item.size() {
@@ -83,8 +88,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 	}
 
 	if let Some(chunks) = chunks_to_extract {
-		let mut stream = repo.open_stream(chunks.iter());
-		io::copy(&mut stream, &mut io::stdout())?;
+		let mut stream = repo.open_stream(futures::stream::iter(chunks.iter()));
+		tokio::io::copy(&mut stream, &mut tokio::io::stdout()).await?;
 	}
 	Ok(())
 }
