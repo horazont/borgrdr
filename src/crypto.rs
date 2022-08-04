@@ -30,7 +30,7 @@ impl Context {
 		}
 	}
 
-	fn get_repokey_keys(&self, provider: impl SecretProvider) -> io::Result<Keys> {
+	fn get_repokey_keys(&self, provider: &impl SecretProvider) -> io::Result<Keys> {
 		let mut repokey_lock = self.repokey_keys.lock().unwrap();
 		if let Some(keys) = repokey_lock.as_ref() {
 			return Ok(keys.clone());
@@ -43,7 +43,7 @@ impl Context {
 		Ok(keys)
 	}
 
-	fn get_keyfile_keys(&self, provider: impl SecretProvider) -> io::Result<Keys> {
+	fn get_keyfile_keys(&self, provider: &impl SecretProvider) -> io::Result<Keys> {
 		let path = match std::env::var("BORG_KEYFILE") {
 			Ok(v) => v,
 			Err(_) => {
@@ -263,10 +263,7 @@ pub fn detect_crypto<P: SecretProvider>(
 ) -> io::Result<Box<dyn Key>> {
 	match data[0] {
 		0x03 => {
-			let keys = secret_provider.encrypted_key()?;
-			let passphrase = secret_provider.passphrase()?;
-			let keys = decrypt_keybox(keys, passphrase)?;
-			Ok(Box::new(Aes::new(keys)))
+			Ok(Box::new(Aes::new(context.get_repokey_keys(secret_provider)?)))
 		}
 		0x02 => Ok(Box::new(Plaintext::new())),
 		other => Err(io::Error::new(
