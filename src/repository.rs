@@ -14,9 +14,12 @@ use bytes::{Buf, Bytes};
 
 use rmp_serde;
 
+use tokio_util::codec::FramedRead;
+
 use super::compress;
 use super::crypto;
 use super::crypto::Key;
+use super::rmp_codec::MpCodec;
 use super::segments::Id;
 use super::store::ObjectStore;
 use super::structs::{Archive, ArchiveItem, Manifest};
@@ -237,13 +240,8 @@ impl<S: ObjectStore> Repository<S> {
 	pub fn archive_items<'x, A: 'x + AsRef<Id>, I: Stream<Item = A>>(
 		&'x self,
 		iter: I,
-	) -> ItemIter<'x, S, I> {
-		ItemIter {
-			repo: self,
-			stream: self.open_stream(iter),
-			buffer: Vec::new(),
-			poisoned: false,
-		}
+	) -> FramedRead<StreamReader<'x, S, I>, MpCodec<ArchiveItem>> {
+		FramedRead::new(self.open_stream(iter), MpCodec::new())
 	}
 }
 
@@ -340,71 +338,5 @@ impl<'x, A: 'x + AsRef<Id>, S: ObjectStore, I: Stream<Item = A>> AsyncBufRead
 			}
 		}
 		Poll::Ready(Ok(this.curr.as_ref().unwrap().chunk()))
-	}
-}
-
-pin_project_lite::pin_project! {
-	pub struct ItemIter<'x, S, I> {
-		repo: &'x Repository<S>,
-		#[pin]
-		stream: StreamReader<'x, S, I>,
-		// we need an internal buffer to handle objects straddling chunk
-		// boundaries; rmp_serde doesn't async, so we have to buffer
-		// ourselves, and deal with UnexpectedEof.
-		buffer: Vec<u8>,
-		poisoned: bool,
-	}
-}
-
-impl<'x, A: 'x + AsRef<Id>, S: ObjectStore, I: Stream<Item = A>> Stream for ItemIter<'x, S, I> {
-	type Item = io::Result<ArchiveItem>;
-
-	fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
-		let mut this = self.project();
-		if *this.poisoned {
-			return Poll::Ready(None);
-		}
-
-		loop {
-			if this.buffer.len() > 0 {
-				let mut buf = &this.buffer[..];
-				let old_len = buf.len();
-				match rmp_serde::from_read(&mut buf) {
-					Ok(v) => {
-						let new_len = buf.len();
-						let to_drop = old_len - new_len;
-						this.buffer.drain(..to_drop);
-						return Poll::Ready(Some(Ok(v)));
-					}
-					Err(rmp_serde::decode::Error::InvalidDataRead(e))
-					| Err(rmp_serde::decode::Error::InvalidMarkerRead(e))
-						if e.kind() == io::ErrorKind::UnexpectedEof =>
-					{
-						// not enough data in buffer, do not advance and try again
-					}
-					Err(other) => {
-						*this.poisoned = true;
-						return Poll::Ready(Some(Err(io::Error::new(
-							io::ErrorKind::InvalidData,
-							other,
-						))));
-					}
-				};
-			}
-
-			let buf = match this.stream.as_mut().poll_fill_buf(cx) {
-				Poll::Pending => return Poll::Pending,
-				Poll::Ready(Ok(v)) if v.len() == 0 => return Poll::Ready(None),
-				Poll::Ready(Err(e)) => {
-					*this.poisoned = true;
-					return Poll::Ready(Some(Err(e)));
-				}
-				Poll::Ready(Ok(buf)) => buf,
-			};
-			this.buffer.extend_from_slice(buf);
-			// need this var, otherwise borrowck is unhappy in the line below
-			let bufsize = buf.len();
-			this.stream.as_mut().consume(bufsize);
-		}
 	}
 }

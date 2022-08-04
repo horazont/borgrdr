@@ -2,7 +2,7 @@ use std::borrow::Cow;
 use std::fmt;
 use std::io;
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_with::{serde_as, Bytes};
 
 use byteorder::{ByteOrder, LittleEndian};
@@ -10,7 +10,7 @@ use byteorder::{ByteOrder, LittleEndian};
 use num_enum::{IntoPrimitive, TryFromPrimitive};
 
 #[serde_as]
-#[derive(Deserialize, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct Id(#[serde_as(as = "Bytes")] pub [u8; 32]);
 
 impl Id {

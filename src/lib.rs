@@ -4,6 +4,7 @@ pub mod crypto;
 pub mod fs_store;
 pub mod progress;
 pub mod repository;
+pub mod rmp_codec;
 pub mod segments;
 pub mod store;
 pub mod structs;
