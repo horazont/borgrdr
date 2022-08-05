@@ -225,7 +225,7 @@ impl<S: ObjectStore> Repository<S> {
 		&self.manifest
 	}
 
-	pub fn open_stream<'x, A: 'x + AsRef<Id>, I: Stream<Item = A>>(
+	pub fn open_stream<'x, A: 'x + AsRef<Id> + Send, I: Stream<Item = A>>(
 		&'x self,
 		iter: I,
 	) -> StreamReader<'x, S, I> {
@@ -237,7 +237,7 @@ impl<S: ObjectStore> Repository<S> {
 		}
 	}
 
-	pub fn archive_items<'x, A: 'x + AsRef<Id>, I: Stream<Item = A>>(
+	pub fn archive_items<'x, A: 'x + AsRef<Id> + Send, I: Stream<Item = A>>(
 		&'x self,
 		iter: I,
 	) -> FramedRead<StreamReader<'x, S, I>, MpCodec<ArchiveItem>> {
@@ -256,7 +256,7 @@ pin_project_lite::pin_project! {
 	}
 }
 
-impl<'p, 'x, A: 'x + AsRef<Id>, S: ObjectStore, I: Stream<Item = A>>
+impl<'p, 'x, A: 'x + AsRef<Id> + Send, S: ObjectStore, I: Stream<Item = A>>
 	StreamReaderProj<'p, 'x, S, I>
 {
 	fn poll_next_object(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<Option<Bytes>>> {
@@ -280,7 +280,7 @@ impl<'p, 'x, A: 'x + AsRef<Id>, S: ObjectStore, I: Stream<Item = A>>
 	}
 }
 
-impl<'x, A: 'x + AsRef<Id>, S: ObjectStore, I: Stream<Item = A>> AsyncRead
+impl<'x, A: 'x + AsRef<Id> + Send, S: ObjectStore, I: Stream<Item = A>> AsyncRead
 	for StreamReader<'x, S, I>
 {
 	fn poll_read(
@@ -301,7 +301,7 @@ impl<'x, A: 'x + AsRef<Id>, S: ObjectStore, I: Stream<Item = A>> AsyncRead
 	}
 }
 
-impl<'x, A: 'x + AsRef<Id>, S: ObjectStore, I: Stream<Item = A>> AsyncBufRead
+impl<'x, A: 'x + AsRef<Id> + Send, S: ObjectStore, I: Stream<Item = A>> AsyncBufRead
 	for StreamReader<'x, S, I>
 {
 	fn consume(self: Pin<&mut Self>, amt: usize) {

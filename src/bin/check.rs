@@ -1,45 +1,95 @@
 use std::env::args;
 use std::io;
 use std::io::Write;
+use std::sync::{Arc, Mutex};
 
 use anyhow::{Context, Result};
 
 use futures::stream::StreamExt;
 
 use borgrdr::fs_store::FsStore;
-use borgrdr::progress::{FnProgress, Progress};
+use borgrdr::progress::{Progress, ProgressSink};
 use borgrdr::repository::Repository;
 use borgrdr::store::ObjectStore;
 
-fn print_progress(progress: Progress) {
-	match progress {
-		Progress::Range { cur, max } => {
-			let percentage = ((cur as f64) / (max as f64)) * 100.;
-			print!("... {:5.1}%\r", percentage);
-		}
-		Progress::Count(at) => {
-			print!("... {:16}\r", at);
-		}
-		Progress::Ratio(v) => {
-			let percentage = v * 100.;
-			print!("... {:5.1}%\r", percentage);
-		}
-		Progress::Complete => {
-			print!("\x1b[K");
+struct ProgressMeter {
+	meters: [Progress; 2],
+}
+
+impl ProgressMeter {
+	fn new() -> Self {
+		Self {
+			meters: [Progress::Ratio(0.); 2],
 		}
 	}
-	let _ = io::stdout().flush();
+
+	fn shareable(self) -> Arc<Mutex<Self>> {
+		Arc::new(Mutex::new(self))
+	}
+
+	fn format_one(p: &Progress) -> String {
+		match p {
+			Progress::Range { cur, max } => {
+				let percentage = ((*cur as f64) / (*max as f64)) * 100.;
+				format!("{:5.1}%", percentage)
+			}
+			Progress::Count(at) => {
+				format!("{}", *at)
+			}
+			Progress::Ratio(v) => {
+				let percentage = *v * 100.;
+				format!("{:5.1}%", percentage)
+			}
+			Progress::Complete => "100.0%".to_string(),
+		}
+	}
+
+	fn print(&self) {
+		let segments = Self::format_one(&self.meters[0]);
+		let archives = Self::format_one(&self.meters[1]);
+		print!("\x1b[Ksegments: {}  archives: {}\r", segments, archives);
+		let _ = io::stdout().flush();
+	}
+}
+
+struct ProgressMeterRef {
+	inner: Arc<Mutex<ProgressMeter>>,
+	index: usize,
+}
+
+impl ProgressSink for ProgressMeterRef {
+	fn report(&mut self, progress: Progress) {
+		let mut lock = match self.inner.lock() {
+			Ok(v) => v,
+			Err(_) => return,
+		};
+		lock.meters[self.index] = progress;
+		lock.print();
+	}
+}
+
+fn split_meter(meter: Arc<Mutex<ProgressMeter>>) -> (ProgressMeterRef, ProgressMeterRef) {
+	(
+		ProgressMeterRef {
+			inner: meter.clone(),
+			index: 0,
+		},
+		ProgressMeterRef {
+			inner: meter.clone(),
+			index: 1,
+		},
+	)
 }
 
 #[tokio::main]
 async fn main() -> Result<()> {
 	let argv: Vec<String> = args().collect();
 
-	let mut progress_sink: FnProgress<_> = print_progress.into();
-	let store = FsStore::open(argv[1].clone())?;
-	eprintln!("checking segments ...");
-	store.check_all_segments(Some(&mut progress_sink)).await?;
-	eprintln!("segment check ok");
+	let (mut segment_meter, mut archive_meter) = split_meter(ProgressMeter::new().shareable());
+	let store = Arc::new(FsStore::open(argv[1].clone())?);
+	let store_ref = Arc::clone(&store);
+	let checker =
+		tokio::spawn(async move { store_ref.check_all_segments(Some(&mut segment_meter)).await });
 	let repo = Repository::open(store, Box::new(borgrdr::repository::EnvPassphrase::new()))
 		.await
 		.with_context(|| "failed to open repository")?;
@@ -48,6 +98,10 @@ async fn main() -> Result<()> {
 	let mut nitems = 0;
 	let mut nchunks = 0;
 	for (name, archive_hdr) in manifest.archives().iter() {
+		archive_meter.report(Progress::Range {
+			cur: narchives,
+			max: manifest.archives().len() as u64,
+		});
 		narchives += 1;
 		let archive_meta = repo.read_archive(archive_hdr.id()).await.with_context(|| {
 			// let chunk = repo.store().retrieve(archive_hdr.id()).ok();
@@ -67,7 +121,9 @@ async fn main() -> Result<()> {
 			nitems += 1;
 		}
 	}
+	archive_meter.report(Progress::Complete);
 
+	checker.await??;
 	println!(
 		"checked {} archives, {} items, {} chunks",
 		narchives, nitems, nchunks

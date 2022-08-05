@@ -11,6 +11,7 @@ use configparser::ini::Ini;
 
 use bytes::Bytes;
 
+use super::hashindex::{MmapSegmentIndex, ReadSegmentIndex};
 use super::progress::{Progress, ProgressSink};
 use super::segments::{read_segment, Id, Segment, SegmentReader};
 use super::store::ObjectStore;
@@ -76,6 +77,7 @@ pub struct FsStore {
 	config: Ini,
 	segments_per_dir: u64,
 	latest_segment: u64,
+	on_disk_index: Option<MmapSegmentIndex>,
 	segment_cache: RwLock<HashMap<Id, Option<(u64, u64)>>>,
 }
 
@@ -93,12 +95,17 @@ impl FsStore {
 			get_config_key(&config, Ini::getuint, "repository", "segments_per_dir")?;
 
 		let latest_segment = Self::find_latest_segment(&root).map_err(Error::InaccessibleIndex)?;
+		let mut index = root.clone();
+		index.push(format!("index.{}", latest_segment));
+		let on_disk_index =
+			Some(MmapSegmentIndex::open(&index).expect("failed to open on-disk index"));
 
 		Ok(Self {
 			root,
 			config,
 			segments_per_dir,
 			latest_segment,
+			on_disk_index,
 			segment_cache: RwLock::new(HashMap::new()),
 		})
 	}
@@ -109,6 +116,60 @@ impl FsStore {
 			self.latest_segment,
 			self.segments_per_dir,
 		))
+	}
+
+	fn read_single_segment(&self, id: &Id, segmentno: u64, offset: u64) -> io::Result<Bytes> {
+		let mut path = self.root.clone();
+		path.reserve(4 + 10 + 10);
+		path.push("data");
+		let (dir, fileno) = split_fileno(self.segments_per_dir, segmentno);
+		path.push(dir.to_string());
+		path.push(fileno.to_string());
+		let mut file = fs::File::open(&path)?;
+		file.seek(io::SeekFrom::Start(offset as u64))?;
+		let file = io::BufReader::new(file);
+		match read_segment(file)? {
+			Some(Segment::Put { ref key, ref data }) => {
+				if key != id {
+					Err(io::Error::new(
+						io::ErrorKind::InvalidData,
+						format!(
+							"chunk index pointed at {}/{} @ {}, which is a mismatching PUT",
+							dir, fileno, offset
+						),
+					))
+				} else {
+					Ok(data.to_owned().to_vec().into())
+				}
+			}
+			_ => Err(io::Error::new(
+				io::ErrorKind::InvalidData,
+				format!(
+					"chunk index pointed at {}/{} @ {}, which is not a PUT",
+					dir, fileno, offset
+				),
+			)),
+		}
+	}
+
+	fn try_on_disk_cache(&self, id: &Id) -> Option<io::Result<Option<(u64, u64)>>> {
+		let on_disk_index = self.on_disk_index.as_ref()?;
+		let entry = match on_disk_index.get(id) {
+			Some(v) => v,
+			None => return Some(Ok(None)),
+		};
+		Some(Ok(Some((entry.segment as u64, entry.offset as u64))))
+	}
+
+	fn try_in_memory_cache(&self, id: &Id) -> Option<io::Result<Option<(u64, u64)>>> {
+		let (segment, offset) = {
+			let lock = self.segment_cache.read().unwrap();
+			match lock.get(id)? {
+				Some((segment, offset)) => (*segment, *offset),
+				None => return Some(Ok(None)),
+			}
+		};
+		Some(Ok(Some((segment, offset))))
 	}
 
 	fn search_chunk(&self, id: &Id) -> io::Result<Option<Bytes>> {
@@ -186,44 +247,26 @@ impl FsStore {
 	}
 }
 
-#[async_trait::async_trait(?Send)]
+#[async_trait::async_trait]
 impl ObjectStore for FsStore {
-	async fn retrieve<K: AsRef<Id>>(&self, id: K) -> io::Result<Bytes> {
+	async fn retrieve<K: AsRef<Id> + Send>(&self, id: K) -> io::Result<Bytes> {
 		let id = id.as_ref();
+		match self
+			.try_on_disk_cache(id)
+			.or_else(|| self.try_in_memory_cache(id))
 		{
-			let lock = self.segment_cache.read().unwrap();
-			match lock.get(id) {
-				Some(Some((segment_no, offset))) => {
-					let (dir, file) = split_fileno(self.segments_per_dir, *segment_no);
-					let mut path = self.root.clone();
-					path.push("data");
-					path.push(dir.to_string());
-					path.push(file.to_string());
-					let mut file = io::BufReader::new(fs::File::open(path)?);
-					file.seek(io::SeekFrom::Start(*offset))?;
-					let segment = match read_segment(file) {
-						Ok(v) => v,
-						Err(e) => panic!(
-							"failed to re-read cached segment in {}/{} @ {}: {:?}",
-							dir, segment_no, offset, e
-						),
-					};
-					match segment {
-						Some(Segment::Put { ref key, ref data }) => {
-							assert_eq!(key, id);
-							return Ok(data.to_owned().to_vec().into());
-						}
-						_ => panic!("cache pointed at invalid segment"),
-					}
-				}
-				Some(None) => {
-					return Err(io::Error::new(
-						io::ErrorKind::NotFound,
-						format!("key {:?} not in repository", id),
-					));
-				}
-				None => (),
+			Some(Ok(Some((segment, offset)))) => {
+				return self.read_single_segment(id, segment, offset)
 			}
+			Some(Ok(None)) => {
+				return Err(io::Error::new(
+					io::ErrorKind::NotFound,
+					format!("key {:?} not in repository", id),
+				));
+			}
+			Some(Err(e)) => return Err(e),
+			// caches are all inconclusive, do exhaustive search
+			None => (),
 		}
 		match self.search_chunk(id)? {
 			Some(v) => return Ok(v),
@@ -236,15 +279,17 @@ impl ObjectStore for FsStore {
 		}
 	}
 
-	async fn contains<K: AsRef<Id>>(&self, id: K) -> io::Result<bool> {
+	async fn contains<K: AsRef<Id> + Send>(&self, id: K) -> io::Result<bool> {
 		let id = id.as_ref();
+		match self
+			.try_on_disk_cache(id)
+			.or_else(|| self.try_in_memory_cache(id))
 		{
-			let lock = self.segment_cache.read().unwrap();
-			match lock.get(id) {
-				Some(entry) => return Ok(entry.is_some()),
-				// not in cache, need to search
-				None => (),
-			}
+			Some(Ok(Some(_))) => return Ok(true),
+			Some(Ok(None)) => return Ok(false),
+			Some(Err(e)) => return Err(e),
+			// caches are all inconclusive, do exhaustive search
+			None => (),
 		}
 		Ok(self.search_chunk(id)?.is_some())
 	}
@@ -255,23 +300,22 @@ impl ObjectStore for FsStore {
 
 	async fn check_all_segments(
 		&self,
-		mut progress: Option<&mut dyn ProgressSink>,
+		mut progress: Option<&mut (dyn ProgressSink + Send)>,
 	) -> io::Result<()> {
 		let max_segment_number = self.latest_segment;
 		let segments_per_dir = self.segments_per_dir;
-		let mut lock = self.segment_cache.write().unwrap();
-		// as we're going to read *all* segments, we'll now clear the map
-		// and reconstruct it.
-		lock.clear();
 		let mut data_path = self.root.clone();
 		data_path.push("data");
 		// we're popping that off in the first iteration
 		data_path.push("XXXXXXXX");
 
+		let mut new_cache = HashMap::<_, Option<(u64, u64)>>::new();
+		let mut update_cache = HashMap::<_, Option<(u64, u64)>>::new();
 		for segment_no in 0..=max_segment_number {
 			let (dir, file) = split_fileno(segments_per_dir, segment_no);
-			if file % segments_per_dir == 0 {
+			if segment_no % 100 == 0 {
 				progress.report(Progress::Range {
+					// revresed!
 					cur: segment_no,
 					max: max_segment_number,
 				});
@@ -293,14 +337,34 @@ impl ObjectStore for FsStore {
 			data_path.pop();
 			let mut reader = SegmentReader::new(io::BufReader::new(reader));
 			while let Some((offset, segment)) = reader.read_pos()? {
-				match segment {
-					Segment::Put { ref key, .. } => {
-						lock.insert(*key, Some((segment_no, offset)));
+				let (key, value) = match segment {
+					Segment::Put { ref key, .. } => (*key, Some((segment_no, offset))),
+					Segment::Delete { ref key } => (*key, None),
+					Segment::Commit => {
+						for (key, value) in update_cache.drain() {
+							new_cache.insert(key, value);
+						}
+						update_cache.clear();
+						continue;
 					}
-					Segment::Delete { ref key } => {
-						lock.insert(*key, None);
-					}
-					Segment::Commit => (),
+				};
+				update_cache.insert(key, value);
+			}
+		}
+
+		{
+			let mut lock = self.segment_cache.write().unwrap();
+			*lock = new_cache;
+		}
+		if let Some(on_disk_index) = self.on_disk_index.as_ref() {
+			let lock = self.segment_cache.read().unwrap();
+			for (key, value) in lock.iter() {
+				let claim = on_disk_index.contains(key);
+				if claim && value.is_none() {
+					return Err(io::Error::new(io::ErrorKind::InvalidData, format!("on-disk segment cache error: claims {:?} exists, but I found an authoritative delete!", key)));
+				}
+				if !claim && value.is_some() {
+					return Err(io::Error::new(io::ErrorKind::InvalidData, format!("on-disk segment cache error: claims {:?} does not exist, but I found an authoritative put!", key)));
 				}
 			}
 		}

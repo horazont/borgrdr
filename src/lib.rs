@@ -2,6 +2,7 @@ mod aes_ctr;
 pub mod compress;
 pub mod crypto;
 pub mod fs_store;
+pub mod hashindex;
 pub mod progress;
 pub mod repository;
 pub mod rmp_codec;
