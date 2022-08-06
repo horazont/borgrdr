@@ -10,6 +10,7 @@ use futures::stream::StreamExt;
 use borgrdr::fs_store::FsStore;
 use borgrdr::progress::{Progress, ProgressSink};
 use borgrdr::repository::Repository;
+use borgrdr::rpc::{spawn_rpc_server, RpcStoreClient};
 use borgrdr::store::ObjectStore;
 
 struct ProgressMeter {
@@ -86,7 +87,11 @@ async fn main() -> Result<()> {
 	let argv: Vec<String> = args().collect();
 
 	let (segment_meter, mut archive_meter) = split_meter(ProgressMeter::new().shareable());
+
 	let store = Arc::new(FsStore::open(argv[1].clone())?);
+	let (serverside, clientside) = tokio::net::UnixStream::pair()?;
+	let server = spawn_rpc_server(store, serverside);
+	let store = Arc::new(RpcStoreClient::new(clientside));
 	let store_ref = Arc::clone(&store);
 	let checker = tokio::spawn(async move {
 		store_ref
@@ -112,21 +117,34 @@ async fn main() -> Result<()> {
 		})?;
 		let ids: Vec<_> = archive_meta.items().iter().map(|x| *x).collect();
 		let mut archive_item_stream = repo.archive_items(ids)?;
+		let mut idbuf = Vec::new();
 		while let Some(item) = archive_item_stream.next().await {
 			let item =
 				item.with_context(|| format!("failed to read archive item from {}", name))?;
-			for chunk in item.chunks().iter() {
-				if !repo.store().contains(chunk.id()).await? {
-					eprintln!("chunk {:?} is missing", chunk.id());
+			idbuf.extend(item.chunks().iter().map(|x| x.id()));
+			if idbuf.len() >= 128 {
+				let ids = idbuf.split_off(0);
+				assert!(ids.len() > 0);
+				for missing_id in repo.store().find_missing_chunks(ids).await? {
+					eprintln!("chunk {:?} is missing", missing_id);
 				}
 			}
+			//println!("checked chunks");
 			nchunks += item.chunks().len();
 			nitems += 1;
+		}
+
+		if idbuf.len() > 0 {
+			for missing_id in repo.store().find_missing_chunks(idbuf).await? {
+				eprintln!("chunk {:?} is missing", missing_id);
+			}
 		}
 	}
 	archive_meter.report(Progress::Complete);
 
 	checker.await??;
+	drop(repo);
+	server.await?;
 	println!(
 		"checked {} archives, {} items, {} chunks",
 		narchives, nitems, nchunks

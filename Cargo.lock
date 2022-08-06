@@ -74,6 +74,7 @@ dependencies = [
  "serde",
  "serde_with",
  "tokio",
+ "tokio-stream",
  "tokio-util",
  "zstd",
 ]
@@ -424,6 +425,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "mio"
+version = "0.8.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "57ee1c23c7c63b0c9250c339ffdc69255f110b298b901b9f6c82547b7b87caaf"
+dependencies = [
+ "libc",
+ "log",
+ "wasi 0.11.0+wasi-snapshot-preview1",
+ "windows-sys",
+]
+
+[[package]]
 name = "num-integer"
 version = "0.1.45"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -650,6 +663,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "socket2"
+version = "0.4.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "66d72b759436ae32898a2af0a14218dbf55efde3feeb170eb623637db85ee1e0"
+dependencies = [
+ "libc",
+ "winapi",
+]
+
+[[package]]
 name = "spin"
 version = "0.5.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -699,7 +722,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "6db9e6914ab8b1ae1c260a4ae7a49b6c5611b40328a735b21862567685e73255"
 dependencies = [
  "libc",
- "wasi",
+ "wasi 0.10.0+wasi-snapshot-preview1",
  "winapi",
 ]
 
@@ -711,11 +734,15 @@ checksum = "7a8325f63a7d4774dd041e363b2409ed1c5cbbd0f867795e661df066b2b0a581"
 dependencies = [
  "autocfg",
  "bytes",
+ "libc",
  "memchr",
+ "mio",
  "num_cpus",
  "once_cell",
  "pin-project-lite",
+ "socket2",
  "tokio-macros",
+ "winapi",
 ]
 
 [[package]]
@@ -727,6 +754,17 @@ dependencies = [
  "proc-macro2",
  "quote",
  "syn",
+]
+
+[[package]]
+name = "tokio-stream"
+version = "0.1.9"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "df54d54117d6fdc4e4fea40fe1e4e566b3505700e148a6827e59b34b0d2600d9"
+dependencies = [
+ "futures-core",
+ "pin-project-lite",
+ "tokio",
 ]
 
 [[package]]
@@ -801,6 +839,12 @@ name = "wasi"
 version = "0.10.0+wasi-snapshot-preview1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1a143597ca7c7793eff794def352d41792a93c481eb1042423ff7ff72ba2c31f"
+
+[[package]]
+name = "wasi"
+version = "0.11.0+wasi-snapshot-preview1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "9c8d87e72b64a3b4db28d11ce29237c246188f4f51057d65a7eab63b7987e423"
 
 [[package]]
 name = "wasm-bindgen"
@@ -887,6 +931,49 @@ name = "winapi-x86_64-pc-windows-gnu"
 version = "0.4.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "712e227841d057c1ee1cd2fb22fa7e5a5461ae8e48fa2ca79ec42cfc1931183f"
+
+[[package]]
+name = "windows-sys"
+version = "0.36.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ea04155a16a59f9eab786fe12a4a450e75cdb175f9e0d80da1e17db09f55b8d2"
+dependencies = [
+ "windows_aarch64_msvc",
+ "windows_i686_gnu",
+ "windows_i686_msvc",
+ "windows_x86_64_gnu",
+ "windows_x86_64_msvc",
+]
+
+[[package]]
+name = "windows_aarch64_msvc"
+version = "0.36.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "9bb8c3fd39ade2d67e9874ac4f3db21f0d710bee00fe7cab16949ec184eeaa47"
+
+[[package]]
+name = "windows_i686_gnu"
+version = "0.36.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "180e6ccf01daf4c426b846dfc66db1fc518f074baa793aa7d9b9aaeffad6a3b6"
+
+[[package]]
+name = "windows_i686_msvc"
+version = "0.36.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e2e7917148b2812d1eeafaeb22a97e4813dfa60a3f8f78ebe204bcc88f12f024"
+
+[[package]]
+name = "windows_x86_64_gnu"
+version = "0.36.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "4dcd171b8776c41b97521e5da127a2d86ad280114807d0b2ab1e462bc764d9e1"
+
+[[package]]
+name = "windows_x86_64_msvc"
+version = "0.36.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c811ca4a8c853ef420abd8592ba53ddbbac90410fab6903b3e79972a631f7680"
 
 [[package]]
 name = "zstd"

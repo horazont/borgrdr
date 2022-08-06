@@ -1,0 +1,1121 @@
+use std::collections::hash_map;
+use std::collections::HashMap;
+use std::fmt;
+use std::future::Future;
+use std::io;
+use std::pin::Pin;
+use std::result::Result as StdResult;
+use std::sync::{Arc, Weak};
+use std::task::{Context, Poll};
+
+use tokio::io::{AsyncRead, AsyncWrite};
+use tokio::sync::{mpsc, oneshot, RwLock};
+use tokio::time::{sleep_until, Duration, Instant};
+
+use tokio_util::codec;
+
+use bytes::Bytes;
+
+use futures::future::{FusedFuture, FutureExt};
+use futures::sink::SinkExt;
+use futures::stream::{SplitSink, SplitStream, Stream, StreamExt};
+
+use serde::{Deserialize, Serialize};
+
+use super::progress::{Progress, ProgressSink};
+use super::rmp_codec::MpCodec;
+use super::segments::Id;
+use super::store::ObjectStore;
+
+type RequestId = u64;
+
+#[derive(Debug, Serialize, Deserialize)]
+pub enum RpcMessage {
+	ProgressPush(f64),
+	StreamedChunk(StdResult<Bytes, String>),
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub enum RpcRequest {
+	RetrieveChunk { id: Id },
+	StreamChunks { ids: Vec<Id> },
+	ContainsChunk { id: Id },
+	FindMissingChunks { ids: Vec<Id> },
+	GetRepositoryConfigKey { key: String },
+	CheckRepository,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub enum RpcResponse {
+	DataReply(Bytes),
+	BoolReply(bool),
+	IdListReply(Vec<Id>),
+	RepoKeyValueReply(Option<String>),
+	Error(String),
+	Success,
+}
+
+impl RpcResponse {
+	pub fn result(self) -> Result<RpcResponse> {
+		match self {
+			Self::Error(msg) => Err(Error::Remote(msg)),
+			other => Ok(other),
+		}
+	}
+}
+
+impl<E: std::error::Error> From<StdResult<Bytes, E>> for RpcResponse {
+	fn from(other: StdResult<Bytes, E>) -> Self {
+		match other {
+			Ok(v) => Self::DataReply(v),
+			Err(e) => Self::Error(e.to_string()),
+		}
+	}
+}
+
+impl<E: std::error::Error> From<StdResult<Option<String>, E>> for RpcResponse {
+	fn from(other: StdResult<Option<String>, E>) -> Self {
+		match other {
+			Ok(v) => Self::RepoKeyValueReply(v),
+			Err(e) => Self::Error(e.to_string()),
+		}
+	}
+}
+
+impl<E: std::error::Error> From<StdResult<bool, E>> for RpcResponse {
+	fn from(other: StdResult<bool, E>) -> Self {
+		match other {
+			Ok(v) => Self::BoolReply(v),
+			Err(e) => Self::Error(e.to_string()),
+		}
+	}
+}
+
+impl<E: std::error::Error> From<StdResult<Vec<Id>, E>> for RpcResponse {
+	fn from(other: StdResult<Vec<Id>, E>) -> Self {
+		match other {
+			Ok(ids) => Self::IdListReply(ids),
+			Err(e) => Self::Error(e.to_string()),
+		}
+	}
+}
+
+impl<E: std::error::Error> From<StdResult<(), E>> for RpcResponse {
+	fn from(other: StdResult<(), E>) -> Self {
+		match other {
+			Ok(()) => Self::Success,
+			Err(e) => Self::Error(e.to_string()),
+		}
+	}
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub enum RpcItem {
+	Message {
+		in_reply_to: Option<RequestId>,
+		payload: RpcMessage,
+	},
+	Request {
+		id: RequestId,
+		payload: RpcRequest,
+	},
+	Response {
+		id: RequestId,
+		payload: RpcResponse,
+	},
+	Heartbeat,
+	Goodbye,
+	Hello,
+}
+
+#[derive(Debug)]
+pub enum Error {
+	LostWorker,
+	Communication(io::Error),
+	Remote(String),
+	UnexpectedResponse(RpcResponse),
+}
+
+impl From<Error> for io::Error {
+	fn from(other: Error) -> Self {
+		match other {
+			Error::LostWorker => io::Error::new(io::ErrorKind::BrokenPipe, other),
+			Error::Remote(_) => io::Error::new(io::ErrorKind::Other, other),
+			Error::Communication(e) => e,
+			Error::UnexpectedResponse(_) => io::Error::new(io::ErrorKind::InvalidData, other),
+		}
+	}
+}
+
+impl From<io::Error> for Error {
+	fn from(other: io::Error) -> Self {
+		match other.get_ref().and_then(|x| x.downcast_ref::<Self>()) {
+			Some(_) => {
+				let inner = other.into_inner().unwrap();
+				*inner.downcast().unwrap()
+			}
+			None => Self::Communication(other),
+		}
+	}
+}
+
+impl fmt::Display for Error {
+	fn fmt<'f>(&self, f: &'f mut fmt::Formatter) -> fmt::Result {
+		match self {
+			Self::LostWorker => write!(f, "lost rpc worker or internal worker error"),
+			Self::Communication(e) => write!(f, "communication error: {}", e),
+			Self::Remote(msg) => write!(f, "remote error: {}", msg),
+			Self::UnexpectedResponse(resp) => write!(f, "unexpected response received: {:?}", resp),
+		}
+	}
+}
+
+impl std::error::Error for Error {}
+
+type Result<T> = StdResult<T, Error>;
+
+#[derive(Debug)]
+enum RpcWorkerCommand {
+	SendRequest {
+		payload: RpcRequest,
+		message_handler: Option<mpsc::Sender<RpcMessage>>,
+		response_handler: oneshot::Sender<io::Result<RpcResponse>>,
+	},
+	SendPush {
+		payload: RpcMessage,
+		in_reply_to: Option<RequestId>,
+		result: oneshot::Sender<io::Result<()>>,
+	},
+}
+
+pub enum MessageSendError {
+	AlreadyComplete,
+	Other(Error),
+}
+
+pub enum TryMessageSendError {
+	AlreadyComplete,
+	Full(RpcMessage),
+	Other(Error),
+}
+
+pub struct MessageSender {
+	request_id: RequestId,
+	worker_ch: mpsc::Sender<RpcWorkerCommand>,
+	guard: Weak<RwLock<bool>>,
+}
+
+impl MessageSender {
+	async fn send(&self, payload: RpcMessage) -> StdResult<(), MessageSendError> {
+		let ptr = match self.guard.upgrade() {
+			Some(ptr) => ptr,
+			_ => return Err(MessageSendError::AlreadyComplete),
+		};
+		let lock = ptr.read().await;
+		if !*lock {
+			return Err(MessageSendError::AlreadyComplete);
+		}
+		let (tx, rx) = oneshot::channel();
+		match self
+			.worker_ch
+			.send(RpcWorkerCommand::SendPush {
+				in_reply_to: Some(self.request_id),
+				payload: payload,
+				result: tx,
+			})
+			.await
+		{
+			Ok(_) => (),
+			Err(_) => return Err(MessageSendError::Other(Error::LostWorker)),
+		};
+		match rx.await {
+			Ok(Ok(())) => Ok(()),
+			Ok(Err(e)) => Err(MessageSendError::Other(Error::Communication(e))),
+			Err(_) => Err(MessageSendError::Other(Error::LostWorker)),
+		}
+	}
+
+	fn try_send(&self, payload: RpcMessage) -> StdResult<(), TryMessageSendError> {
+		let ptr = match self.guard.upgrade() {
+			Some(ptr) => ptr,
+			_ => return Err(TryMessageSendError::AlreadyComplete),
+		};
+		let lock = match ptr.try_read() {
+			Ok(lock) => lock,
+			// the only way we can fail to acquire the lock is if it's
+			// currently being locked by the reply(), in order to shut down
+			// the thing, so returning the AlreadyComplete error is
+			// appropriate.
+			Err(_) => return Err(TryMessageSendError::AlreadyComplete),
+		};
+		if !*lock {
+			return Err(TryMessageSendError::AlreadyComplete);
+		}
+		let (tx, _) = oneshot::channel();
+		match self.worker_ch.try_send(RpcWorkerCommand::SendPush {
+			in_reply_to: Some(self.request_id),
+			payload: payload,
+			result: tx,
+		}) {
+			Ok(_) => Ok(()),
+			Err(mpsc::error::TrySendError::Full(v)) => match v {
+				RpcWorkerCommand::SendPush { payload, .. } => {
+					Err(TryMessageSendError::Full(payload))
+				}
+				_ => unreachable!(),
+			},
+			Err(mpsc::error::TrySendError::Closed(_)) => {
+				Err(TryMessageSendError::Other(Error::LostWorker))
+			}
+		}
+	}
+}
+
+pub struct RequestContext {
+	request_id: RequestId,
+	guard: Arc<RwLock<bool>>,
+	worker_ch: mpsc::Sender<RpcWorkerCommand>,
+	reply_ch: oneshot::Sender<(RpcResponse, oneshot::Sender<io::Result<()>>)>,
+}
+
+impl RequestContext {
+	fn new(
+		request_id: RequestId,
+		worker_ch: mpsc::Sender<RpcWorkerCommand>,
+		reply_ch: oneshot::Sender<(RpcResponse, oneshot::Sender<io::Result<()>>)>,
+	) -> Self {
+		Self {
+			request_id,
+			worker_ch,
+			reply_ch,
+			guard: Arc::new(RwLock::new(true)),
+		}
+	}
+
+	pub fn message_sender(&self) -> MessageSender {
+		MessageSender {
+			request_id: self.request_id,
+			worker_ch: self.worker_ch.clone(),
+			guard: Arc::downgrade(&self.guard),
+		}
+	}
+
+	pub async fn send_message(&self, payload: RpcMessage) -> Result<()> {
+		let (tx, rx) = oneshot::channel();
+		// before we can send the final message, we have to ensure that no
+		// message sender can be used anymore
+		{
+			let mut lock = self.guard.write().await;
+			*lock = false;
+		}
+
+		// we'll learn about errors when polling the rx
+		let _: StdResult<_, _> = self
+			.worker_ch
+			.send(RpcWorkerCommand::SendPush {
+				in_reply_to: Some(self.request_id),
+				result: tx,
+				payload,
+			})
+			.await;
+		match rx.await {
+			Ok(Ok(v)) => Ok(v),
+			Ok(Err(e)) => Err(Error::Communication(e)),
+			Err(_) => Err(Error::LostWorker),
+		}
+	}
+
+	pub async fn reply(self, payload: RpcResponse) -> Result<()> {
+		let (tx, rx) = oneshot::channel();
+		// we'll learn about errors when polling the rx
+		let _: StdResult<_, _> = self.reply_ch.send((payload, tx));
+		match rx.await {
+			Ok(Ok(v)) => Ok(v),
+			Ok(Err(e)) => Err(Error::Communication(e)),
+			Err(_) => Err(Error::LostWorker),
+		}
+	}
+}
+
+struct RequestWorkers {
+	slots: Vec<(
+		RequestId,
+		oneshot::Receiver<(RpcResponse, oneshot::Sender<io::Result<()>>)>,
+	)>,
+}
+
+impl RequestWorkers {
+	fn new() -> Self {
+		Self { slots: Vec::new() }
+	}
+
+	fn add(
+		&mut self,
+		request_id: RequestId,
+		reply_ch: oneshot::Receiver<(RpcResponse, oneshot::Sender<io::Result<()>>)>,
+	) {
+		self.slots.push((request_id, reply_ch))
+	}
+}
+
+impl Stream for RequestWorkers {
+	type Item = (
+		RequestId,
+		StdResult<(RpcResponse, oneshot::Sender<io::Result<()>>), oneshot::error::RecvError>,
+	);
+
+	fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+		for (i, (req_id, ch)) in self.slots.iter_mut().enumerate() {
+			match Pin::new(ch).poll(cx) {
+				Poll::Ready(v) => {
+					let req_id = *req_id;
+					self.slots.remove(i);
+					return Poll::Ready(Some((req_id, v)));
+				}
+				Poll::Pending => continue,
+			}
+		}
+		Poll::Pending
+	}
+}
+
+enum RpcWorkerMessage {
+	Request {
+		ctx: RequestContext,
+		payload: RpcRequest,
+	},
+	Message {
+		#[allow(dead_code)]
+		payload: RpcMessage,
+	},
+}
+
+struct RpcWorkerConfig {
+	request_queue_size: usize,
+	message_queue_size: usize,
+}
+
+impl RpcWorkerConfig {
+	fn new() -> Self {
+		Self {
+			request_queue_size: 16,
+			message_queue_size: 16,
+		}
+	}
+
+	#[allow(dead_code)]
+	fn set_request_queue_size(&mut self, new: usize) -> &mut Self {
+		self.request_queue_size = new;
+		self
+	}
+
+	#[allow(dead_code)]
+	fn set_message_queue_size(&mut self, new: usize) -> &mut Self {
+		self.message_queue_size = new;
+		self
+	}
+
+	fn spawn<T: AsyncRead + AsyncWrite + Send + 'static>(
+		self,
+		channel: T,
+	) -> (
+		tokio::task::JoinHandle<()>,
+		mpsc::Sender<RpcWorkerCommand>,
+		mpsc::Receiver<RpcWorkerMessage>,
+	) {
+		let (tx, rx) = codec::Framed::new(channel, MpCodec::new()).split();
+		let (request_tx, request_rx) = mpsc::channel(self.request_queue_size);
+		let (message_tx, message_rx) = mpsc::channel(self.message_queue_size);
+		let worker = RpcWorker {
+			tx,
+			rx,
+			next_id: 0,
+			request_rx,
+			request_tx_zygote: request_tx.clone(),
+			message_tx,
+			response_handlers: HashMap::new(),
+			message_handlers: HashMap::new(),
+			request_workers: RequestWorkers::new(),
+		};
+		let join_handle = tokio::spawn(worker.run());
+		(join_handle, request_tx, message_rx)
+	}
+}
+
+#[derive(Clone)]
+enum ErrorGenerator {
+	HandshakeError(Arc<io::Error>),
+	SendError(Arc<io::Error>),
+	ReceiveError(Arc<io::Error>),
+	LocalShutdown,
+	RemoteShutdown,
+}
+
+impl ErrorGenerator {
+	fn send(other: io::Error) -> Self {
+		Self::SendError(Arc::new(other))
+	}
+
+	fn receive(other: io::Error) -> Self {
+		Self::ReceiveError(Arc::new(other))
+	}
+
+	fn handshake(other: io::Error) -> Self {
+		Self::HandshakeError(Arc::new(other))
+	}
+}
+
+impl From<&ErrorGenerator> for io::Error {
+	fn from(other: &ErrorGenerator) -> Self {
+		match other {
+			ErrorGenerator::HandshakeError(e) => {
+				Self::new(e.kind(), format!("handshake error: {}", e))
+			}
+			ErrorGenerator::LocalShutdown => Self::new(io::ErrorKind::BrokenPipe, "local shutdown"),
+			ErrorGenerator::RemoteShutdown => {
+				Self::new(io::ErrorKind::ConnectionReset, "remote shutdown")
+			}
+			ErrorGenerator::SendError(e) => Self::new(e.kind(), format!("send error: {}", e)),
+			ErrorGenerator::ReceiveError(e) => Self::new(e.kind(), format!("receive error: {}", e)),
+		}
+	}
+}
+
+macro_rules! handle_tx {
+	($tx:expr => {
+		Ok($okv:pat_param) => $ok:expr,
+		Err($errv:pat_param) => $err:expr => break,
+	}) => {
+		match $tx.map_err(ErrorGenerator::send) {
+			Ok($okv) => $ok,
+			Err(e) => {
+				{
+					let $errv = &e;
+					$err;
+				}
+				break Err(e);
+			}
+		}
+	};
+}
+
+macro_rules! fulfill_reply {
+	($ch:expr, $v:expr) => {
+		if let Some(ch) = $ch {
+			let _: StdResult<_, _> = ch.send($v);
+		}
+	};
+}
+
+struct RpcWorker<T: AsyncRead + AsyncWrite> {
+	tx: SplitSink<codec::Framed<T, MpCodec<RpcItem>>, RpcItem>,
+	rx: SplitStream<codec::Framed<T, MpCodec<RpcItem>>>,
+	next_id: RequestId,
+	request_rx: mpsc::Receiver<RpcWorkerCommand>,
+	request_tx_zygote: mpsc::Sender<RpcWorkerCommand>,
+	message_tx: mpsc::Sender<RpcWorkerMessage>,
+	response_handlers: HashMap<RequestId, oneshot::Sender<io::Result<RpcResponse>>>,
+	message_handlers: HashMap<RequestId, mpsc::Sender<RpcMessage>>,
+	request_workers: RequestWorkers,
+}
+
+impl<T: AsyncRead + AsyncWrite> RpcWorker<T> {
+	fn generate_next_id(&mut self) -> RequestId {
+		loop {
+			let id = self.next_id;
+			self.next_id += 1;
+			if !self.response_handlers.contains_key(&id) && !self.message_handlers.contains_key(&id)
+			{
+				return id;
+			}
+		}
+	}
+
+	fn tx_deadline() -> Instant {
+		Instant::now() + Duration::new(45, 0)
+	}
+
+	fn rx_deadline() -> Instant {
+		Instant::now() + Duration::new(120, 0)
+	}
+
+	fn drain_with_error(mut self, e: &ErrorGenerator) {
+		self.request_rx.close();
+		drop(self.request_tx_zygote);
+		drop(self.message_tx);
+		drop(self.request_workers);
+		self.message_handlers.clear();
+		for (_, handler) in self.response_handlers.drain() {
+			fulfill_reply!(Some(handler), Err(e.into()));
+		}
+		// we ignore permits
+		while let Ok(req) = self.request_rx.try_recv() {
+			match req {
+				RpcWorkerCommand::SendRequest {
+					response_handler, ..
+				} => {
+					let _: StdResult<_, _> = response_handler.send(Err(e.into()));
+				}
+				RpcWorkerCommand::SendPush { result, .. } => {
+					let _: StdResult<_, _> = result.send(Err(e.into()));
+				}
+			}
+		}
+	}
+
+	async fn run(mut self) {
+		// Protocol layout:
+		// 1. Exchange hellos
+		// 2. Exchange requests/messages/responses
+		// 3. Send goodbye
+
+		match self.tx.send(RpcItem::Hello).await {
+			Ok(()) => (),
+			Err(e) => {
+				self.drain_with_error(&ErrorGenerator::handshake(e));
+				return;
+			}
+		};
+		// send heartbeat immediately after receiving the handshake
+		let tx_timeout = sleep_until(Instant::now());
+		tokio::pin!(tx_timeout);
+		match self.rx.next().await {
+			Some(Ok(RpcItem::Hello)) => (),
+			None => {
+				let e = io::Error::new(io::ErrorKind::UnexpectedEof, "no Hello received");
+				self.drain_with_error(&ErrorGenerator::handshake(e));
+				return;
+			}
+			Some(Ok(_)) => {
+				let e = io::Error::new(
+					io::ErrorKind::InvalidData,
+					"unexpected message during handshake",
+				);
+				self.drain_with_error(&ErrorGenerator::handshake(e));
+				return;
+			}
+			Some(Err(e)) => {
+				self.drain_with_error(&ErrorGenerator::handshake(e));
+				return;
+			}
+		};
+		let rx_timeout = sleep_until(Self::rx_deadline());
+		tokio::pin!(rx_timeout);
+
+		// Hellos are now exchanged successfully, we can enter the main item exchange
+		let result: StdResult<(), ErrorGenerator> = loop {
+			tokio::select! {
+				// tx timeout: every 45s of silence, we send a Heartbeat
+				_ = &mut tx_timeout => {
+					match self.tx.send(RpcItem::Heartbeat).await {
+						Ok(_) => (),
+						Err(e) => break Err(ErrorGenerator::send(e)),
+					};
+					tx_timeout.as_mut().reset(Self::tx_deadline());
+				}
+
+				// rx timeout: every 120s at least we expect to hear from our partner
+				// if we do not, that's an rx timeout, which is fatal
+				_ = &mut rx_timeout => {
+					break Err(ErrorGenerator::receive(io::Error::new(io::ErrorKind::TimedOut, "receive timeout elapsed")));
+				}
+
+				// received item (message) from peer
+				item = self.rx.next() => {
+					// advance receive timeout -- as long as data is pouring in, we don't care about round-trip times
+					rx_timeout.as_mut().reset(Self::rx_deadline());
+					match item {
+						// push-style message, potentially related to an ongoing request
+						Some(Ok(RpcItem::Message{in_reply_to, payload})) => {
+							if let Some(in_reply_to) = in_reply_to {
+								match self.message_handlers.entry(in_reply_to) {
+									// no recipient, drop
+									hash_map::Entry::Vacant(_) => (),
+									hash_map::Entry::Occupied(o) => {
+										match o.get().send(payload).await {
+											Ok(_) => (),
+											Err(_) => {
+												o.remove();
+											}
+										}
+									}
+								}
+							} else {
+								// it is legitimate to drop all unsolicited messages, the intent of which is signalled by dropping the rx side.
+								let _: StdResult<_, _> = self.message_tx.send(RpcWorkerMessage::Message{payload}).await;
+							}
+						}
+
+						// incoming request: send request down the chute and keep track of it to make sure we send a reply always, even if the corresponding task dies)
+						Some(Ok(RpcItem::Request{id, payload})) => {
+							let (tx, rx) = oneshot::channel();
+							let ctx = RequestContext::new(
+								id,
+								self.request_tx_zygote.clone(),
+								tx,
+							);
+							self.request_workers.add(id, rx);
+							// we'll learn about failure by polling request_workers
+							let _: StdResult<_, _> = self.message_tx.send(RpcWorkerMessage::Request{
+								payload,
+								ctx,
+							}).await;
+						}
+
+						// incoming response: route it to the corresponding task.
+						Some(Ok(RpcItem::Response{id, payload})) => {
+							self.message_handlers.remove(&id);
+							match self.response_handlers.remove(&id) {
+								Some(v) => {
+									// if the task died in the meantime, we don't care.
+									let _: StdResult<_, _> = v.send(Ok(payload));
+								}
+								// unknown id, ignore
+								None => (),
+							}
+						}
+
+						// ignore incoming heartbeats (we advanced the rx timeout above already)
+						Some(Ok(RpcItem::Heartbeat)) => (),
+
+						// request to shutdown, we honour that
+						Some(Ok(RpcItem::Goodbye)) => break Err(ErrorGenerator::RemoteShutdown),
+
+						// protocol violation, but don't care
+						Some(Ok(RpcItem::Hello)) => (),
+
+						// receive error, exit with error
+						Some(Err(e)) => break Err(ErrorGenerator::receive(e)),
+
+						// eof before goodbye, exit with error
+						None => break Err(ErrorGenerator::receive(io::Error::new(io::ErrorKind::UnexpectedEof, "unclean closure of connection"))),
+					}
+				},
+
+				// one of our request workers (see above) finished
+				finished = self.request_workers.next() => {
+					// unwrap: request_workers is an inifinte stream
+					let (request_id, result) = finished.unwrap();
+					let (response, reply_ch) = match result {
+						// the reply_ch provides feedback to the request handler about success/failure of sending the ultimate response
+						Ok((response, reply_ch)) => (response, Some(reply_ch)),
+						// if the result (which is a oneshot) has no correct value, we treat this as an internal error. likely caused by the task exiting unexpectedly or panicing or something like that.
+						Err(_) => (RpcResponse::Error("internal server error".to_string()), None),
+					};
+					handle_tx! {
+						self.tx.send(RpcItem::Response{
+							payload: response,
+							id: request_id,
+						}).await => {
+							Ok(v) => fulfill_reply!(reply_ch, Ok(v)),
+							Err(e) => fulfill_reply!(reply_ch, Err(e.into())) => break,
+						}
+					};
+					tx_timeout.as_mut().reset(Self::tx_deadline());
+				}
+
+				// internal request to do something
+				request = self.request_rx.recv() => {
+					match request {
+						// send a request to the peer
+						Some(RpcWorkerCommand::SendRequest{
+							payload,
+							message_handler,
+							response_handler,
+						}) => {
+							// we are responsible for ID bookkeeping, not the requester; this way, we don't need another synchronization point for picking IDs and we can avoid re-using IDs which are currently in-flight'
+							let id = self.generate_next_id();
+							let item = RpcItem::Request{id, payload};
+							// register the handlers first, so that they're taken care of during drain if anything goes wrong
+							self.response_handlers.insert(id, response_handler);
+							if let Some(message_handler) = message_handler {
+								self.message_handlers.insert(id, message_handler);
+							}
+							handle_tx! {
+								self.tx.send(item).await => {
+									Ok(()) => (),
+									Err(_) => () => break,
+								}
+							}
+							tx_timeout.as_mut().reset(Self::tx_deadline());
+						},
+
+						// send a message, potentially related to a request, to the peer
+						Some(RpcWorkerCommand::SendPush{
+							payload,
+							in_reply_to,
+							result,
+						}) => {
+							let item = RpcItem::Message{in_reply_to, payload};
+							handle_tx! {
+								self.tx.send(item).await => {
+									Ok(()) => fulfill_reply!(Some(result), Ok(())),
+									Err(e) => fulfill_reply!(Some(result), Err(e.into())) => break,
+								}
+							}
+							tx_timeout.as_mut().reset(Self::tx_deadline());
+						},
+						None => return,
+					}
+				},
+			}
+		};
+		let errgen = match result {
+			Ok(()) => {
+				// we try to send a Goodbye message, and if we don't succeed, that changes the error state'
+				self.tx
+					.send(RpcItem::Goodbye)
+					.await
+					.map_err(ErrorGenerator::send)
+					.err()
+					.unwrap_or(ErrorGenerator::LocalShutdown)
+			}
+			Err(e) => e,
+		};
+		self.drain_with_error(&errgen);
+	}
+}
+
+macro_rules! match_rpc_response {
+	($x:expr => {
+		$($p:pat_param => $px:expr,)*
+	}) => {
+		match $x {
+			$($p => $px,)*
+			Ok(other) => Err(Error::UnexpectedResponse(other)),
+			Err(e) => Err(e),
+		}
+	}
+}
+
+async fn progress_handler<P: ProgressSink + Send + 'static>(
+	mut src: mpsc::Receiver<RpcMessage>,
+	mut dst: P,
+) {
+	loop {
+		let progress = match src.recv().await {
+			Some(RpcMessage::ProgressPush(r)) => Progress::Ratio(r),
+			Some(_) => continue,
+			None => return,
+		};
+		dst.report(progress);
+	}
+}
+
+pub struct RpcStoreClient {
+	request_ch: mpsc::Sender<RpcWorkerCommand>,
+}
+
+impl RpcStoreClient {
+	pub fn new<I: AsyncRead + AsyncWrite + Send + 'static>(inner: I) -> Self {
+		let (_, ch_tx, _) = RpcWorkerConfig::new().spawn(inner);
+		Self { request_ch: ch_tx }
+	}
+
+	async fn rpc_call(
+		&self,
+		req: RpcRequest,
+		message_sink: Option<mpsc::Sender<RpcMessage>>,
+	) -> Result<RpcResponse> {
+		let (response_tx, response_rx) = oneshot::channel();
+		match self
+			.request_ch
+			.send(RpcWorkerCommand::SendRequest {
+				payload: req,
+				message_handler: message_sink,
+				response_handler: response_tx,
+			})
+			.await
+		{
+			Ok(_) => (),
+			Err(_) => return Err(Error::LostWorker),
+		};
+		match response_rx.await {
+			Ok(Ok(RpcResponse::Error(remote_err))) => Err(Error::Remote(remote_err)),
+			Ok(Ok(other)) => Ok(other),
+			Ok(Err(e)) => Err(Error::Communication(e)),
+			Err(_) => Err(Error::LostWorker),
+		}
+	}
+}
+
+#[async_trait::async_trait]
+impl ObjectStore for RpcStoreClient {
+	async fn retrieve<K: AsRef<Id> + Send>(&self, id: K) -> io::Result<Bytes> {
+		let id = id.as_ref().clone();
+		match_rpc_response! {
+			self.rpc_call(RpcRequest::RetrieveChunk{id}, None).await => {
+				Ok(RpcResponse::DataReply(data)) => Ok(data),
+			}
+		}
+		.map_err(|x| x.into())
+	}
+
+	async fn contains<K: AsRef<Id> + Send>(&self, id: K) -> io::Result<bool> {
+		let id = id.as_ref().clone();
+		match_rpc_response! {
+			self.rpc_call(RpcRequest::ContainsChunk{id}, None).await => {
+				Ok(RpcResponse::BoolReply(data)) => Ok(data),
+			}
+		}
+		.map_err(|x| x.into())
+	}
+
+	async fn find_missing_chunks(&self, ids: Vec<Id>) -> io::Result<Vec<Id>> {
+		match_rpc_response! {
+			self.rpc_call(RpcRequest::FindMissingChunks{ids}, None).await => {
+				Ok(RpcResponse::IdListReply(ids)) => Ok(ids),
+			}
+		}
+		.map_err(|x| x.into())
+	}
+
+	async fn get_repository_config_key(&self, key: &str) -> io::Result<Option<String>> {
+		let key = key.to_string();
+		match_rpc_response! {
+			self.rpc_call(RpcRequest::GetRepositoryConfigKey{key}, None).await => {
+				Ok(RpcResponse::RepoKeyValueReply(data)) => Ok(data),
+			}
+		}
+		.map_err(|x| x.into())
+	}
+
+	async fn check_all_segments(
+		&self,
+		progress: Option<Box<dyn ProgressSink + Send + 'static>>,
+	) -> io::Result<()> {
+		let tx = if let Some(progress) = progress {
+			let (tx, rx) = mpsc::channel(1);
+			tokio::spawn(progress_handler(rx, progress));
+			Some(tx)
+		} else {
+			None
+		};
+		match_rpc_response! {
+			self.rpc_call(RpcRequest::CheckRepository, tx).await => {
+				Ok(RpcResponse::Success) => Ok(()),
+			}
+		}
+		.map_err(|x| x.into())
+	}
+
+	type ChunkStream = ChunkStream;
+
+	fn stream_chunks(&self, chunks: Vec<Id>) -> io::Result<ChunkStream> {
+		Ok(ChunkStream {
+			backend: tokio_util::sync::PollSender::new(self.request_ch.clone()),
+			src: chunks,
+			block_size: 128,
+			curr_chunk: None,
+		})
+	}
+}
+
+pin_project_lite::pin_project! {
+	struct ChunksFromMessages {
+		#[pin]
+		stream: mpsc::Receiver<RpcMessage>,
+		#[pin]
+		completion: futures::future::Fuse<oneshot::Receiver<io::Result<RpcResponse>>>,
+	}
+}
+
+impl Stream for ChunksFromMessages {
+	type Item = io::Result<Bytes>;
+
+	fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+		//println!("ChunksFromMessages asked for more");
+		let mut this = self.project();
+		loop {
+			match this.stream.as_mut().poll_recv(cx) {
+				// if we get data, return it
+				Poll::Ready(Some(RpcMessage::StreamedChunk(data))) => {
+					//println!("chunk emitting: {:?}", data.is_ok());
+					match data {
+						Ok(v) => return Poll::Ready(Some(Ok(v))),
+						Err(e) => return Poll::Ready(Some(Err(Error::Remote(e).into()))),
+					}
+				}
+				// if we have to block, block
+				Poll::Pending => return Poll::Pending,
+				// if this is the eof, we have to poll on the oneshot
+				Poll::Ready(None) => break,
+				// if there is an unrelated message, spin
+				Poll::Ready(Some(_)) => (),
+			}
+		}
+
+		if this.completion.is_terminated() {
+			return Poll::Ready(None);
+		}
+		match this.completion.poll(cx) {
+			Poll::Ready(Ok(Ok(v))) => match v.result() {
+				Ok(_) => Poll::Ready(None),
+				Err(e) => Poll::Ready(Some(Err(e.into()))),
+			},
+			Poll::Ready(Ok(Err(e))) => Poll::Ready(Some(Err(e))),
+			Poll::Ready(Err(_)) => Poll::Ready(Some(Err(Error::LostWorker.into()))),
+			Poll::Pending => Poll::Pending,
+		}
+	}
+}
+
+pin_project_lite::pin_project! {
+	pub struct ChunkStream {
+		#[pin]
+		backend: tokio_util::sync::PollSender<RpcWorkerCommand>,
+		src: Vec<Id>,
+		block_size: usize,
+		#[pin]
+		curr_chunk: Option<ChunksFromMessages>,
+	}
+}
+
+impl Stream for ChunkStream {
+	type Item = io::Result<Bytes>;
+
+	fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+		//println!("ChunkStream asked for more");
+		let mut this = self.project();
+		loop {
+			if this.curr_chunk.is_none() {
+				//println!("ChunkStream needs to request more");
+				if this.src.len() == 0 {
+					//println!("ChunkStream exhausted");
+					return Poll::Ready(None);
+				}
+
+				match this.backend.as_mut().poll_reserve(cx) {
+					Poll::Pending => return Poll::Pending,
+					Poll::Ready(Err(_)) => return Poll::Ready(Some(Err(Error::LostWorker.into()))),
+					Poll::Ready(Ok(())) => (),
+				}
+
+				// we can now prepare the sending :-)
+				let size = (*this.block_size).min(this.src.len());
+				let ids = this.src.drain(..size).collect();
+				let (result_tx, result_rx) = oneshot::channel();
+				let (msg_tx, msg_rx) = mpsc::channel(*this.block_size);
+				match this.backend.send_item(RpcWorkerCommand::SendRequest {
+					payload: RpcRequest::StreamChunks { ids },
+					message_handler: Some(msg_tx),
+					response_handler: result_tx,
+				}) {
+					Ok(()) => (),
+					Err(_) => return Poll::Ready(Some(Err(Error::LostWorker.into()))),
+				};
+
+				*this.curr_chunk = Some(ChunksFromMessages {
+					stream: msg_rx,
+					completion: result_rx.fuse(),
+				});
+			}
+
+			//println!("ChunkStream asking inner stream");
+			match this.curr_chunk.as_mut().as_pin_mut().unwrap().poll_next(cx) {
+				Poll::Ready(Some(v)) => return Poll::Ready(Some(v)),
+				Poll::Ready(None) => (),
+				Poll::Pending => return Poll::Pending,
+			};
+
+			//println!("inner stream exhausted");
+			*this.curr_chunk = None;
+		}
+	}
+}
+
+struct ProgressGenerator {
+	sink: MessageSender,
+}
+
+impl ProgressSink for ProgressGenerator {
+	fn report(&mut self, progress: Progress) {
+		let ratio = match progress {
+			Progress::Ratio(v) => v,
+			Progress::Range { cur, max } => (cur as f64) / (max as f64),
+			Progress::Complete => 1.0,
+			Progress::Count(_) => todo!(),
+		};
+		let _: StdResult<_, _> = self.sink.try_send(RpcMessage::ProgressPush(ratio));
+	}
+}
+
+pub struct RpcStoreServerWorker<S> {
+	inner: Arc<S>,
+	rx_ch: mpsc::Receiver<RpcWorkerMessage>,
+}
+
+impl<S: ObjectStore + Sync + Send + 'static> RpcStoreServerWorker<S> {
+	async fn stream_chunks(backend: Arc<S>, ids: Vec<Id>, ctx: MessageSender) -> Result<()> {
+		//println!("streaming {} chunks", ids.len());
+		let mut stream = backend.stream_chunks(ids)?;
+		while let Some(item) = stream.next().await {
+			let item = item?;
+			//println!("pushing chunk");
+			match ctx.send(RpcMessage::StreamedChunk(Ok(item))).await {
+				Ok(_) => (),
+				Err(MessageSendError::Other(e)) => Err(e)?,
+				Err(MessageSendError::AlreadyComplete) => unreachable!(),
+			}
+			//println!("chunk pushed");
+		}
+		//println!("stream complete");
+		Ok(())
+	}
+
+	async fn run(mut self) {
+		loop {
+			tokio::select! {
+				msg = self.rx_ch.recv() => match msg {
+					Some(RpcWorkerMessage::Request{ctx, payload}) => {
+						let backend = Arc::clone(&self.inner);
+						tokio::spawn(async move {
+							let response = match payload {
+								RpcRequest::RetrieveChunk{id} => {
+									backend.retrieve(id).await.into()
+								}
+								RpcRequest::ContainsChunk{id} => {
+									backend.contains(id).await.into()
+								}
+								RpcRequest::GetRepositoryConfigKey{key} => {
+									backend.get_repository_config_key(&key).await.into()
+								}
+								RpcRequest::CheckRepository => {
+									let progress_sink = Box::new(ProgressGenerator{sink: ctx.message_sender()});
+									let result = backend.check_all_segments(Some(progress_sink)).await.into();
+									// ensure that we send one last progress update, as the ProgressGenerator is intentionally not reliable if the worker is very busy
+									let _: StdResult<_, _> = ctx.send_message(RpcMessage::ProgressPush(1.0)).await;
+									result
+								}
+								RpcRequest::StreamChunks{ids} => {
+									Self::stream_chunks(backend, ids, ctx.message_sender()).await.into()
+								}
+								RpcRequest::FindMissingChunks{ids} => {
+									backend.find_missing_chunks(ids).await.into()
+								}
+							};
+							let _: StdResult<_, _> = ctx.reply(response).await;
+						});
+					}
+					Some(_) => continue,
+					None => return,
+				}
+			}
+		}
+	}
+}
+
+pub fn spawn_rpc_server<
+	S: ObjectStore + Send + Sync + 'static,
+	I: AsyncRead + AsyncWrite + Send + 'static,
+>(
+	backend: S,
+	io: I,
+) -> tokio::task::JoinHandle<()> {
+	let (_, _, message_rx) = RpcWorkerConfig::new().spawn(io);
+	let worker = RpcStoreServerWorker {
+		inner: Arc::new(backend),
+		rx_ch: message_rx,
+	};
+	tokio::spawn(worker.run())
+}

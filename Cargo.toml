@@ -26,12 +26,16 @@ zstd = "^0.11"
 anyhow = "^1"
 crc32fast = "^1"
 async-trait = "^0.1"
-tokio = { version = "^1", features = ["io-util", "macros", "rt", "rt-multi-thread", "io-std"] }
+tokio = { version = "^1", features = ["io-util", "macros", "rt", "rt-multi-thread", "io-std", "net"] }
 # via tokio
 pin-project-lite = "*"
 # via tokio
 futures = "*"
 tokio-util = { version = "^0.7", features = ["codec"] }
+tokio-stream = { version = "^0.1" }
 
 [[bin]]
 name = "check"
+
+[[bin]]
+name = "pipecheck"

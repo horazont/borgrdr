@@ -1,4 +1,5 @@
 use std::env::args;
+use std::sync::Arc;
 
 use futures::stream::StreamExt;
 
@@ -32,7 +33,7 @@ fn convert_ts(ts: i64) -> DateTime<Utc> {
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
 	let argv: Vec<String> = args().collect();
 
-	let store = FsStore::open(argv[1].clone())?;
+	let store = Arc::new(FsStore::open(argv[1].clone())?);
 	let archive_name = argv.get(2);
 	let file_name = argv.get(3);
 	let mut chunks_to_extract: Option<Vec<Id>> = None;
@@ -56,7 +57,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 		eprintln!("  Comment: {:?}", archive.comment());
 		eprintln!("  Items:");
 		let mut archive_item_stream =
-			repo.archive_items(futures::stream::iter(archive.items().iter()));
+			repo.archive_items(archive.items().iter().map(|x| *x).collect())?;
 		while let Some(item) = archive_item_stream.next().await {
 			let item = item?;
 			eprint!("    {} ", mode_to_str(item.mode()));
@@ -86,7 +87,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 	}
 
 	if let Some(chunks) = chunks_to_extract {
-		let mut stream = repo.open_stream(futures::stream::iter(chunks.iter()));
+		let mut stream = repo.open_stream(chunks)?;
 		tokio::io::copy(&mut stream, &mut tokio::io::stdout()).await?;
 	}
 	Ok(())

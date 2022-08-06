@@ -2,12 +2,18 @@ use std::borrow::Cow;
 use std::collections::HashMap;
 use std::fmt;
 use std::fs;
+use std::future::Future;
 use std::io;
 use std::io::Seek;
 use std::path::{Path, PathBuf};
+use std::pin::Pin;
+use std::sync::Arc;
 use std::sync::RwLock;
+use std::task::{Context, Poll};
 
 use configparser::ini::Ini;
+
+use futures::stream::Stream;
 
 use bytes::Bytes;
 
@@ -245,10 +251,25 @@ impl FsStore {
 
 		Ok(index_segment)
 	}
+
+	fn contains_inner(&self, id: &Id) -> io::Result<bool> {
+		let id = id.as_ref();
+		match self
+			.try_on_disk_cache(id)
+			.or_else(|| self.try_in_memory_cache(id))
+		{
+			Some(Ok(Some(_))) => return Ok(true),
+			Some(Ok(None)) => return Ok(false),
+			Some(Err(e)) => return Err(e),
+			// caches are all inconclusive, do exhaustive search
+			None => (),
+		}
+		Ok(self.search_chunk(id)?.is_some())
+	}
 }
 
 #[async_trait::async_trait]
-impl ObjectStore for FsStore {
+impl ObjectStore for Arc<FsStore> {
 	async fn retrieve<K: AsRef<Id> + Send>(&self, id: K) -> io::Result<Bytes> {
 		let id = id.as_ref();
 		match self
@@ -280,27 +301,30 @@ impl ObjectStore for FsStore {
 	}
 
 	async fn contains<K: AsRef<Id> + Send>(&self, id: K) -> io::Result<bool> {
-		let id = id.as_ref();
-		match self
-			.try_on_disk_cache(id)
-			.or_else(|| self.try_in_memory_cache(id))
-		{
-			Some(Ok(Some(_))) => return Ok(true),
-			Some(Ok(None)) => return Ok(false),
-			Some(Err(e)) => return Err(e),
-			// caches are all inconclusive, do exhaustive search
-			None => (),
-		}
-		Ok(self.search_chunk(id)?.is_some())
+		self.contains_inner(id.as_ref())
 	}
 
-	async fn get_repository_config_key(&self, key: &str) -> Option<String> {
-		self.config.get("repository", key)
+	async fn find_missing_chunks(&self, ids: Vec<Id>) -> io::Result<Vec<Id>> {
+		let mut missing = Vec::new();
+		for (i, id) in ids.into_iter().enumerate() {
+			if !self.contains_inner(&id)? {
+				missing.push(id);
+			}
+			// make sure we yield once in a while
+			if i % 100 == 99 {
+				tokio::task::yield_now().await;
+			}
+		}
+		Ok(missing)
+	}
+
+	async fn get_repository_config_key(&self, key: &str) -> io::Result<Option<String>> {
+		Ok(self.config.get("repository", key))
 	}
 
 	async fn check_all_segments(
 		&self,
-		mut progress: Option<&mut (dyn ProgressSink + Send)>,
+		mut progress: Option<Box<dyn ProgressSink + Send + 'static>>,
 	) -> io::Result<()> {
 		let max_segment_number = self.latest_segment;
 		let segments_per_dir = self.segments_per_dir;
@@ -335,6 +359,7 @@ impl ObjectStore for FsStore {
 				Err(e) => return Err(e),
 			};
 			data_path.pop();
+			tokio::task::yield_now().await;
 			let mut reader = SegmentReader::new(io::BufReader::new(reader));
 			while let Some((offset, segment)) = reader.read_pos()? {
 				let (key, value) = match segment {
@@ -349,6 +374,7 @@ impl ObjectStore for FsStore {
 					}
 				};
 				update_cache.insert(key, value);
+				tokio::task::yield_now().await;
 			}
 		}
 
@@ -356,6 +382,7 @@ impl ObjectStore for FsStore {
 			let mut lock = self.segment_cache.write().unwrap();
 			*lock = new_cache;
 		}
+		tokio::task::yield_now().await;
 		if let Some(on_disk_index) = self.on_disk_index.as_ref() {
 			let lock = self.segment_cache.read().unwrap();
 			for (key, value) in lock.iter() {
@@ -368,8 +395,48 @@ impl ObjectStore for FsStore {
 				}
 			}
 		}
+		tokio::task::yield_now().await;
 		progress.report(Progress::Complete);
 		Ok(())
+	}
+
+	type ChunkStream = ChunkStream;
+
+	fn stream_chunks(&self, chunks: Vec<Id>) -> io::Result<Self::ChunkStream> {
+		Ok(Self::ChunkStream {
+			ids: chunks.into_iter(),
+			store: Arc::clone(self),
+			request: None,
+		})
+	}
+}
+
+pub struct ChunkStream {
+	store: Arc<FsStore>,
+	ids: std::vec::IntoIter<Id>,
+	request: Option<Pin<Box<dyn Future<Output = io::Result<Bytes>> + Send>>>,
+}
+
+impl Stream for ChunkStream {
+	type Item = io::Result<Bytes>;
+
+	fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+		if self.request.is_none() {
+			let id = match self.ids.next() {
+				None => return Poll::Ready(None),
+				Some(id) => id,
+			};
+			let store = Arc::clone(&self.store);
+			self.request = Some(Box::pin(async move { store.retrieve(id).await }));
+		}
+
+		match self.request.as_mut().unwrap().as_mut().poll(cx) {
+			Poll::Pending => Poll::Pending,
+			Poll::Ready(v) => {
+				self.request = None;
+				Poll::Ready(Some(v))
+			}
+		}
 	}
 }
 

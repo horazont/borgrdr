@@ -1,5 +1,4 @@
 use std::fmt;
-use std::future::Future;
 use std::io;
 use std::pin::Pin;
 use std::task::{Context, Poll};
@@ -108,7 +107,7 @@ pub struct Repository<S> {
 	crypto_ctx: crypto::Context,
 }
 
-impl<S: ObjectStore> Repository<S> {
+impl<S: ObjectStore + Send + Sync + 'static> Repository<S> {
 	pub async fn open(
 		store: S,
 		secret_provider: Box<dyn PassphraseProvider>,
@@ -116,7 +115,10 @@ impl<S: ObjectStore> Repository<S> {
 		// once we implement crypto support, we need two things:
 		// - the ability to query the repokey from the ObjectStore
 		// - a way to ask for a passphrase (by passing a callback)
-		let repokey_data = store.get_repository_config_key("key").await;
+		let repokey_data = match store.get_repository_config_key("key").await {
+			Ok(v) => v,
+			Err(e) => return Err(Error::InaccessibleConfig(e)),
+		};
 		let crypto_ctx = crypto::Context::new();
 		let manifest = match Self::read_manifest(
 			&store,
@@ -143,10 +145,6 @@ impl<S: ObjectStore> Repository<S> {
 
 	pub fn store(&self) -> &S {
 		&self.store
-	}
-
-	pub fn store_mut(&mut self) -> &mut S {
-		&mut self.store
 	}
 
 	fn detect_crypto(
@@ -225,23 +223,22 @@ impl<S: ObjectStore> Repository<S> {
 		&self.manifest
 	}
 
-	pub fn open_stream<'x, A: 'x + AsRef<Id> + Send, I: Stream<Item = A>>(
+	pub fn open_stream<'x>(
 		&'x self,
-		iter: I,
-	) -> StreamReader<'x, S, I> {
-		StreamReader {
+		ids: Vec<Id>,
+	) -> io::Result<StreamReader<'x, S, S::ChunkStream>> {
+		Ok(StreamReader {
 			repo: self,
 			curr: None,
-			next_poll: None,
-			iter,
-		}
+			src: self.store.stream_chunks(ids)?,
+		})
 	}
 
-	pub fn archive_items<'x, A: 'x + AsRef<Id> + Send, I: Stream<Item = A>>(
+	pub fn archive_items<'x>(
 		&'x self,
-		iter: I,
-	) -> FramedRead<StreamReader<'x, S, I>, MpCodec<ArchiveItem>> {
-		FramedRead::new(self.open_stream(iter), MpCodec::new())
+		ids: Vec<Id>,
+	) -> io::Result<FramedRead<StreamReader<'x, S, S::ChunkStream>, MpCodec<ArchiveItem>>> {
+		Ok(FramedRead::new(self.open_stream(ids)?, MpCodec::new()))
 	}
 }
 
@@ -250,37 +247,26 @@ pin_project_lite::pin_project! {
 	pub struct StreamReader<'x, S, I> {
 		repo: &'x Repository<S>,
 		curr: Option<Bytes>,
-		next_poll: Option<Pin<Box<dyn Future<Output = io::Result<Bytes>> + 'x>>>,
 		#[pin]
-		iter: I,
+		src: I,
 	}
 }
 
-impl<'p, 'x, A: 'x + AsRef<Id> + Send, S: ObjectStore, I: Stream<Item = A>>
+impl<'p, 'x, S: ObjectStore + Send + Sync + 'static, I: Stream<Item = io::Result<Bytes>>>
 	StreamReaderProj<'p, 'x, S, I>
 {
 	fn poll_next_object(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<Option<Bytes>>> {
-		if self.next_poll.is_none() {
-			let next_blob = match self.iter.as_mut().poll_next(cx) {
-				Poll::Pending => return Poll::Pending,
-				Poll::Ready(None) => return Poll::Ready(Ok(None)),
-				Poll::Ready(Some(id)) => id,
-			};
-			*self.next_poll = Some(self.repo.store.retrieve(next_blob));
+		//println!("StreamReader looking for next object");
+		match self.src.as_mut().poll_next(cx) {
+			Poll::Ready(Some(Ok(v))) => Poll::Ready(Ok(Some(self.repo.decode_raw(&v)?.into()))),
+			Poll::Ready(Some(Err(e))) => Poll::Ready(Err(e)),
+			Poll::Ready(None) => Poll::Ready(Ok(None)),
+			Poll::Pending => Poll::Pending,
 		}
-		let buf = match self.next_poll.as_mut().unwrap().as_mut().poll(cx) {
-			Poll::Pending => return Poll::Pending,
-			Poll::Ready(Ok(v)) => {
-				*self.next_poll = None;
-				v
-			}
-			Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
-		};
-		Poll::Ready(Ok(Some(self.repo.decode_raw(&buf)?.into())))
 	}
 }
 
-impl<'x, A: 'x + AsRef<Id> + Send, S: ObjectStore, I: Stream<Item = A>> AsyncRead
+impl<'p, 'x, S: ObjectStore + Send + Sync + 'static, I: Stream<Item = io::Result<Bytes>>> AsyncRead
 	for StreamReader<'x, S, I>
 {
 	fn poll_read(
@@ -288,10 +274,13 @@ impl<'x, A: 'x + AsRef<Id> + Send, S: ObjectStore, I: Stream<Item = A>> AsyncRea
 		cx: &mut Context<'_>,
 		buf: &mut ReadBuf<'_>,
 	) -> Poll<io::Result<()>> {
+		//println!("StreamReader read({})", buf.remaining());
 		match self.as_mut().poll_fill_buf(cx) {
 			Poll::Ready(Ok(my_buf)) => {
+				//println!("StreamReader got {}", my_buf.len());
 				let len = my_buf.len().min(buf.remaining());
 				buf.put_slice(&my_buf[..len]);
+				//println!("StreamReader advanced by {}, remaining {}", len, my_buf.len() - len);
 				self.consume(len);
 				Poll::Ready(Ok(()))
 			}
@@ -301,8 +290,8 @@ impl<'x, A: 'x + AsRef<Id> + Send, S: ObjectStore, I: Stream<Item = A>> AsyncRea
 	}
 }
 
-impl<'x, A: 'x + AsRef<Id> + Send, S: ObjectStore, I: Stream<Item = A>> AsyncBufRead
-	for StreamReader<'x, S, I>
+impl<'p, 'x, S: ObjectStore + Send + Sync + 'static, I: Stream<Item = io::Result<Bytes>>>
+	AsyncBufRead for StreamReader<'x, S, I>
 {
 	fn consume(self: Pin<&mut Self>, amt: usize) {
 		if amt == 0 {

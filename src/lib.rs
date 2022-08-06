@@ -6,6 +6,7 @@ pub mod hashindex;
 pub mod progress;
 pub mod repository;
 pub mod rmp_codec;
+pub mod rpc;
 pub mod segments;
 pub mod store;
 pub mod structs;

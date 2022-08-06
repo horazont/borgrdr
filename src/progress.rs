@@ -34,7 +34,7 @@ impl ProgressSink for &mut dyn ProgressSink {
 	}
 }
 
-impl<'x> ProgressSink for &mut (dyn ProgressSink + Send + 'x) {
+impl<'x> ProgressSink for Box<(dyn ProgressSink + Send + 'x)> {
 	fn report(&mut self, progress: Progress) {
 		(**self).report(progress)
 	}
