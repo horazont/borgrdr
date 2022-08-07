@@ -158,7 +158,7 @@ impl<E: std::error::Error> From<StdResult<(), E>> for RpcResponse {
 #[derive(Debug, Serialize, Deserialize)]
 pub enum RpcItem {
 	Message {
-		in_reply_to: Option<RequestId>,
+		in_reply_to: RequestId,
 		payload: RpcMessage,
 	},
 	Request {
@@ -509,16 +509,7 @@ impl Stream for RequestWorkers {
 	}
 }
 
-enum RpcWorkerMessage {
-	Request {
-		ctx: RequestContext,
-		payload: RpcRequest,
-	},
-	Message {
-		#[allow(dead_code)]
-		payload: RpcMessage,
-	},
-}
+type RpcWorkerMessage = (RequestContext, RpcRequest);
 
 struct RpcWorkerConfig {
 	request_queue_size: usize,
@@ -561,7 +552,6 @@ impl RpcWorkerConfig {
 			rx,
 			next_id: 0,
 			request_rx,
-			request_tx_zygote: request_tx.clone(),
 			message_tx,
 			response_handlers: HashMap::new(),
 			message_handlers: HashMap::new(),
@@ -642,7 +632,6 @@ struct RpcWorker<T: AsyncRead + AsyncWrite> {
 	rx: SplitStream<codec::Framed<T, MpCodec<RpcItem>>>,
 	next_id: RequestId,
 	request_rx: mpsc::Receiver<RpcWorkerCommand>,
-	request_tx_zygote: mpsc::Sender<RpcWorkerCommand>,
 	message_tx: mpsc::Sender<RpcWorkerMessage>,
 	response_handlers: HashMap<RequestId, oneshot::Sender<io::Result<RpcResponse>>>,
 	message_handlers: HashMap<RequestId, mpsc::Sender<RpcMessage>>,
@@ -671,7 +660,6 @@ impl<T: AsyncRead + AsyncWrite> RpcWorker<T> {
 
 	fn drain_with_error(mut self, e: &ErrorGenerator) {
 		self.request_rx.close();
-		drop(self.request_tx_zygote);
 		drop(self.message_tx);
 		drop(self.request_workers);
 		self.message_handlers.clear();
@@ -757,22 +745,17 @@ impl<T: AsyncRead + AsyncWrite> RpcWorker<T> {
 					match item {
 						// push-style message, potentially related to an ongoing request
 						Some(Ok(RpcItem::Message{in_reply_to, payload})) => {
-							if let Some(in_reply_to) = in_reply_to {
-								match self.message_handlers.entry(in_reply_to) {
-									// no recipient, drop
-									hash_map::Entry::Vacant(_) => (),
-									hash_map::Entry::Occupied(o) => {
-										match o.get().send(payload).await {
-											Ok(_) => (),
-											Err(_) => {
-												o.remove();
-											}
+							match self.message_handlers.entry(in_reply_to) {
+								// no recipient, drop
+								hash_map::Entry::Vacant(_) => (),
+								hash_map::Entry::Occupied(o) => {
+									match o.get().send(payload).await {
+										Ok(_) => (),
+										Err(_) => {
+											o.remove();
 										}
 									}
 								}
-							} else {
-								// it is legitimate to drop all unsolicited messages, the intent of which is signalled by dropping the rx side.
-								let _: StdResult<_, _> = self.message_tx.send(RpcWorkerMessage::Message{payload}).await;
 							}
 						}
 
@@ -783,12 +766,22 @@ impl<T: AsyncRead + AsyncWrite> RpcWorker<T> {
 								msg_tx,
 								res_tx,
 							);
-							self.request_workers.add(id, ch);
-							// we'll learn about failure by polling request_workers
-							let _: StdResult<_, _> = self.message_tx.send(RpcWorkerMessage::Request{
-								payload,
-								ctx,
-							}).await;
+							match self.message_tx.send((ctx, payload)).await {
+								Ok(_) => {
+									// successfully sent *somewhere*, so we need to poll it
+									self.request_workers.add(id, ch);
+								}
+								Err(mpsc::error::SendError((_, _))) => {
+									// there is nothing there handling requests -> return error
+									handle_tx! {
+										self.tx.send(RpcItem::Response{id, payload: RpcResponse::Error("request refused".into())}).await => {
+											Ok(()) => (),
+											Err(_) => () => break,
+										}
+									}
+									tx_timeout.as_mut().reset(Self::tx_deadline());
+								}
+							};
 						}
 
 						// incoming response: route it to the corresponding task.
@@ -846,7 +839,7 @@ impl<T: AsyncRead + AsyncWrite> RpcWorker<T> {
 						}
 						RequestWorkerItem::Message(req_id, msg, ch) => {
 							handle_tx! {
-								self.tx.send(RpcItem::Message{in_reply_to: Some(req_id), payload: msg}).await => {
+								self.tx.send(RpcItem::Message{in_reply_to: req_id, payload: msg}).await => {
 									Ok(()) => fulfill_reply!(Some(ch), Ok(())),
 									Err(e) => fulfill_reply!(Some(ch), Err(e.into())) => break,
 								}
@@ -877,7 +870,7 @@ impl<T: AsyncRead + AsyncWrite> RpcWorker<T> {
 							}
 							tx_timeout.as_mut().reset(Self::tx_deadline());
 						},
-						None => return,
+						None => break Ok(()),
 					}
 				},
 			}
@@ -1200,6 +1193,9 @@ impl DiagnosticsSink for ProgressGenerator {
 pub struct RpcStoreServerWorker<S> {
 	inner: Arc<S>,
 	rx_ch: mpsc::Receiver<RpcWorkerMessage>,
+	// required to prevent the rpc worker from shutting down
+	#[allow(dead_code)]
+	guard: mpsc::Sender<RpcWorkerCommand>,
 }
 
 impl<S: ObjectStore + Sync + Send + 'static> RpcStoreServerWorker<S> {
@@ -1224,7 +1220,7 @@ impl<S: ObjectStore + Sync + Send + 'static> RpcStoreServerWorker<S> {
 		loop {
 			tokio::select! {
 				msg = self.rx_ch.recv() => match msg {
-					Some(RpcWorkerMessage::Request{ctx, payload}) => {
+					Some((ctx, payload)) => {
 						let backend = Arc::clone(&self.inner);
 						tokio::spawn(async move {
 							let response = match payload {
@@ -1253,7 +1249,6 @@ impl<S: ObjectStore + Sync + Send + 'static> RpcStoreServerWorker<S> {
 							let _: StdResult<_, _> = ctx.reply(response).await;
 						});
 					}
-					Some(_) => continue,
 					None => return,
 				}
 			}
@@ -1268,10 +1263,11 @@ pub fn spawn_rpc_server<
 	backend: S,
 	io: I,
 ) -> tokio::task::JoinHandle<()> {
-	let (_, _, message_rx) = RpcWorkerConfig::new().spawn(io);
+	let (_, command_tx, message_rx) = RpcWorkerConfig::new().spawn(io);
 	let worker = RpcStoreServerWorker {
 		inner: Arc::new(backend),
 		rx_ch: message_rx,
+		guard: command_tx,
 	};
 	tokio::spawn(worker.run())
 }
