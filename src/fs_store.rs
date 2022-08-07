@@ -39,6 +39,20 @@ pub enum Error {
 	InaccessibleIndex(io::Error),
 }
 
+impl From<Error> for io::Error {
+	fn from(other: Error) -> Self {
+		match other {
+			Error::InaccessibleConfig(e) => {
+				io::Error::new(e.kind(), format!("inaccessible index: {}", e))
+			}
+			Error::InaccessibleIndex(e) => {
+				io::Error::new(e.kind(), format!("inaccessible index: {}", e))
+			}
+			other => io::Error::new(io::ErrorKind::InvalidData, other),
+		}
+	}
+}
+
 impl fmt::Display for Error {
 	fn fmt<'f>(&self, f: &'f mut fmt::Formatter) -> fmt::Result {
 		match self {

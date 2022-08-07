@@ -36,15 +36,10 @@ tokio-stream = { version = "^0.1" }
 log = "^0.4"
 env_logger = "^0.9"
 bincode = "^1"
+url = "^2"
 
 [[bin]]
 name = "check"
 
 [[bin]]
-name = "pipecheck"
-
-[[bin]]
 name = "serve"
-
-[[bin]]
-name = "stdiocheck"

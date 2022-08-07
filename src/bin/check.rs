@@ -5,12 +5,10 @@ use std::sync::{Arc, Mutex};
 
 use anyhow::{Context, Result};
 
-use futures::stream::StreamExt;
+use log::{error, log};
 
 use borgrdr::diag;
 use borgrdr::diag::{DiagnosticsSink, Progress};
-use borgrdr::fs_store::FsStore;
-use borgrdr::repository::Repository;
 use borgrdr::store::ObjectStore;
 
 struct ProgressMeter {
@@ -51,6 +49,11 @@ impl ProgressMeter {
 		print!("\x1b[Ksegments: {}  archives: {}\r", segments, archives);
 		let _ = io::stdout().flush();
 	}
+
+	fn clear(&self) {
+		print!("\x1b[K");
+		let _ = io::stdout().flush();
+	}
 }
 
 struct ProgressMeterRef {
@@ -72,7 +75,7 @@ impl DiagnosticsSink for ProgressMeterRef {
 		if level < diag::Level::Warning {
 			return;
 		}
-		println!("{}[{}]: {}", level, subsystem, message);
+		log!(level.into(), "{}: {}", subsystem, message);
 	}
 }
 
@@ -94,48 +97,38 @@ async fn main() -> Result<()> {
 	env_logger::init();
 	let argv: Vec<String> = args().collect();
 
-	let (mut segment_meter, mut archive_meter) = split_meter(ProgressMeter::new().shareable());
-	let store = Arc::new(FsStore::open(argv[1].clone())?);
-	let store_ref = Arc::clone(&store);
-	let checker =
-		tokio::spawn(async move { store_ref.check_all_segments(Some(&mut segment_meter)).await });
-	let repo = Repository::open(store, Box::new(borgrdr::repository::EnvPassphrase::new()))
-		.await
-		.with_context(|| "failed to open repository")?;
-	let manifest = repo.manifest();
-	let mut narchives = 0;
-	let mut nitems = 0;
-	let mut nchunks = 0;
-	for (name, archive_hdr) in manifest.archives().iter() {
-		archive_meter.progress(Progress::Range {
-			cur: narchives,
-			max: manifest.archives().len() as u64,
-		});
-		narchives += 1;
-		let archive_meta = repo.read_archive(archive_hdr.id()).await.with_context(|| {
-			// let chunk = repo.store().retrieve(archive_hdr.id()).ok();
-			format!("failed to open archive {} @ {:?}", name, archive_hdr.id())
-		})?;
-		let ids: Vec<_> = archive_meta.items().iter().map(|x| *x).collect();
-		let mut archive_item_stream = repo.archive_items(ids)?;
-		while let Some(item) = archive_item_stream.next().await {
-			let item =
-				item.with_context(|| format!("failed to read archive item from {}", name))?;
-			for chunk in item.chunks().iter() {
-				if !repo.store().contains(chunk.id()).await? {
-					eprintln!("chunk {:?} is missing", chunk.id());
-				}
-			}
-			nchunks += item.chunks().len();
-			nitems += 1;
-		}
-	}
-	archive_meter.progress(Progress::Complete);
+	let meter = ProgressMeter::new().shareable();
+	let (mut segment_meter, mut archive_meter) = split_meter(Arc::clone(&meter));
 
-	checker.await??;
-	println!(
-		"checked {} archives, {} items, {} chunks",
-		narchives, nitems, nchunks
+	let (mut backend, repo) = borgrdr::cliutil::open_url_str(&argv[1])
+		.await
+		.with_context(|| format!("failed to open repository"))?;
+	let store = repo.store().clone();
+
+	let (repo_check, archive_check) = tokio::join!(
+		store.check_all_segments(Some(&mut segment_meter)),
+		repo.check_archives(Some(&mut archive_meter)),
 	);
+	let _ = meter.lock().and_then(|x| Ok(x.clear()));
+
+	let repo_check = repo_check.with_context(|| format!("repository check failed"));
+	let archive_check = archive_check.with_context(|| format!("archive check failed"));
+
+	let mut ok = true;
+	if let Some(err) = repo_check.err() {
+		error!("{}", err);
+		ok = false;
+	}
+	if let Some(err) = archive_check.err() {
+		error!("{}", err);
+		ok = false;
+	}
+	drop(repo);
+	drop(store);
+	let _: Result<_, _> = backend.wait_for_shutdown().await;
+	if !ok {
+		// we printed errors already, so we skip the result here
+		std::process::exit(125);
+	}
 	Ok(())
 }

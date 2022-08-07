@@ -3,7 +3,9 @@ use std::io;
 use std::pin::Pin;
 use std::task::{Context, Poll};
 
-use futures::stream::Stream;
+use log::{debug, trace};
+
+use futures::stream::{Stream, StreamExt};
 
 use tokio::io::{AsyncBufRead, AsyncRead, ReadBuf};
 
@@ -18,6 +20,8 @@ use tokio_util::codec::FramedRead;
 use super::compress;
 use super::crypto;
 use super::crypto::Key;
+use super::diag;
+use super::diag::{DiagnosticsSink, Progress};
 use super::rmp_codec::MpCodec;
 use super::segments::Id;
 use super::store::ObjectStore;
@@ -30,6 +34,20 @@ pub enum Error {
 	InaccessibleConfig(io::Error),
 	ManifestInaccessible(io::Error),
 	ManifestVersionNotSupported(u8),
+}
+
+impl From<Error> for io::Error {
+	fn from(other: Error) -> Self {
+		match other {
+			Error::InaccessibleConfig(e) => {
+				io::Error::new(e.kind(), format!("inaccessible index: {}", e))
+			}
+			Error::ManifestInaccessible(e) => {
+				io::Error::new(e.kind(), format!("manifest inaccessible: {}", e))
+			}
+			other => io::Error::new(io::ErrorKind::InvalidData, other),
+		}
+	}
 }
 
 impl fmt::Display for Error {
@@ -239,6 +257,108 @@ impl<S: ObjectStore + Send + Sync + 'static> Repository<S> {
 		ids: Vec<Id>,
 	) -> io::Result<FramedRead<StreamReader<'x, S, S::ObjectStream>, MpCodec<ArchiveItem>>> {
 		Ok(FramedRead::new(self.open_stream(ids)?, MpCodec::new()))
+	}
+
+	pub async fn check_archives(
+		&self,
+		mut progress: Option<&mut (dyn DiagnosticsSink + Send)>,
+	) -> io::Result<()> {
+		let mut ok = true;
+		for (i, (name, archive_hdr)) in self.manifest.archives().iter().enumerate() {
+			progress.progress(Progress::Range {
+				cur: i as u64,
+				max: self.manifest.archives().len() as u64,
+			});
+
+			let archive_meta = match self.read_archive(archive_hdr.id()).await {
+				Ok(v) => {
+					debug!("check: opened archive {} (id={:?})", name, archive_hdr.id());
+					v
+				}
+				Err(e) => {
+					progress.log(
+						diag::Level::Error,
+						"archives",
+						&format!(
+							"failed to open archive {} (id={:?}): {}",
+							name,
+							archive_hdr.id(),
+							e
+						),
+					);
+					ok = false;
+					continue;
+				}
+			};
+
+			// accumulator for find_missing_objects calls -- batching them is much more efficient in RPC cases
+			let mut idbuf = Vec::new();
+
+			let mut archive_item_stream = match self.archive_items(archive_meta.items) {
+				Ok(v) => v,
+				Err(e) => {
+					progress.log(
+						diag::Level::Error,
+						"archives",
+						&format!(
+							"failed to open archive metadata stream of archive {} (id={:?}): {}",
+							name,
+							archive_hdr.id(),
+							e
+						),
+					);
+					ok = false;
+					continue;
+				}
+			};
+
+			while let Some(item) = archive_item_stream.next().await {
+				let item = match item {
+					Ok(v) => v,
+					Err(e) => {
+						progress.log(
+							diag::Level::Error,
+							"archive_items",
+							&format!("failed to read item metadata from {}: {}", name, e),
+						);
+						ok = false;
+						continue;
+					}
+				};
+				trace!("check: archive {}: found item {:?}", name, item.path());
+				idbuf.extend(item.chunks().iter().map(|x| x.id()));
+				if idbuf.len() >= 128 {
+					let ids = idbuf.split_off(0);
+					assert!(ids.len() > 0);
+					for missing_id in self.store.find_missing_objects(ids).await? {
+						progress.log(
+							diag::Level::Error,
+							"archive_items",
+							&format!("chunk {:?} is missing", missing_id),
+						);
+					}
+				}
+			}
+
+			if idbuf.len() > 0 {
+				for missing_id in self.store.find_missing_objects(idbuf).await? {
+					progress.log(
+						diag::Level::Error,
+						"archive_items",
+						&format!("chunk {:?} is missing", missing_id),
+					);
+				}
+			}
+		}
+		progress.progress(Progress::Complete);
+		if ok {
+			Ok(())
+		} else {
+			Err(io::Error::new(
+				io::ErrorKind::InvalidData,
+				"one or more archive checks failed",
+			))
+		}
 	}
 }
 

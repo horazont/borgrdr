@@ -179,7 +179,7 @@ pub struct Archive {
 	time_end: String,
 	comment: Option<String>,
 	chunker_params: Option<ChunkerParams>,
-	items: Vec<Id>,
+	pub(crate) items: Vec<Id>,
 }
 
 impl Archive {

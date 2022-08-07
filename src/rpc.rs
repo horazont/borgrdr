@@ -943,6 +943,7 @@ macro_rules! match_rpc_response {
 	}
 }
 
+#[derive(Clone)]
 pub struct RpcStoreClient {
 	request_ch: mpsc::Sender<RpcWorkerCommand>,
 }
