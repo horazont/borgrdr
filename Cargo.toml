@@ -26,7 +26,7 @@ zstd = "^0.11"
 anyhow = "^1"
 crc32fast = "^1"
 async-trait = "^0.1"
-tokio = { version = "^1", features = ["io-util", "macros", "rt", "rt-multi-thread", "io-std", "net"] }
+tokio = { version = "^1", features = ["io-util", "macros", "rt", "rt-multi-thread", "io-std", "net", "process"] }
 # via tokio
 pin-project-lite = "*"
 # via tokio
@@ -42,3 +42,9 @@ name = "check"
 
 [[bin]]
 name = "pipecheck"
+
+[[bin]]
+name = "serve"
+
+[[bin]]
+name = "stdiocheck"
