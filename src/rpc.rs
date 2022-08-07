@@ -642,7 +642,7 @@ impl<T: AsyncRead + AsyncWrite> RpcWorker<T> {
 	fn generate_next_id(&mut self) -> RequestId {
 		loop {
 			let id = self.next_id;
-			self.next_id += 1;
+			self.next_id = self.next_id.wrapping_add(1);
 			if !self.response_handlers.contains_key(&id) && !self.message_handlers.contains_key(&id)
 			{
 				return id;
