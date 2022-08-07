@@ -34,8 +34,11 @@ type RequestId = u64;
 
 #[derive(Debug, Serialize, Deserialize)]
 pub enum RpcMessage {
+	#[serde(rename = "p")]
 	ProgressPush(f64),
+	#[serde(rename = "d")]
 	DiagnosticsLog(diag::Level, String, String),
+	#[serde(rename = "c")]
 	StreamedChunk(StdResult<Bytes, String>),
 }
 
@@ -58,11 +61,17 @@ impl fmt::Display for RpcMessage {
 
 #[derive(Debug, Serialize, Deserialize)]
 pub enum RpcRequest {
+	#[serde(rename = "r")]
 	RetrieveObject { id: Id },
+	#[serde(rename = "s")]
 	StreamObjects { ids: Vec<Id> },
+	#[serde(rename = "i")]
 	ContainsObject { id: Id },
+	#[serde(rename = "f")]
 	FindMissingObjects { ids: Vec<Id> },
+	#[serde(rename = "c")]
 	GetRepositoryConfigKey { key: String },
+	#[serde(rename = "C")]
 	CheckRepository,
 }
 
@@ -82,11 +91,17 @@ impl fmt::Display for RpcRequest {
 
 #[derive(Debug, Serialize, Deserialize)]
 pub enum RpcResponse {
+	#[serde(rename = "D")]
 	DataReply(Bytes),
+	#[serde(rename = "b")]
 	BoolReply(bool),
+	#[serde(rename = "i")]
 	IdListReply(Vec<Id>),
+	#[serde(rename = "v")]
 	RepoKeyValueReply(Option<String>),
+	#[serde(rename = "!")]
 	Error(String),
+	#[serde(rename = "s")]
 	Success,
 }
 
@@ -160,20 +175,20 @@ impl<E: std::error::Error> From<StdResult<(), E>> for RpcResponse {
 
 #[derive(Debug, Serialize, Deserialize)]
 pub enum RpcItem {
+	#[serde(rename = ",")]
 	Message {
 		in_reply_to: RequestId,
 		payload: RpcMessage,
 	},
-	Request {
-		id: RequestId,
-		payload: RpcRequest,
-	},
-	Response {
-		id: RequestId,
-		payload: RpcResponse,
-	},
+	#[serde(rename = "?")]
+	Request { id: RequestId, payload: RpcRequest },
+	#[serde(rename = ".")]
+	Response { id: RequestId, payload: RpcResponse },
+	#[serde(rename = "h")]
 	Heartbeat,
+	#[serde(rename = "G")]
 	Goodbye,
+	#[serde(rename = "H")]
 	Hello,
 }
 
