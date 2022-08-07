@@ -7,8 +7,9 @@ use anyhow::{Context, Result};
 
 use futures::stream::StreamExt;
 
+use borgrdr::diag;
+use borgrdr::diag::{DiagnosticsSink, Progress};
 use borgrdr::fs_store::FsStore;
-use borgrdr::progress::{Progress, ProgressSink};
 use borgrdr::repository::Repository;
 use borgrdr::store::ObjectStore;
 
@@ -57,14 +58,21 @@ struct ProgressMeterRef {
 	index: usize,
 }
 
-impl ProgressSink for ProgressMeterRef {
-	fn report(&mut self, progress: Progress) {
+impl DiagnosticsSink for ProgressMeterRef {
+	fn progress(&mut self, progress: Progress) {
 		let mut lock = match self.inner.lock() {
 			Ok(v) => v,
 			Err(_) => return,
 		};
 		lock.meters[self.index] = progress;
 		lock.print();
+	}
+
+	fn log(&mut self, level: diag::Level, subsystem: &str, message: &str) {
+		if level < diag::Level::Warning {
+			return;
+		}
+		println!("{}[{}]: {}", level, subsystem, message);
 	}
 }
 
@@ -85,14 +93,11 @@ fn split_meter(meter: Arc<Mutex<ProgressMeter>>) -> (ProgressMeterRef, ProgressM
 async fn main() -> Result<()> {
 	let argv: Vec<String> = args().collect();
 
-	let (segment_meter, mut archive_meter) = split_meter(ProgressMeter::new().shareable());
+	let (mut segment_meter, mut archive_meter) = split_meter(ProgressMeter::new().shareable());
 	let store = Arc::new(FsStore::open(argv[1].clone())?);
 	let store_ref = Arc::clone(&store);
-	let checker = tokio::spawn(async move {
-		store_ref
-			.check_all_segments(Some(Box::new(segment_meter)))
-			.await
-	});
+	let checker =
+		tokio::spawn(async move { store_ref.check_all_segments(Some(&mut segment_meter)).await });
 	let repo = Repository::open(store, Box::new(borgrdr::repository::EnvPassphrase::new()))
 		.await
 		.with_context(|| "failed to open repository")?;
@@ -101,7 +106,7 @@ async fn main() -> Result<()> {
 	let mut nitems = 0;
 	let mut nchunks = 0;
 	for (name, archive_hdr) in manifest.archives().iter() {
-		archive_meter.report(Progress::Range {
+		archive_meter.progress(Progress::Range {
 			cur: narchives,
 			max: manifest.archives().len() as u64,
 		});
@@ -124,7 +129,7 @@ async fn main() -> Result<()> {
 			nitems += 1;
 		}
 	}
-	archive_meter.report(Progress::Complete);
+	archive_meter.progress(Progress::Complete);
 
 	checker.await??;
 	println!(

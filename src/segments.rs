@@ -37,10 +37,14 @@ impl fmt::Debug for Id {
 	}
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 pub enum Error {
 	InvalidSegmentTag(u8),
-	CrcMismatch { found: u32, calculated: u32 },
+	CrcMismatch {
+		found: u32,
+		calculated: u32,
+		unchecked: Segment<'static>,
+	},
 	InvalidSize(SegmentType, u32),
 	InvalidHeader([u8; 8]),
 }
@@ -49,7 +53,9 @@ impl fmt::Display for Error {
 	fn fmt<'f>(&self, f: &'f mut fmt::Formatter) -> fmt::Result {
 		match self {
 			Self::InvalidSegmentTag(tag) => write!(f, "invalid segment tag: 0x{:02x}", tag),
-			Self::CrcMismatch { found, calculated } => write!(
+			Self::CrcMismatch {
+				found, calculated, ..
+			} => write!(
 				f,
 				"crc mismatch: 0x{:08x} (found) != 0x{:08x} (calculated)",
 				found, calculated
@@ -69,6 +75,23 @@ impl std::error::Error for Error {}
 impl From<Error> for io::Error {
 	fn from(other: Error) -> io::Error {
 		io::Error::new(io::ErrorKind::InvalidData, other)
+	}
+}
+
+impl TryFrom<io::Error> for Error {
+	type Error = io::Error;
+
+	fn try_from(other: io::Error) -> Result<Self, Self::Error> {
+		if other.kind() != io::ErrorKind::InvalidData {
+			return Err(other);
+		}
+		let inner: Option<&Self> = other.get_ref().and_then(|x| x.downcast_ref());
+		if inner.is_some() {
+			drop(inner);
+			Ok(*other.into_inner().unwrap().downcast().unwrap())
+		} else {
+			return Err(other);
+		}
 	}
 }
 
@@ -207,6 +230,7 @@ pub fn read_segment<R: io::Read>(mut src: R) -> io::Result<Option<Segment<'stati
 		return Err(Error::CrcMismatch {
 			found: crc,
 			calculated: crc_calculated,
+			unchecked: result,
 		}
 		.into());
 	}
@@ -247,12 +271,15 @@ impl<R: io::Read> SegmentReader<R> {
 }
 
 impl<R: io::Read + io::Seek> SegmentReader<R> {
-	pub fn read_pos(&mut self) -> io::Result<Option<(u64, Segment)>> {
-		self.read_header()?;
-		let pos = self.inner.stream_position()?;
-		match read_segment(&mut self.inner)? {
-			Some(segment) => Ok(Some((pos, segment))),
-			None => Ok(None),
+	pub fn read_pos(&mut self) -> (u64, io::Result<Option<Segment>>) {
+		match self.read_header() {
+			Ok(()) => (),
+			Err(e) => return (0, Err(e)),
 		}
+		let pos = self
+			.inner
+			.stream_position()
+			.expect("stream position not known");
+		(pos, read_segment(&mut self.inner))
 	}
 }

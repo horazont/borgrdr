@@ -6,7 +6,7 @@ use bytes::Bytes;
 
 use futures::stream::Stream;
 
-use super::progress::ProgressSink;
+use super::diag::DiagnosticsSink;
 use super::segments::Id;
 
 #[async_trait::async_trait]
@@ -19,12 +19,12 @@ pub trait ObjectStore {
 	async fn get_repository_config_key(&self, key: &str) -> io::Result<Option<String>>;
 	async fn check_all_segments(
 		&self,
-		progress: Option<Box<dyn ProgressSink + Send + 'static>>,
+		progress: Option<&mut (dyn DiagnosticsSink + Send)>,
 	) -> io::Result<()>;
 
-	// we have to take Vec<Id> here for the lack of GATs
+	// we have to take Vec<Id> here for the lack of type-GATs
 	// this will likely only be implementable on Arc<ObjectStore>,
-	// for lack of GATs
+	// for lack of lifetime-GATs
 	fn stream_chunks(&self, chunks: Vec<Id>) -> io::Result<Self::ChunkStream>;
 }
 
@@ -50,7 +50,7 @@ impl<S: ObjectStore + Send + Sync> ObjectStore for Arc<S> {
 
 	async fn check_all_segments(
 		&self,
-		progress: Option<Box<dyn ProgressSink + Send + 'static>>,
+		progress: Option<&mut (dyn DiagnosticsSink + Send)>,
 	) -> io::Result<()> {
 		(**self).check_all_segments(progress).await
 	}

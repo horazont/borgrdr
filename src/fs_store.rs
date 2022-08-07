@@ -1,5 +1,6 @@
 use std::borrow::Cow;
-use std::collections::HashMap;
+use std::collections::hash_map;
+use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::fs;
 use std::future::Future;
@@ -17,8 +18,10 @@ use futures::stream::Stream;
 
 use bytes::Bytes;
 
+use super::diag;
+use super::diag::{DiagnosticsSink, Progress};
 use super::hashindex::{MmapSegmentIndex, ReadSegmentIndex};
-use super::progress::{Progress, ProgressSink};
+use super::segments;
 use super::segments::{read_segment, Id, Segment, SegmentReader};
 use super::store::ObjectStore;
 
@@ -183,7 +186,12 @@ impl FsStore {
 		for item in self.iter_segment_files()? {
 			let (fileno, item) = item?;
 			let mut rdr = SegmentReader::new(io::BufReader::new(item));
-			while let Some((offset, segment)) = rdr.read_pos()? {
+			loop {
+				let (offset, segment) = rdr.read_pos();
+				let segment = match segment? {
+					Some(v) => v,
+					None => break,
+				};
 				match segment {
 					Segment::Put { ref key, ref data } => {
 						if !lock.contains_key(key) {
@@ -324,11 +332,12 @@ impl ObjectStore for Arc<FsStore> {
 
 	async fn check_all_segments(
 		&self,
-		mut progress: Option<Box<dyn ProgressSink + Send + 'static>>,
+		mut progress: Option<&mut (dyn DiagnosticsSink + Send)>,
 	) -> io::Result<()> {
 		let max_segment_number = self.latest_segment;
 		let segments_per_dir = self.segments_per_dir;
 		let mut data_path = self.root.clone();
+		let mut ok = true;
 		data_path.push("data");
 		// we're popping that off in the first iteration
 		data_path.push("XXXXXXXX");
@@ -338,7 +347,7 @@ impl ObjectStore for Arc<FsStore> {
 		for segment_no in 0..=max_segment_number {
 			let (dir, file) = split_fileno(segments_per_dir, segment_no);
 			if segment_no % 100 == 0 {
-				progress.report(Progress::Range {
+				progress.progress(Progress::Range {
 					// revresed!
 					cur: segment_no,
 					max: max_segment_number,
@@ -356,12 +365,64 @@ impl ObjectStore for Arc<FsStore> {
 					data_path.pop();
 					continue;
 				}
-				Err(e) => return Err(e),
+				Err(e) => {
+					progress.log(
+						diag::Level::Error,
+						"segments",
+						&format!(
+							"failed to open segment file {} at {:?}: {}",
+							segment_no, data_path, e
+						),
+					);
+					ok = false;
+					data_path.pop();
+					continue;
+				}
 			};
 			data_path.pop();
 			tokio::task::yield_now().await;
 			let mut reader = SegmentReader::new(io::BufReader::new(reader));
-			while let Some((offset, segment)) = reader.read_pos()? {
+			loop {
+				let (offset, item) = reader.read_pos();
+				let segment = match item {
+					Ok(Some(segment)) => segment,
+					Ok(None) => break,
+					Err(e) => {
+						ok = false;
+						match segments::Error::try_from(e) {
+							Ok(segments::Error::CrcMismatch {
+								unchecked,
+								found,
+								calculated,
+							}) => {
+								progress.log(diag::Level::Error, "segments", &format!("chunk crc mismatch in segment file {} at offset {}: 0x{:08x} (found) != 0x{:08x} (expected), but reading the chunk anyway", segment_no, offset, found, calculated));
+								unchecked
+							}
+							Ok(other) => {
+								progress.log(
+									diag::Level::Error,
+									"segments",
+									&format!(
+										"malformed chunk in segment file {} at offset {}: {}",
+										segment_no, offset, other
+									),
+								);
+								continue;
+							}
+							Err(other) => {
+								progress.log(
+									diag::Level::Error,
+									"segments",
+									&format!(
+										"failed to read chunk in segment file {} at offset {}: {}",
+										segment_no, offset, other
+									),
+								);
+								continue;
+							}
+						}
+					}
+				};
 				let (key, value) = match segment {
 					Segment::Put { ref key, .. } => (*key, Some((segment_no, offset))),
 					Segment::Delete { ref key } => (*key, None),
@@ -373,7 +434,21 @@ impl ObjectStore for Arc<FsStore> {
 						continue;
 					}
 				};
-				update_cache.insert(key, value);
+				match update_cache.entry(key) {
+					hash_map::Entry::Vacant(v) => {
+						if value.is_none() && new_cache.get(&key).unwrap_or(&None).is_none() {
+							progress.log(
+								diag::Level::Warning,
+								"segments",
+								&format!("found DELETE for chunk {:?}, but no prior PUT", key),
+							);
+						}
+						v.insert(value);
+					}
+					hash_map::Entry::Occupied(mut o) => {
+						o.insert(value);
+					}
+				}
 				tokio::task::yield_now().await;
 			}
 		}
@@ -384,20 +459,35 @@ impl ObjectStore for Arc<FsStore> {
 		}
 		tokio::task::yield_now().await;
 		if let Some(on_disk_index) = self.on_disk_index.as_ref() {
-			let lock = self.segment_cache.read().unwrap();
-			for (key, value) in lock.iter() {
-				let claim = on_disk_index.contains(key);
-				if claim && value.is_none() {
-					return Err(io::Error::new(io::ErrorKind::InvalidData, format!("on-disk segment cache error: claims {:?} exists, but I found an authoritative delete!", key)));
+			let mut expected_chunks: HashSet<_> = on_disk_index.iter_keys().map(|x| *x).collect();
+			{
+				let lock = self.segment_cache.read().unwrap();
+				for (key, value) in lock.iter() {
+					let is_in_cache = expected_chunks.remove(key);
+					if is_in_cache && value.is_none() {
+						progress.log(diag::Level::Error, "chunk_cache", &format!("on-disk chunk cache claims chunk {:?} does exist, but we found a DELETE", key));
+						ok = false;
+					}
+					if !is_in_cache && value.is_some() {
+						progress.log(diag::Level::Error, "chunk_cache", &format!("on-disk chunk cache claims chunk {:?} does not exist, but we found a PUT", key));
+						ok = false;
+					}
 				}
-				if !claim && value.is_some() {
-					return Err(io::Error::new(io::ErrorKind::InvalidData, format!("on-disk segment cache error: claims {:?} does not exist, but I found an authoritative put!", key)));
-				}
+			}
+			for id in expected_chunks.iter() {
+				progress.log(diag::Level::Error, "chunk_cache", &format!("on-disk chunk cache claims chunk {:?} does exist, but we found no trace of it", id));
+				ok = false;
 			}
 		}
 		tokio::task::yield_now().await;
-		progress.report(Progress::Complete);
-		Ok(())
+		progress.progress(Progress::Complete);
+		match ok {
+			true => Ok(()),
+			false => Err(io::Error::new(
+				io::ErrorKind::InvalidData,
+				"segment file check found errors",
+			)),
+		}
 	}
 
 	type ChunkStream = ChunkStream;

@@ -1,5 +1,6 @@
 use std::borrow::Cow;
 use std::io;
+use std::ops::Range;
 use std::path::Path;
 
 use byteorder::{ByteOrder, LittleEndian};
@@ -33,6 +34,26 @@ pub struct SegmentIndexEntry {
 	pub flags: u32, */
 }
 
+impl SegmentIndexEntry {
+	fn is_empty(&self) -> bool {
+		self.segment == MAGIC_VALUE_EMPTY
+	}
+
+	fn is_deleted(&self) -> bool {
+		self.segment == MAGIC_VALUE_DELETED
+	}
+
+	fn matches(&self, id: &Id) -> Option<bool> {
+		if self.is_empty() {
+			return None;
+		}
+		if self.is_deleted() {
+			return Some(false);
+		}
+		Some(self.key == *id)
+	}
+}
+
 const SEGMENT_INDEX_ENTRY_SIZE: usize = std::mem::size_of::<SegmentIndexEntry>();
 const SEGMENT_INDEX_KEY_SIZE: usize = std::mem::size_of::<Id>();
 const SEGMENT_INDEX_VALUE_SIZE: usize = SEGMENT_INDEX_ENTRY_SIZE - SEGMENT_INDEX_KEY_SIZE;
@@ -45,6 +66,7 @@ pub trait ReadSegmentIndex {
 pub struct MmapSegmentIndex {
 	map: Mmap,
 	nbuckets: usize,
+	nentries: usize,
 }
 
 impl MmapSegmentIndex {
@@ -99,15 +121,37 @@ impl MmapSegmentIndex {
 			));
 		}
 
+		let nbuckets = header.nbuckets as usize;
+
+		let total_data = HEADER_SIZE + nbuckets * SEGMENT_INDEX_ENTRY_SIZE;
+		if map.len() < total_data {
+			return Err(io::Error::new(
+				io::ErrorKind::InvalidData,
+				format!(
+					"file is shorter ({}) than number of buckets ({}) claims ({})",
+					map.len(),
+					nbuckets,
+					total_data,
+				),
+			));
+		}
+
 		Ok(Self {
 			map,
 			nbuckets: header.nbuckets as usize,
+			nentries: header.nentries as usize,
 		})
 	}
 
 	#[inline(always)]
-	fn data(&self) -> &[u8] {
-		&self.map[HEADER_SIZE..]
+	fn data(&self) -> &[SegmentIndexEntry] {
+		unsafe {
+			let start_ptr = (&self.map[HEADER_SIZE..]).as_ptr();
+			// SegmentIndexEntry is packed, so transmuting from u8 is safe-ìsh.
+			let start_ptr: *const SegmentIndexEntry = std::mem::transmute(start_ptr);
+			// length is asserted during construction
+			std::slice::from_raw_parts(start_ptr, self.nbuckets)
+		}
 	}
 
 	fn derive_index(&self, id: &Id) -> usize {
@@ -118,35 +162,27 @@ impl MmapSegmentIndex {
 	}
 
 	fn search_slot(&self, id: &Id) -> Option<&SegmentIndexEntry> {
-		let base_index = self.derive_index(id);
-		assert!(base_index < self.nbuckets);
-		let wraparound = self
-			.nbuckets
-			.checked_mul(SEGMENT_INDEX_ENTRY_SIZE)
-			.expect("overflow while calculating hash index offsets");
-		// unwrap: self.nbuckets >= base_index, thus this cannot overflow.
-		let mut offset = base_index * SEGMENT_INDEX_ENTRY_SIZE;
-		let start = offset;
-		loop {
-			let end = offset + SEGMENT_INDEX_ENTRY_SIZE;
-			let entry: &'_ SegmentIndexEntry = unsafe {
-				std::mem::transmute::<_, *const SegmentIndexEntry>(
-					(&self.data()[offset..end]).as_ptr(),
-				)
-				.as_ref()
-				.unwrap()
-			};
-			if entry.segment == MAGIC_VALUE_EMPTY {
-				return None;
+		let start = self.derive_index(id);
+		let data = self.data();
+		for i in 0..self.nbuckets {
+			let index = (start + i) % self.nbuckets;
+			let entry = &data[index];
+			match entry.matches(id) {
+				// match
+				Some(true) => return Some(entry),
+				// deleted or mismatch
+				Some(false) => continue,
+				// empty
+				None => return None,
 			}
-			if entry.segment != MAGIC_VALUE_DELETED && entry.key == *id {
-				return Some(entry);
-			}
+		}
+		None
+	}
 
-			offset = end % wraparound;
-			if offset == start {
-				return None;
-			}
+	pub fn iter_keys(&self) -> MmapKeyIterator<'_> {
+		MmapKeyIterator {
+			hashindex: self,
+			inner: 0..self.nbuckets,
 		}
 	}
 }
@@ -161,5 +197,33 @@ impl ReadSegmentIndex for MmapSegmentIndex {
 
 	fn contains<K: AsRef<Id>>(&self, id: K) -> bool {
 		self.search_slot(id.as_ref()).is_some()
+	}
+}
+
+pub struct MmapKeyIterator<'x> {
+	hashindex: &'x MmapSegmentIndex,
+	inner: Range<usize>,
+}
+
+impl<'x> Iterator for MmapKeyIterator<'x> {
+	type Item = &'x Id;
+
+	fn next(&mut self) -> Option<Self::Item> {
+		let data = self.hashindex.data();
+		for index in &mut self.inner {
+			let entry = data[index];
+			if entry.is_empty() || entry.is_deleted() {
+				continue;
+			}
+			if !entry.is_deleted() {
+				// cannot return &entry.key for some reason, borrowck doesn't like that
+				return Some(&data[index].key);
+			}
+		}
+		None
+	}
+
+	fn size_hint(&self) -> (usize, Option<usize>) {
+		(self.hashindex.nentries, Some(self.hashindex.nbuckets))
 	}
 }
