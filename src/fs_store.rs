@@ -1,5 +1,4 @@
 use std::borrow::Cow;
-use std::collections::hash_map;
 use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::fs;
@@ -434,21 +433,7 @@ impl ObjectStore for Arc<FsStore> {
 						continue;
 					}
 				};
-				match update_cache.entry(key) {
-					hash_map::Entry::Vacant(v) => {
-						if value.is_none() && new_cache.get(&key).unwrap_or(&None).is_none() {
-							progress.log(
-								diag::Level::Warning,
-								"segments",
-								&format!("found DELETE for chunk {:?}, but no prior PUT", key),
-							);
-						}
-						v.insert(value);
-					}
-					hash_map::Entry::Occupied(mut o) => {
-						o.insert(value);
-					}
-				}
+				update_cache.insert(key, value);
 				tokio::task::yield_now().await;
 			}
 		}
