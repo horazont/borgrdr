@@ -177,8 +177,8 @@ pub struct Archive {
 	username: String,
 	time: String,
 	time_end: String,
-	comment: String,
-	chunker_params: ChunkerParams,
+	comment: Option<String>,
+	chunker_params: Option<ChunkerParams>,
 	items: Vec<Id>,
 }
 
@@ -211,12 +211,12 @@ impl Archive {
 		&self.time_end
 	}
 
-	pub fn chunker_params(&self) -> &ChunkerParams {
-		&self.chunker_params
+	pub fn chunker_params(&self) -> Option<&ChunkerParams> {
+		self.chunker_params.as_ref()
 	}
 
-	pub fn comment(&self) -> &str {
-		&self.comment
+	pub fn comment(&self) -> Option<&str> {
+		self.comment.as_ref().map(|x| x.as_str())
 	}
 
 	pub fn items(&self) -> &[Id] {
