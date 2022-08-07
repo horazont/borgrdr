@@ -94,7 +94,7 @@ impl fmt::Display for RpcResponse {
 				write!(f, "DataReply(.. {} bytes ..)", data.len())
 			}
 			Self::IdListReply(ids) => {
-				write!(f, "StreamChunks(.. {} ids ..)", ids.len())
+				write!(f, "IdListReply(.. {} ids ..)", ids.len())
 			}
 			other => fmt::Debug::fmt(other, f),
 		}
