@@ -31,6 +31,7 @@ fn convert_ts(ts: i64) -> DateTime<Utc> {
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
+	env_logger::init();
 	let argv: Vec<String> = args().collect();
 
 	let store = Arc::new(FsStore::open(argv[1].clone())?);

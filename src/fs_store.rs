@@ -11,6 +11,8 @@ use std::sync::Arc;
 use std::sync::RwLock;
 use std::task::{Context, Poll};
 
+use log::{debug, trace};
+
 use configparser::ini::Ini;
 
 use futures::stream::Stream;
@@ -133,6 +135,13 @@ impl FsStore {
 		let (dir, fileno) = split_fileno(self.segments_per_dir, segmentno);
 		path.push(dir.to_string());
 		path.push(fileno.to_string());
+		trace!(
+			"reading chunk {:?} from segment {} in {:?} at offset {}",
+			id,
+			segmentno,
+			path,
+			offset
+		);
 		let mut file = fs::File::open(&path)?;
 		file.seek(io::SeekFrom::Start(offset as u64))?;
 		let file = io::BufReader::new(file);
@@ -161,15 +170,25 @@ impl FsStore {
 	}
 
 	fn try_on_disk_cache(&self, id: &Id) -> Option<io::Result<Option<(u64, u64)>>> {
+		trace!("searching for {:?} in on-disk cache", id);
 		let on_disk_index = self.on_disk_index.as_ref()?;
 		let entry = match on_disk_index.get(id) {
 			Some(v) => v,
 			None => return Some(Ok(None)),
 		};
-		Some(Ok(Some((entry.segment as u64, entry.offset as u64))))
+		let segment = entry.segment as u64;
+		let offset = entry.offset as u64;
+		trace!(
+			"found {:?} via in-memory cache in segment {} at {}",
+			id,
+			segment,
+			offset
+		);
+		Some(Ok(Some((segment, offset))))
 	}
 
 	fn try_in_memory_cache(&self, id: &Id) -> Option<io::Result<Option<(u64, u64)>>> {
+		trace!("searching for {:?} in in-memory cache", id);
 		let (segment, offset) = {
 			let lock = self.segment_cache.read().unwrap();
 			match lock.get(id)? {
@@ -177,10 +196,17 @@ impl FsStore {
 				None => return Some(Ok(None)),
 			}
 		};
+		trace!(
+			"found {:?} via in-memory cache in segment {} at {}",
+			id,
+			segment,
+			offset
+		);
 		Some(Ok(Some((segment, offset))))
 	}
 
 	fn search_chunk(&self, id: &Id) -> io::Result<Option<Bytes>> {
+		trace!("starting exhaustive search for {:?}", id);
 		let mut lock = self.segment_cache.write().unwrap();
 		for item in self.iter_segment_files()? {
 			let (fileno, item) = item?;
@@ -333,6 +359,7 @@ impl ObjectStore for Arc<FsStore> {
 		&self,
 		mut progress: Option<&mut (dyn DiagnosticsSink + Send)>,
 	) -> io::Result<()> {
+		debug!("repository check started");
 		let max_segment_number = self.latest_segment;
 		let segments_per_dir = self.segments_per_dir;
 		let mut data_path = self.root.clone();
@@ -344,6 +371,7 @@ impl ObjectStore for Arc<FsStore> {
 		let mut new_cache = HashMap::<_, Option<(u64, u64)>>::new();
 		let mut update_cache = HashMap::<_, Option<(u64, u64)>>::new();
 		for segment_no in 0..=max_segment_number {
+			trace!("checking segment {}", segment_no);
 			let (dir, file) = split_fileno(segments_per_dir, segment_no);
 			if segment_no % 100 == 0 {
 				progress.progress(Progress::Range {

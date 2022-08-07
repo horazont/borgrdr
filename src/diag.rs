@@ -62,6 +62,17 @@ impl Ord for Level {
 	}
 }
 
+impl From<Level> for log::Level {
+	fn from(other: Level) -> Self {
+		match other {
+			Level::Debug => log::Level::Debug,
+			Level::Info => log::Level::Info,
+			Level::Warning => log::Level::Warn,
+			Level::Error => log::Level::Error,
+		}
+	}
+}
+
 pub trait DiagnosticsSink {
 	fn progress(&mut self, progress: Progress);
 	fn log(&mut self, level: Level, subsystem: &str, message: &str);

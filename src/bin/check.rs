@@ -91,6 +91,7 @@ fn split_meter(meter: Arc<Mutex<ProgressMeter>>) -> (ProgressMeterRef, ProgressM
 
 #[tokio::main]
 async fn main() -> Result<()> {
+	env_logger::init();
 	let argv: Vec<String> = args().collect();
 
 	let (mut segment_meter, mut archive_meter) = split_meter(ProgressMeter::new().shareable());

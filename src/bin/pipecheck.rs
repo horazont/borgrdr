@@ -5,6 +5,8 @@ use std::sync::{Arc, Mutex};
 
 use anyhow::{Context, Result};
 
+use log::{error, log};
+
 use futures::stream::StreamExt;
 
 use borgrdr::diag;
@@ -73,7 +75,7 @@ impl DiagnosticsSink for ProgressMeterRef {
 		if level < diag::Level::Warning {
 			return;
 		}
-		println!("{}[{}]: {}", level, subsystem, message);
+		log!(level.into(), "{}: {}", subsystem, message);
 	}
 }
 
@@ -92,6 +94,7 @@ fn split_meter(meter: Arc<Mutex<ProgressMeter>>) -> (ProgressMeterRef, ProgressM
 
 #[tokio::main]
 async fn main() -> Result<()> {
+	env_logger::init();
 	let argv: Vec<String> = args().collect();
 
 	let (mut segment_meter, mut archive_meter) = split_meter(ProgressMeter::new().shareable());
@@ -110,6 +113,7 @@ async fn main() -> Result<()> {
 	let mut narchives = 0;
 	let mut nitems = 0;
 	let mut nchunks = 0;
+	let mut ok = true;
 	for (name, archive_hdr) in manifest.archives().iter() {
 		archive_meter.progress(Progress::Range {
 			cur: narchives,
@@ -131,7 +135,11 @@ async fn main() -> Result<()> {
 				let ids = idbuf.split_off(0);
 				assert!(ids.len() > 0);
 				for missing_id in repo.store().find_missing_chunks(ids).await? {
-					eprintln!("chunk {:?} is missing", missing_id);
+					archive_meter.log(
+						diag::Level::Error,
+						"item_chunks",
+						&format!("chunk {:?} is missing", missing_id),
+					);
 				}
 			}
 			//println!("checked chunks");
@@ -141,18 +149,32 @@ async fn main() -> Result<()> {
 
 		if idbuf.len() > 0 {
 			for missing_id in repo.store().find_missing_chunks(idbuf).await? {
-				eprintln!("chunk {:?} is missing", missing_id);
+				archive_meter.log(
+					diag::Level::Error,
+					"item_chunks",
+					&format!("chunk {:?} is missing", missing_id),
+				);
 			}
 		}
 	}
 	archive_meter.progress(Progress::Complete);
 
-	checker.await??;
+	match checker.await? {
+		Ok(_) => (),
+		Err(e) => {
+			error!("repository check failed: {}", e);
+			ok = false;
+		}
+	};
 	drop(repo);
 	server.await?;
 	println!(
 		"checked {} archives, {} items, {} chunks",
 		narchives, nitems, nchunks
 	);
-	Ok(())
+	if ok {
+		Ok(())
+	} else {
+		Err(anyhow::Error::msg("one or more checks failed"))
+	}
 }

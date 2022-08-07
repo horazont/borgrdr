@@ -4,8 +4,11 @@ use std::future::Future;
 use std::io;
 use std::pin::Pin;
 use std::result::Result as StdResult;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Weak};
 use std::task::{Context, Poll};
+
+use log::{debug, error, trace, warn};
 
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::sync::{mpsc, oneshot, RwLock};
@@ -511,16 +514,21 @@ impl Stream for RequestWorkers {
 
 type RpcWorkerMessage = (RequestContext, RpcRequest);
 
+static WORKER_NUM_GEN: AtomicUsize = AtomicUsize::new(1);
+
 struct RpcWorkerConfig {
 	request_queue_size: usize,
 	message_queue_size: usize,
+	name: String,
 }
 
 impl RpcWorkerConfig {
-	fn new() -> Self {
+	fn with_name_prefix(prefix: &str) -> Self {
+		let num = WORKER_NUM_GEN.fetch_add(1, Ordering::SeqCst);
 		Self {
 			request_queue_size: 16,
 			message_queue_size: 16,
+			name: format!("{}-{:02}", prefix, num),
 		}
 	}
 
@@ -556,6 +564,7 @@ impl RpcWorkerConfig {
 			response_handlers: HashMap::new(),
 			message_handlers: HashMap::new(),
 			request_workers: RequestWorkers::new(),
+			name: self.name,
 		};
 		let join_handle = tokio::spawn(worker.run());
 		(join_handle, request_tx, message_rx)
@@ -602,11 +611,12 @@ impl From<&ErrorGenerator> for io::Error {
 }
 
 macro_rules! handle_tx {
-	($tx:expr => {
+	(($name:expr, $obj:expr) => $tx:expr => {
 		Ok($okv:pat_param) => $ok:expr,
 		Err($errv:pat_param) => $err:expr => break,
 	}) => {
-		match $tx.map_err(ErrorGenerator::send) {
+		trace!("{}: tx: {}", $name, $obj);
+		match $tx.send($obj).await.map_err(ErrorGenerator::send) {
 			Ok($okv) => $ok,
 			Err(e) => {
 				{
@@ -636,6 +646,7 @@ struct RpcWorker<T: AsyncRead + AsyncWrite> {
 	response_handlers: HashMap<RequestId, oneshot::Sender<io::Result<RpcResponse>>>,
 	message_handlers: HashMap<RequestId, mpsc::Sender<RpcMessage>>,
 	request_workers: RequestWorkers,
+	name: String,
 }
 
 impl<T: AsyncRead + AsyncWrite> RpcWorker<T> {
@@ -661,6 +672,18 @@ impl<T: AsyncRead + AsyncWrite> RpcWorker<T> {
 	}
 
 	fn drain_with_error(mut self, e: &ErrorGenerator) {
+		match e {
+			ErrorGenerator::LocalShutdown => {
+				debug!("{}: shutting down (at local request)", self.name)
+			}
+			ErrorGenerator::RemoteShutdown => {
+				debug!("{}: shutting down (at remote request)", self.name)
+			}
+			other => {
+				let err = io::Error::from(other);
+				error!("{}: shutting down because of error: {}", self.name, err);
+			}
+		};
 		self.request_rx.close();
 		drop(self.message_tx);
 		drop(self.request_workers);
@@ -684,8 +707,7 @@ impl<T: AsyncRead + AsyncWrite> RpcWorker<T> {
 		// 2. Exchange requests/messages/responses
 		// 3. Send goodbye
 
-		#[allow(unused_variables)]
-		let worker_id = (&self) as *const _ as usize;
+		debug!("{}: sending hello", self.name);
 		match self.tx.send(RpcItem::Hello).await {
 			Ok(()) => (),
 			Err(e) => {
@@ -719,6 +741,7 @@ impl<T: AsyncRead + AsyncWrite> RpcWorker<T> {
 		let rx_timeout = sleep_until(Self::rx_deadline());
 		tokio::pin!(rx_timeout);
 
+		debug!("{}: handshake complete", self.name);
 		// Hellos are now exchanged successfully, we can enter the main item exchange
 		let result: StdResult<(), ErrorGenerator> = loop {
 			tokio::select! {
@@ -741,19 +764,24 @@ impl<T: AsyncRead + AsyncWrite> RpcWorker<T> {
 				item = self.rx.next() => {
 					// advance receive timeout -- as long as data is pouring in, we don't care about round-trip times
 					rx_timeout.as_mut().reset(Self::rx_deadline());
-					/* if let Some(Ok(item)) = item.as_ref() {
-						println!("worker 0x{:16x} rx: {}", worker_id, item);
-					} */
+					if let Some(Ok(item)) = item.as_ref() {
+						trace!("{} rx: {}", self.name, item);
+					}
 					match item {
 						// push-style message, potentially related to an ongoing request
 						Some(Ok(RpcItem::Message{in_reply_to, payload})) => {
 							match self.message_handlers.entry(in_reply_to) {
 								// no recipient, drop
-								hash_map::Entry::Vacant(_) => (),
+								hash_map::Entry::Vacant(_) => {
+									// this is debug, because it can be triggered by noisy servers
+									debug!("{} received message {} for request id {}, but no receiver exists", self.name, payload, in_reply_to);
+								},
 								hash_map::Entry::Occupied(o) => {
 									match o.get().send(payload).await {
 										Ok(_) => (),
-										Err(_) => {
+										Err(mpsc::error::SendError(payload)) => {
+											// this is warn, because in contrast to the above, its not (easily) possible for noisy servers to trigger this: we remove message listeners when their task completes... so this requires a rather intricate race condition
+											warn!("{} received message {} for request id {}, but the receiver has terminated", self.name, payload, in_reply_to);
 											o.remove();
 										}
 									}
@@ -768,6 +796,7 @@ impl<T: AsyncRead + AsyncWrite> RpcWorker<T> {
 								msg_tx,
 								res_tx,
 							);
+							debug!("{}: starting request {}: {}", self.name, id, payload);
 							match self.message_tx.send((ctx, payload)).await {
 								Ok(_) => {
 									// successfully sent *somewhere*, so we need to poll it
@@ -775,8 +804,9 @@ impl<T: AsyncRead + AsyncWrite> RpcWorker<T> {
 								}
 								Err(mpsc::error::SendError((_, _))) => {
 									// there is nothing there handling requests -> return error
+									debug!("{} cannot start any requests", self.name);
 									handle_tx! {
-										self.tx.send(RpcItem::Response{id, payload: RpcResponse::Error("request refused".into())}).await => {
+										(self.name, RpcItem::Response{id, payload: RpcResponse::Error("request refused".into())}) => self.tx => {
 											Ok(()) => (),
 											Err(_) => () => break,
 										}
@@ -791,6 +821,7 @@ impl<T: AsyncRead + AsyncWrite> RpcWorker<T> {
 							self.message_handlers.remove(&id);
 							match self.response_handlers.remove(&id) {
 								Some(v) => {
+									debug!("{}: received response to known request {}", self.name, id);
 									// if the task died in the meantime, we don't care.
 									let _: StdResult<_, _> = v.send(Ok(payload));
 								}
@@ -820,35 +851,26 @@ impl<T: AsyncRead + AsyncWrite> RpcWorker<T> {
 				item = self.request_workers.next() => {
 					// unwrap: request_workers is an inifinte stream
 					let item = item.unwrap();
-					match item {
+					let (item, reply_ch) = match item {
 						RequestWorkerItem::Crashed(req_id) => {
-							handle_tx! {
-								self.tx.send(RpcItem::Response{id: req_id, payload: RpcResponse::Error("internal server error".into())}).await => {
-									Ok(()) => (),
-									Err(_) => () => break,
-								}
-							}
-							tx_timeout.as_mut().reset(Self::tx_deadline());
+							debug!("{}: handler for request {} exited unexpectedly", self.name, req_id);
+							(RpcItem::Response{id: req_id, payload: RpcResponse::Error("internal server error".into())}, None)
 						}
 						RequestWorkerItem::Completed(req_id, resp, ch) => {
-							handle_tx! {
-								self.tx.send(RpcItem::Response{id: req_id, payload: resp}).await => {
-									Ok(()) => fulfill_reply!(Some(ch), Ok(())),
-									Err(e) => fulfill_reply!(Some(ch), Err(e.into())) => break,
-								}
-							}
-							tx_timeout.as_mut().reset(Self::tx_deadline());
+							debug!("{}: request {} completed with result {}", self.name, req_id, resp);
+							(RpcItem::Response{id: req_id, payload: resp}, Some(ch))
 						}
 						RequestWorkerItem::Message(req_id, msg, ch) => {
-							handle_tx! {
-								self.tx.send(RpcItem::Message{in_reply_to: req_id, payload: msg}).await => {
-									Ok(()) => fulfill_reply!(Some(ch), Ok(())),
-									Err(e) => fulfill_reply!(Some(ch), Err(e.into())) => break,
-								}
-							}
-							tx_timeout.as_mut().reset(Self::tx_deadline());
+							(RpcItem::Message{in_reply_to: req_id, payload: msg}, Some(ch))
+						}
+					};
+					handle_tx! {
+						(self.name, item) => self.tx => {
+							Ok(()) => fulfill_reply!(reply_ch, Ok(())),
+							Err(e) => fulfill_reply!(reply_ch, Err(e.into())) => break,
 						}
 					}
+					tx_timeout.as_mut().reset(Self::tx_deadline());
 				}
 
 				// internal request to do something
@@ -865,7 +887,7 @@ impl<T: AsyncRead + AsyncWrite> RpcWorker<T> {
 								self.message_handlers.insert(id, message_handler);
 							}
 							handle_tx! {
-								self.tx.send(item).await => {
+								(self.name, item) => self.tx => {
 									Ok(()) => (),
 									Err(_) => () => break,
 								}
@@ -912,7 +934,7 @@ pub struct RpcStoreClient {
 
 impl RpcStoreClient {
 	pub fn new<I: AsyncRead + AsyncWrite + Send + 'static>(inner: I) -> Self {
-		let (_, ch_tx, _) = RpcWorkerConfig::new().spawn(inner);
+		let (_, ch_tx, _) = RpcWorkerConfig::with_name_prefix("client").spawn(inner);
 		Self { request_ch: ch_tx }
 	}
 
@@ -1265,7 +1287,7 @@ pub fn spawn_rpc_server<
 	backend: S,
 	io: I,
 ) -> tokio::task::JoinHandle<()> {
-	let (_, command_tx, message_rx) = RpcWorkerConfig::new().spawn(io);
+	let (_, command_tx, message_rx) = RpcWorkerConfig::with_name_prefix("server").spawn(io);
 	let worker = RpcStoreServerWorker {
 		inner: Arc::new(backend),
 		rx_ch: message_rx,
