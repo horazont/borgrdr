@@ -241,21 +241,11 @@ impl fmt::Display for Error {
 impl std::error::Error for Error {}
 
 type Result<T> = StdResult<T, Error>;
-
-#[derive(Debug)]
-enum RpcWorkerCommand {
-	SendRequest {
-		payload: RpcRequest,
-		message_handler: Option<mpsc::Sender<RpcMessage>>,
-		response_handler: oneshot::Sender<io::Result<RpcResponse>>,
-	},
-	#[allow(dead_code)]
-	SendPush {
-		payload: RpcMessage,
-		in_reply_to: Option<RequestId>,
-		result: oneshot::Sender<io::Result<()>>,
-	},
-}
+type RpcWorkerCommand = (
+	RpcRequest,
+	Option<mpsc::Sender<RpcMessage>>,
+	oneshot::Sender<io::Result<RpcResponse>>,
+);
 
 enum CompletionStreamItem<M, R> {
 	Data(M),
@@ -279,14 +269,7 @@ impl CompletionStream<RpcMessage, io::Result<RpcResponse>> {
 		depth: usize,
 	) -> Result<Self> {
 		let ((msg_tx, response_tx), result) = Self::channel(depth);
-		match ch
-			.send(RpcWorkerCommand::SendRequest {
-				payload: req,
-				message_handler: Some(msg_tx),
-				response_handler: response_tx,
-			})
-			.await
-		{
+		match ch.send((req, Some(msg_tx), response_tx)).await {
 			Ok(_) => (),
 			Err(_) => return Err(Error::LostWorker),
 		};
@@ -295,16 +278,17 @@ impl CompletionStream<RpcMessage, io::Result<RpcResponse>> {
 }
 
 impl<M, R> CompletionStream<M, R> {
+	fn wrap(msg_rx: mpsc::Receiver<M>, res_rx: oneshot::Receiver<R>) -> Self {
+		Self {
+			stream: msg_rx,
+			completion: res_rx.fuse(),
+		}
+	}
+
 	fn channel(depth: usize) -> ((mpsc::Sender<M>, oneshot::Sender<R>), Self) {
 		let (msg_tx, msg_rx) = mpsc::channel(depth);
 		let (res_tx, res_rx) = oneshot::channel();
-		(
-			(msg_tx, res_tx),
-			Self {
-				stream: msg_rx,
-				completion: res_rx.fuse(),
-			},
-		)
+		((msg_tx, res_tx), Self::wrap(msg_rx, res_rx))
 	}
 }
 
@@ -697,13 +681,8 @@ impl<T: AsyncRead + AsyncWrite> RpcWorker<T> {
 		// we ignore permits
 		while let Ok(req) = self.request_rx.try_recv() {
 			match req {
-				RpcWorkerCommand::SendRequest {
-					response_handler, ..
-				} => {
+				(_, _, response_handler) => {
 					let _: StdResult<_, _> = response_handler.send(Err(e.into()));
-				}
-				RpcWorkerCommand::SendPush { result, .. } => {
-					let _: StdResult<_, _> = result.send(Err(e.into()));
 				}
 			}
 		}
@@ -881,11 +860,7 @@ impl<T: AsyncRead + AsyncWrite> RpcWorker<T> {
 				request = self.request_rx.recv() => {
 					match request {
 						// send a request to the peer
-						Some(RpcWorkerCommand::SendRequest{
-							payload,
-							message_handler,
-							response_handler,
-						}) => {
+						Some((payload, message_handler, response_handler)) => {
 							// we are responsible for ID bookkeeping, not the requester; this way, we don't need another synchronization point for picking IDs and we can avoid re-using IDs which are currently in-flight'
 							let id = self.generate_next_id();
 							let item = RpcItem::Request{id, payload};
@@ -898,22 +873,6 @@ impl<T: AsyncRead + AsyncWrite> RpcWorker<T> {
 								self.tx.send(item).await => {
 									Ok(()) => (),
 									Err(_) => () => break,
-								}
-							}
-							tx_timeout.as_mut().reset(Self::tx_deadline());
-						},
-
-						// send a message, potentially related to a request, to the peer
-						Some(RpcWorkerCommand::SendPush{
-							payload,
-							in_reply_to,
-							result,
-						}) => {
-							let item = RpcItem::Message{in_reply_to, payload};
-							handle_tx! {
-								self.tx.send(item).await => {
-									Ok(()) => fulfill_reply!(Some(result), Ok(())),
-									Err(e) => fulfill_reply!(Some(result), Err(e.into())) => break,
 								}
 							}
 							tx_timeout.as_mut().reset(Self::tx_deadline());
@@ -968,15 +927,7 @@ impl RpcStoreClient {
 		message_sink: Option<mpsc::Sender<RpcMessage>>,
 	) -> Result<RpcResponse> {
 		let (response_tx, response_rx) = oneshot::channel();
-		match self
-			.request_ch
-			.send(RpcWorkerCommand::SendRequest {
-				payload: req,
-				message_handler: message_sink,
-				response_handler: response_tx,
-			})
-			.await
-		{
+		match self.request_ch.send((req, message_sink, response_tx)).await {
 			Ok(_) => (),
 			Err(_) => return Err(Error::LostWorker),
 		};
@@ -1080,62 +1031,13 @@ impl ObjectStore for RpcStoreClient {
 }
 
 pin_project_lite::pin_project! {
-	struct ChunksFromMessages {
-		#[pin]
-		stream: mpsc::Receiver<RpcMessage>,
-		#[pin]
-		completion: futures::future::Fuse<oneshot::Receiver<io::Result<RpcResponse>>>,
-	}
-}
-
-impl Stream for ChunksFromMessages {
-	type Item = io::Result<Bytes>;
-
-	fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
-		//println!("ChunksFromMessages asked for more");
-		let mut this = self.project();
-		loop {
-			match this.stream.as_mut().poll_recv(cx) {
-				// if we get data, return it
-				Poll::Ready(Some(RpcMessage::StreamedChunk(data))) => {
-					//println!("chunk emitting: {:?}", data.is_ok());
-					match data {
-						Ok(v) => return Poll::Ready(Some(Ok(v))),
-						Err(e) => return Poll::Ready(Some(Err(Error::Remote(e).into()))),
-					}
-				}
-				// if we have to block, block
-				Poll::Pending => return Poll::Pending,
-				// if this is the eof, we have to poll on the oneshot
-				Poll::Ready(None) => break,
-				// if there is an unrelated message, spin
-				Poll::Ready(Some(_)) => (),
-			}
-		}
-
-		if this.completion.is_terminated() {
-			return Poll::Ready(None);
-		}
-		match this.completion.poll(cx) {
-			Poll::Ready(Ok(Ok(v))) => match v.result() {
-				Ok(_) => Poll::Ready(None),
-				Err(e) => Poll::Ready(Some(Err(e.into()))),
-			},
-			Poll::Ready(Ok(Err(e))) => Poll::Ready(Some(Err(e))),
-			Poll::Ready(Err(_)) => Poll::Ready(Some(Err(Error::LostWorker.into()))),
-			Poll::Pending => Poll::Pending,
-		}
-	}
-}
-
-pin_project_lite::pin_project! {
 	pub struct ChunkStream {
 		#[pin]
 		backend: tokio_util::sync::PollSender<RpcWorkerCommand>,
 		src: Vec<Id>,
 		block_size: usize,
 		#[pin]
-		curr_chunk: Option<ChunksFromMessages>,
+		curr_chunk: Option<CompletionStream<RpcMessage, io::Result<RpcResponse>>>,
 	}
 }
 
@@ -1164,29 +1066,49 @@ impl Stream for ChunkStream {
 				let ids = this.src.drain(..size).collect();
 				let (result_tx, result_rx) = oneshot::channel();
 				let (msg_tx, msg_rx) = mpsc::channel(*this.block_size);
-				match this.backend.send_item(RpcWorkerCommand::SendRequest {
-					payload: RpcRequest::StreamChunks { ids },
-					message_handler: Some(msg_tx),
-					response_handler: result_tx,
-				}) {
+				match this.backend.send_item((
+					RpcRequest::StreamChunks { ids },
+					Some(msg_tx),
+					result_tx,
+				)) {
 					Ok(()) => (),
 					Err(_) => return Poll::Ready(Some(Err(Error::LostWorker.into()))),
 				};
 
-				*this.curr_chunk = Some(ChunksFromMessages {
-					stream: msg_rx,
-					completion: result_rx.fuse(),
-				});
+				*this.curr_chunk = Some(CompletionStream::wrap(msg_rx, result_rx));
 			}
 
 			//println!("ChunkStream asking inner stream");
 			match this.curr_chunk.as_mut().as_pin_mut().unwrap().poll_next(cx) {
-				Poll::Ready(Some(v)) => return Poll::Ready(Some(v)),
-				Poll::Ready(None) => (),
+				// forward streamed data to user
+				Poll::Ready(Some(CompletionStreamItem::Data(RpcMessage::StreamedChunk(data)))) => {
+					return Poll::Ready(Some(data.map_err(Error::Remote).map_err(|x| x.into())))
+				}
+				// ignore unexpected messages
+				Poll::Ready(Some(CompletionStreamItem::Data(_))) => (),
+				// if completed ...
+				Poll::Ready(Some(CompletionStreamItem::Completed(Ok(v)))) => {
+					*this.curr_chunk = None;
+					match v.result() {
+						// ... with success, we try the next one
+						Ok(_) => (),
+						// ... with error, we return the error
+						Err(e) => return Poll::Ready(Some(Err(e.into()))),
+					}
+				}
+				// if completed with error (e.g. send error), we return the error
+				Poll::Ready(Some(CompletionStreamItem::Completed(Err(e)))) => {
+					*this.curr_chunk = None;
+					return Poll::Ready(Some(Err(e)));
+				}
+				// if completed unexpectedly, continue and inject LostWorker error
+				Poll::Ready(None) | Poll::Ready(Some(CompletionStreamItem::Crashed)) => {
+					*this.curr_chunk = None;
+					return Poll::Ready(Some(Err(Error::LostWorker.into())));
+				}
 				Poll::Pending => return Poll::Pending,
-			};
+			}
 
-			//println!("inner stream exhausted");
 			*this.curr_chunk = None;
 		}
 	}
