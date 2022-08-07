@@ -1,12 +1,11 @@
 use std::env::args;
-use std::sync::Arc;
+
+use anyhow::{Context, Result};
 
 use futures::stream::StreamExt;
 
 use chrono::{DateTime, TimeZone, Utc};
 
-use borgrdr::fs_store::FsStore;
-use borgrdr::repository::Repository;
 use borgrdr::segments::Id;
 
 fn mode_to_str(mode: u32) -> String {
@@ -34,11 +33,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 	env_logger::init();
 	let argv: Vec<String> = args().collect();
 
-	let store = Arc::new(FsStore::open(argv[1].clone())?);
+	let (mut backend, repo) = borgrdr::cliutil::open_url_str(&argv[1])
+		.await
+		.with_context(|| format!("failed to open repository"))?;
+
 	let archive_name = argv.get(2);
 	let file_name = argv.get(3);
 	let mut chunks_to_extract: Option<Vec<Id>> = None;
-	let repo = Repository::open(store, Box::new(borgrdr::repository::EnvPassphrase::new())).await?;
 	let manifest = repo.manifest();
 	eprintln!("Repository manifest:");
 	eprintln!("  Version   : {}", manifest.version());
@@ -91,5 +92,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 		let mut stream = repo.open_stream(chunks)?;
 		tokio::io::copy(&mut stream, &mut tokio::io::stdout()).await?;
 	}
+
+	drop(repo);
+	let _: Result<_, _> = backend.wait_for_shutdown().await;
 	Ok(())
 }

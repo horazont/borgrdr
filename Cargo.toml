@@ -43,3 +43,6 @@ name = "check"
 
 [[bin]]
 name = "serve"
+
+[[bin]]
+name = "dump"
