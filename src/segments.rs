@@ -43,9 +43,9 @@ pub enum Error {
 	CrcMismatch {
 		found: u32,
 		calculated: u32,
-		unchecked: Segment<'static>,
+		unchecked: LogEntry<'static>,
 	},
-	InvalidSize(SegmentType, u32),
+	InvalidSize(LogEntryType, u32),
 	InvalidHeader([u8; 8]),
 }
 
@@ -97,13 +97,13 @@ impl TryFrom<io::Error> for Error {
 
 #[derive(IntoPrimitive, TryFromPrimitive, Clone, Copy, Debug, PartialEq, Eq)]
 #[repr(u8)]
-pub enum SegmentType {
+pub enum LogEntryType {
 	Put = 0,
 	Delete = 1,
 	Commit = 2,
 }
 
-impl SegmentType {
+impl LogEntryType {
 	fn min_size(&self) -> u32 {
 		match self {
 			Self::Put | Self::Delete => 41,
@@ -121,18 +121,18 @@ impl SegmentType {
 }
 
 #[derive(Debug, Clone)]
-pub enum Segment<'x> {
+pub enum LogEntry<'x> {
 	Put { key: Id, data: Cow<'x, [u8]> },
 	Delete { key: Id },
 	Commit,
 }
 
-impl<'x> Segment<'x> {
-	pub fn tag(&self) -> SegmentType {
+impl<'x> LogEntry<'x> {
+	pub fn tag(&self) -> LogEntryType {
 		match self {
-			Self::Put { .. } => SegmentType::Put,
-			Self::Delete { .. } => SegmentType::Delete,
-			Self::Commit { .. } => SegmentType::Commit,
+			Self::Put { .. } => LogEntryType::Put,
+			Self::Delete { .. } => LogEntryType::Delete,
+			Self::Commit { .. } => LogEntryType::Commit,
 		}
 	}
 }
@@ -152,9 +152,9 @@ fn try_read_upto<R: io::Read>(mut src: R, out: &mut [u8]) -> io::Result<usize> {
 	}
 }
 
-const COMMIT_SEGMENT: [u8; 9] = *b"\x40\xf4\x3c\x25\x09\x00\x00\x00\x02";
+const COMMIT_LOG_ENTRY: [u8; 9] = *b"\x40\xf4\x3c\x25\x09\x00\x00\x00\x02";
 
-pub fn read_segment<R: io::Read>(mut src: R) -> io::Result<Option<Segment<'static>>> {
+pub fn read_segment<R: io::Read>(mut src: R) -> io::Result<Option<LogEntry<'static>>> {
 	let mut main_buffer = [0u8; 9];
 	match try_read_upto(&mut src, &mut main_buffer[..])? {
 		0 => return Ok(None),
@@ -167,8 +167,8 @@ pub fn read_segment<R: io::Read>(mut src: R) -> io::Result<Option<Segment<'stati
 		}
 	}
 
-	if main_buffer == COMMIT_SEGMENT {
-		return Ok(Some(Segment::Commit));
+	if main_buffer == COMMIT_LOG_ENTRY {
+		return Ok(Some(LogEntry::Commit));
 	}
 
 	let mut crc_digest = crc32fast::Hasher::new();
@@ -182,7 +182,7 @@ pub fn read_segment<R: io::Read>(mut src: R) -> io::Result<Option<Segment<'stati
 	let crc = LittleEndian::read_u32(&crc_raw[..]);
 	let size = LittleEndian::read_u32(&size_raw[..]);
 
-	let segment_type: SegmentType = match tag.try_into() {
+	let segment_type: LogEntryType = match tag.try_into() {
 		Ok(v) => v,
 		Err(_) => return Err(Error::InvalidSegmentTag(tag).into()),
 	};
@@ -198,7 +198,7 @@ pub fn read_segment<R: io::Read>(mut src: R) -> io::Result<Option<Segment<'stati
 	}
 
 	let result = match segment_type {
-		SegmentType::Put => {
+		LogEntryType::Put => {
 			let mut key = Id::zero();
 			src.read_exact(&mut key.0[..])?;
 			crc_digest.update(&key.0[..]);
@@ -210,19 +210,19 @@ pub fn read_segment<R: io::Read>(mut src: R) -> io::Result<Option<Segment<'stati
 			src.read_exact(&mut buffer[..])?;
 			crc_digest.update(&buffer[..]);
 
-			Segment::Put {
+			LogEntry::Put {
 				key,
 				data: buffer.into(),
 			}
 		}
-		SegmentType::Delete => {
+		LogEntryType::Delete => {
 			let mut key = Id::zero();
 			src.read_exact(&mut key.0[..])?;
 			crc_digest.update(&key.0[..]);
 
-			Segment::Delete { key }
+			LogEntry::Delete { key }
 		}
-		SegmentType::Commit => Segment::Commit,
+		LogEntryType::Commit => LogEntry::Commit,
 	};
 
 	let crc_calculated = crc_digest.finalize();
@@ -264,14 +264,14 @@ impl<R: io::Read> SegmentReader<R> {
 		Ok(())
 	}
 
-	pub fn read(&mut self) -> io::Result<Option<Segment>> {
+	pub fn read(&mut self) -> io::Result<Option<LogEntry<'static>>> {
 		self.read_header()?;
 		read_segment(&mut self.inner)
 	}
 }
 
 impl<R: io::Read + io::Seek> SegmentReader<R> {
-	pub fn read_pos(&mut self) -> (u64, io::Result<Option<Segment>>) {
+	pub fn read_pos(&mut self) -> (u64, io::Result<Option<LogEntry<'static>>>) {
 		match self.read_header() {
 			Ok(()) => (),
 			Err(e) => return (0, Err(e)),

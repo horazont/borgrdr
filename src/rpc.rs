@@ -58,10 +58,10 @@ impl fmt::Display for RpcMessage {
 
 #[derive(Debug, Serialize, Deserialize)]
 pub enum RpcRequest {
-	RetrieveChunk { id: Id },
-	StreamChunks { ids: Vec<Id> },
-	ContainsChunk { id: Id },
-	FindMissingChunks { ids: Vec<Id> },
+	RetrieveObject { id: Id },
+	StreamObjects { ids: Vec<Id> },
+	ContainsObject { id: Id },
+	FindMissingObjects { ids: Vec<Id> },
 	GetRepositoryConfigKey { key: String },
 	CheckRepository,
 }
@@ -69,11 +69,11 @@ pub enum RpcRequest {
 impl fmt::Display for RpcRequest {
 	fn fmt<'f>(&self, f: &'f mut fmt::Formatter) -> fmt::Result {
 		match self {
-			Self::FindMissingChunks { ids } => {
-				write!(f, "FindMissingChunks {{ ids: .. {} ids .. }}", ids.len())
+			Self::FindMissingObjects { ids } => {
+				write!(f, "FindMissingObjects {{ ids: .. {} ids .. }}", ids.len())
 			}
-			Self::StreamChunks { ids } => {
-				write!(f, "StreamChunks {{ ids: .. {} ids .. }}", ids.len())
+			Self::StreamObjects { ids } => {
+				write!(f, "StreamObjects {{ ids: .. {} ids .. }}", ids.len())
 			}
 			other => fmt::Debug::fmt(other, f),
 		}
@@ -962,7 +962,7 @@ impl ObjectStore for RpcStoreClient {
 	async fn retrieve<K: AsRef<Id> + Send>(&self, id: K) -> io::Result<Bytes> {
 		let id = id.as_ref().clone();
 		match_rpc_response! {
-			self.rpc_call(RpcRequest::RetrieveChunk{id}, None).await => {
+			self.rpc_call(RpcRequest::RetrieveObject{id}, None).await => {
 				Ok(RpcResponse::DataReply(data)) => Ok(data),
 			}
 		}
@@ -972,16 +972,16 @@ impl ObjectStore for RpcStoreClient {
 	async fn contains<K: AsRef<Id> + Send>(&self, id: K) -> io::Result<bool> {
 		let id = id.as_ref().clone();
 		match_rpc_response! {
-			self.rpc_call(RpcRequest::ContainsChunk{id}, None).await => {
+			self.rpc_call(RpcRequest::ContainsObject{id}, None).await => {
 				Ok(RpcResponse::BoolReply(data)) => Ok(data),
 			}
 		}
 		.map_err(|x| x.into())
 	}
 
-	async fn find_missing_chunks(&self, ids: Vec<Id>) -> io::Result<Vec<Id>> {
+	async fn find_missing_objects(&self, ids: Vec<Id>) -> io::Result<Vec<Id>> {
 		match_rpc_response! {
-			self.rpc_call(RpcRequest::FindMissingChunks{ids}, None).await => {
+			self.rpc_call(RpcRequest::FindMissingObjects{ids}, None).await => {
 				Ok(RpcResponse::IdListReply(ids)) => Ok(ids),
 			}
 		}
@@ -1035,12 +1035,12 @@ impl ObjectStore for RpcStoreClient {
 		.map_err(|x| x.into())
 	}
 
-	type ChunkStream = ChunkStream;
+	type ObjectStream = ObjectStream;
 
-	fn stream_chunks(&self, chunks: Vec<Id>) -> io::Result<ChunkStream> {
-		Ok(ChunkStream {
+	fn stream_objects(&self, object_ids: Vec<Id>) -> io::Result<ObjectStream> {
+		Ok(ObjectStream {
 			backend: tokio_util::sync::PollSender::new(self.request_ch.clone()),
-			src: chunks,
+			src: object_ids,
 			block_size: 128,
 			curr_chunk: None,
 		})
@@ -1048,7 +1048,7 @@ impl ObjectStore for RpcStoreClient {
 }
 
 pin_project_lite::pin_project! {
-	pub struct ChunkStream {
+	pub struct ObjectStream {
 		#[pin]
 		backend: tokio_util::sync::PollSender<RpcWorkerCommand>,
 		src: Vec<Id>,
@@ -1058,17 +1058,17 @@ pin_project_lite::pin_project! {
 	}
 }
 
-impl Stream for ChunkStream {
+impl Stream for ObjectStream {
 	type Item = io::Result<Bytes>;
 
 	fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
-		//println!("ChunkStream asked for more");
+		//println!("ObjectStream asked for more");
 		let mut this = self.project();
 		loop {
 			if this.curr_chunk.is_none() {
-				//println!("ChunkStream needs to request more");
+				//println!("ObjectStream needs to request more");
 				if this.src.len() == 0 {
-					//println!("ChunkStream exhausted");
+					//println!("ObjectStream exhausted");
 					return Poll::Ready(None);
 				}
 
@@ -1084,7 +1084,7 @@ impl Stream for ChunkStream {
 				let (result_tx, result_rx) = oneshot::channel();
 				let (msg_tx, msg_rx) = mpsc::channel(*this.block_size);
 				match this.backend.send_item((
-					RpcRequest::StreamChunks { ids },
+					RpcRequest::StreamObjects { ids },
 					Some(msg_tx),
 					result_tx,
 				)) {
@@ -1095,7 +1095,7 @@ impl Stream for ChunkStream {
 				*this.curr_chunk = Some(CompletionStream::wrap(msg_rx, result_rx));
 			}
 
-			//println!("ChunkStream asking inner stream");
+			//println!("ObjectStream asking inner stream");
 			match this.curr_chunk.as_mut().as_pin_mut().unwrap().poll_next(cx) {
 				// forward streamed data to user
 				Poll::Ready(Some(CompletionStreamItem::Data(RpcMessage::StreamedChunk(data)))) => {
@@ -1223,20 +1223,16 @@ pub struct RpcStoreServerWorker<S> {
 }
 
 impl<S: ObjectStore + Sync + Send + 'static> RpcStoreServerWorker<S> {
-	async fn stream_chunks(backend: Arc<S>, ids: Vec<Id>, ctx: MessageSender) -> Result<()> {
-		//println!("streaming {} chunks", ids.len());
-		let mut stream = backend.stream_chunks(ids)?;
+	async fn stream_objects(backend: Arc<S>, ids: Vec<Id>, ctx: MessageSender) -> Result<()> {
+		let mut stream = backend.stream_objects(ids)?;
 		while let Some(item) = stream.next().await {
 			let item = item?;
-			//println!("pushing chunk");
 			match ctx.send(RpcMessage::StreamedChunk(Ok(item))).await {
 				Ok(_) => (),
 				Err(MessageSendError::Other(e)) => Err(e)?,
 				Err(MessageSendError::AlreadyComplete) => unreachable!(),
 			}
-			//println!("chunk pushed");
 		}
-		//println!("stream complete");
 		Ok(())
 	}
 
@@ -1248,10 +1244,10 @@ impl<S: ObjectStore + Sync + Send + 'static> RpcStoreServerWorker<S> {
 						let backend = Arc::clone(&self.inner);
 						tokio::spawn(async move {
 							let response = match payload {
-								RpcRequest::RetrieveChunk{id} => {
+								RpcRequest::RetrieveObject{id} => {
 									backend.retrieve(id).await.into()
 								}
-								RpcRequest::ContainsChunk{id} => {
+								RpcRequest::ContainsObject{id} => {
 									backend.contains(id).await.into()
 								}
 								RpcRequest::GetRepositoryConfigKey{key} => {
@@ -1263,11 +1259,11 @@ impl<S: ObjectStore + Sync + Send + 'static> RpcStoreServerWorker<S> {
 									let _: StdResult<_, _> = progress_sink.sink.flush().await;
 									result
 								}
-								RpcRequest::StreamChunks{ids} => {
-									Self::stream_chunks(backend, ids, ctx.message_sender()).await.into()
+								RpcRequest::StreamObjects{ids} => {
+									Self::stream_objects(backend, ids, ctx.message_sender()).await.into()
 								}
-								RpcRequest::FindMissingChunks{ids} => {
-									backend.find_missing_chunks(ids).await.into()
+								RpcRequest::FindMissingObjects{ids} => {
+									backend.find_missing_objects(ids).await.into()
 								}
 							};
 							let _: StdResult<_, _> = ctx.reply(response).await;

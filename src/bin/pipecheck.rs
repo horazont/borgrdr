@@ -134,7 +134,7 @@ async fn main() -> Result<()> {
 			if idbuf.len() >= 128 {
 				let ids = idbuf.split_off(0);
 				assert!(ids.len() > 0);
-				for missing_id in repo.store().find_missing_chunks(ids).await? {
+				for missing_id in repo.store().find_missing_objects(ids).await? {
 					archive_meter.log(
 						diag::Level::Error,
 						"item_chunks",
@@ -148,7 +148,7 @@ async fn main() -> Result<()> {
 		}
 
 		if idbuf.len() > 0 {
-			for missing_id in repo.store().find_missing_chunks(idbuf).await? {
+			for missing_id in repo.store().find_missing_objects(idbuf).await? {
 				archive_meter.log(
 					diag::Level::Error,
 					"item_chunks",

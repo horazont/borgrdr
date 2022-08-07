@@ -226,18 +226,18 @@ impl<S: ObjectStore + Send + Sync + 'static> Repository<S> {
 	pub fn open_stream<'x>(
 		&'x self,
 		ids: Vec<Id>,
-	) -> io::Result<StreamReader<'x, S, S::ChunkStream>> {
+	) -> io::Result<StreamReader<'x, S, S::ObjectStream>> {
 		Ok(StreamReader {
 			repo: self,
 			curr: None,
-			src: self.store.stream_chunks(ids)?,
+			src: self.store.stream_objects(ids)?,
 		})
 	}
 
 	pub fn archive_items<'x>(
 		&'x self,
 		ids: Vec<Id>,
-	) -> io::Result<FramedRead<StreamReader<'x, S, S::ChunkStream>, MpCodec<ArchiveItem>>> {
+	) -> io::Result<FramedRead<StreamReader<'x, S, S::ObjectStream>, MpCodec<ArchiveItem>>> {
 		Ok(FramedRead::new(self.open_stream(ids)?, MpCodec::new()))
 	}
 }

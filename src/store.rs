@@ -11,11 +11,11 @@ use super::segments::Id;
 
 #[async_trait::async_trait]
 pub trait ObjectStore {
-	type ChunkStream: Stream<Item = io::Result<Bytes>> + Send + Unpin + 'static;
+	type ObjectStream: Stream<Item = io::Result<Bytes>> + Send + Unpin + 'static;
 
 	async fn retrieve<K: AsRef<Id> + Send>(&self, id: K) -> io::Result<Bytes>;
 	async fn contains<K: AsRef<Id> + Send>(&self, id: K) -> io::Result<bool>;
-	async fn find_missing_chunks(&self, ids: Vec<Id>) -> io::Result<Vec<Id>>;
+	async fn find_missing_objects(&self, ids: Vec<Id>) -> io::Result<Vec<Id>>;
 	async fn get_repository_config_key(&self, key: &str) -> io::Result<Option<String>>;
 	async fn check_all_segments(
 		&self,
@@ -25,12 +25,12 @@ pub trait ObjectStore {
 	// we have to take Vec<Id> here for the lack of type-GATs
 	// this will likely only be implementable on Arc<ObjectStore>,
 	// for lack of lifetime-GATs
-	fn stream_chunks(&self, chunks: Vec<Id>) -> io::Result<Self::ChunkStream>;
+	fn stream_objects(&self, object_ids: Vec<Id>) -> io::Result<Self::ObjectStream>;
 }
 
 #[async_trait::async_trait]
 impl<S: ObjectStore + Send + Sync> ObjectStore for Arc<S> {
-	type ChunkStream = S::ChunkStream;
+	type ObjectStream = S::ObjectStream;
 
 	async fn retrieve<K: AsRef<Id> + Send>(&self, id: K) -> io::Result<Bytes> {
 		(**self).retrieve(id).await
@@ -40,8 +40,8 @@ impl<S: ObjectStore + Send + Sync> ObjectStore for Arc<S> {
 		(**self).contains(id).await
 	}
 
-	async fn find_missing_chunks(&self, ids: Vec<Id>) -> io::Result<Vec<Id>> {
-		(**self).find_missing_chunks(ids).await
+	async fn find_missing_objects(&self, ids: Vec<Id>) -> io::Result<Vec<Id>> {
+		(**self).find_missing_objects(ids).await
 	}
 
 	async fn get_repository_config_key(&self, key: &str) -> io::Result<Option<String>> {
@@ -55,7 +55,7 @@ impl<S: ObjectStore + Send + Sync> ObjectStore for Arc<S> {
 		(**self).check_all_segments(progress).await
 	}
 
-	fn stream_chunks(&self, chunks: Vec<Id>) -> io::Result<Self::ChunkStream> {
-		(**self).stream_chunks(chunks)
+	fn stream_objects(&self, object_ids: Vec<Id>) -> io::Result<Self::ObjectStream> {
+		(**self).stream_objects(object_ids)
 	}
 }

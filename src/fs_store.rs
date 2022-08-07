@@ -23,7 +23,7 @@ use super::diag;
 use super::diag::{DiagnosticsSink, Progress};
 use super::hashindex::{MmapSegmentIndex, ReadSegmentIndex};
 use super::segments;
-use super::segments::{read_segment, Id, Segment, SegmentReader};
+use super::segments::{read_segment, Id, LogEntry, SegmentReader};
 use super::store::ObjectStore;
 
 #[derive(Debug)]
@@ -128,7 +128,7 @@ impl FsStore {
 		))
 	}
 
-	fn read_single_segment(&self, id: &Id, segmentno: u64, offset: u64) -> io::Result<Bytes> {
+	fn read_single_object(&self, id: &Id, segmentno: u64, offset: u64) -> io::Result<Bytes> {
 		let mut path = self.root.clone();
 		path.reserve(4 + 10 + 10);
 		path.push("data");
@@ -136,7 +136,7 @@ impl FsStore {
 		path.push(dir.to_string());
 		path.push(fileno.to_string());
 		trace!(
-			"reading chunk {:?} from segment {} in {:?} at offset {}",
+			"reading object {:?} from segment {} in {:?} at offset {}",
 			id,
 			segmentno,
 			path,
@@ -146,12 +146,12 @@ impl FsStore {
 		file.seek(io::SeekFrom::Start(offset as u64))?;
 		let file = io::BufReader::new(file);
 		match read_segment(file)? {
-			Some(Segment::Put { ref key, ref data }) => {
+			Some(LogEntry::Put { ref key, ref data }) => {
 				if key != id {
 					Err(io::Error::new(
 						io::ErrorKind::InvalidData,
 						format!(
-							"chunk index pointed at {}/{} @ {}, which is a mismatching PUT",
+							"segment index pointed at {}/{} @ {}, which is a mismatching PUT",
 							dir, fileno, offset
 						),
 					))
@@ -162,7 +162,7 @@ impl FsStore {
 			_ => Err(io::Error::new(
 				io::ErrorKind::InvalidData,
 				format!(
-					"chunk index pointed at {}/{} @ {}, which is not a PUT",
+					"segment index pointed at {}/{} @ {}, which is not a PUT",
 					dir, fileno, offset
 				),
 			)),
@@ -205,20 +205,20 @@ impl FsStore {
 		Some(Ok(Some((segment, offset))))
 	}
 
-	fn search_chunk(&self, id: &Id) -> io::Result<Option<Bytes>> {
+	fn search_object(&self, id: &Id) -> io::Result<Option<Bytes>> {
 		trace!("starting exhaustive search for {:?}", id);
 		let mut lock = self.segment_cache.write().unwrap();
 		for item in self.iter_segment_files()? {
 			let (fileno, item) = item?;
 			let mut rdr = SegmentReader::new(io::BufReader::new(item));
 			loop {
-				let (offset, segment) = rdr.read_pos();
-				let segment = match segment? {
+				let (offset, log_entry) = rdr.read_pos();
+				let log_entry = match log_entry? {
 					Some(v) => v,
 					None => break,
 				};
-				match segment {
-					Segment::Put { ref key, ref data } => {
+				match log_entry {
+					LogEntry::Put { ref key, ref data } => {
 						if !lock.contains_key(key) {
 							lock.insert(*key, Some((fileno, offset)));
 						}
@@ -226,7 +226,7 @@ impl FsStore {
 							return Ok(Some(data.to_owned().to_vec().into()));
 						}
 					}
-					Segment::Delete { ref key } => {
+					LogEntry::Delete { ref key } => {
 						if !lock.contains_key(key) {
 							lock.insert(*key, None);
 						}
@@ -234,7 +234,7 @@ impl FsStore {
 							return Ok(None);
 						}
 					}
-					Segment::Commit => (),
+					LogEntry::Commit => (),
 				}
 			}
 		}
@@ -297,7 +297,7 @@ impl FsStore {
 			// caches are all inconclusive, do exhaustive search
 			None => (),
 		}
-		Ok(self.search_chunk(id)?.is_some())
+		Ok(self.search_object(id)?.is_some())
 	}
 }
 
@@ -310,7 +310,7 @@ impl ObjectStore for Arc<FsStore> {
 			.or_else(|| self.try_in_memory_cache(id))
 		{
 			Some(Ok(Some((segment, offset)))) => {
-				return self.read_single_segment(id, segment, offset)
+				return self.read_single_object(id, segment, offset)
 			}
 			Some(Ok(None)) => {
 				return Err(io::Error::new(
@@ -322,7 +322,7 @@ impl ObjectStore for Arc<FsStore> {
 			// caches are all inconclusive, do exhaustive search
 			None => (),
 		}
-		match self.search_chunk(id)? {
+		match self.search_object(id)? {
 			Some(v) => return Ok(v),
 			None => {
 				return Err(io::Error::new(
@@ -337,7 +337,7 @@ impl ObjectStore for Arc<FsStore> {
 		self.contains_inner(id.as_ref())
 	}
 
-	async fn find_missing_chunks(&self, ids: Vec<Id>) -> io::Result<Vec<Id>> {
+	async fn find_missing_objects(&self, ids: Vec<Id>) -> io::Result<Vec<Id>> {
 		let mut missing = Vec::new();
 		for (i, id) in ids.into_iter().enumerate() {
 			if !self.contains_inner(&id)? {
@@ -379,10 +379,9 @@ impl ObjectStore for Arc<FsStore> {
 					cur: segment_no,
 					max: max_segment_number,
 				});
-				// this is the first segment of a new directory
-				data_path.pop();
-				data_path.push(dir.to_string());
 			}
+			data_path.pop();
+			data_path.push(dir.to_string());
 
 			data_path.push(file.to_string());
 			let reader = match fs::File::open(&data_path) {
@@ -411,8 +410,8 @@ impl ObjectStore for Arc<FsStore> {
 			let mut reader = SegmentReader::new(io::BufReader::new(reader));
 			loop {
 				let (offset, item) = reader.read_pos();
-				let segment = match item {
-					Ok(Some(segment)) => segment,
+				let log_entry = match item {
+					Ok(Some(log_entry)) => log_entry,
 					Ok(None) => break,
 					Err(e) => {
 						ok = false;
@@ -422,7 +421,7 @@ impl ObjectStore for Arc<FsStore> {
 								found,
 								calculated,
 							}) => {
-								progress.log(diag::Level::Error, "segments", &format!("chunk crc mismatch in segment file {} at offset {}: 0x{:08x} (found) != 0x{:08x} (expected), but reading the chunk anyway", segment_no, offset, found, calculated));
+								progress.log(diag::Level::Error, "segments", &format!("log entry crc mismatch in segment file {} at offset {}: 0x{:08x} (found) != 0x{:08x} (expected), but reading the log entry anyway", segment_no, offset, found, calculated));
 								unchecked
 							}
 							Ok(other) => {
@@ -430,7 +429,7 @@ impl ObjectStore for Arc<FsStore> {
 									diag::Level::Error,
 									"segments",
 									&format!(
-										"malformed chunk in segment file {} at offset {}: {}",
+										"malformed log entry in segment file {} at offset {}: {}",
 										segment_no, offset, other
 									),
 								);
@@ -441,7 +440,7 @@ impl ObjectStore for Arc<FsStore> {
 									diag::Level::Error,
 									"segments",
 									&format!(
-										"failed to read chunk in segment file {} at offset {}: {}",
+										"failed to read log entry in segment file {} at offset {}: {}",
 										segment_no, offset, other
 									),
 								);
@@ -450,10 +449,10 @@ impl ObjectStore for Arc<FsStore> {
 						}
 					}
 				};
-				let (key, value) = match segment {
-					Segment::Put { ref key, .. } => (*key, Some((segment_no, offset))),
-					Segment::Delete { ref key } => (*key, None),
-					Segment::Commit => {
+				let (key, value) = match log_entry {
+					LogEntry::Put { ref key, .. } => (*key, Some((segment_no, offset))),
+					LogEntry::Delete { ref key } => (*key, None),
+					LogEntry::Commit => {
 						for (key, value) in update_cache.drain() {
 							new_cache.insert(key, value);
 						}
@@ -472,23 +471,23 @@ impl ObjectStore for Arc<FsStore> {
 		}
 		tokio::task::yield_now().await;
 		if let Some(on_disk_index) = self.on_disk_index.as_ref() {
-			let mut expected_chunks: HashSet<_> = on_disk_index.iter_keys().map(|x| *x).collect();
+			let mut expected_objects: HashSet<_> = on_disk_index.iter_keys().map(|x| *x).collect();
 			{
 				let lock = self.segment_cache.read().unwrap();
 				for (key, value) in lock.iter() {
-					let is_in_cache = expected_chunks.remove(key);
+					let is_in_cache = expected_objects.remove(key);
 					if is_in_cache && value.is_none() {
-						progress.log(diag::Level::Error, "chunk_cache", &format!("on-disk chunk cache claims chunk {:?} does exist, but we found a DELETE", key));
+						progress.log(diag::Level::Error, "segment_index", &format!("on-disk segment index claims object {:?} does exist, but we found a DELETE", key));
 						ok = false;
 					}
 					if !is_in_cache && value.is_some() {
-						progress.log(diag::Level::Error, "chunk_cache", &format!("on-disk chunk cache claims chunk {:?} does not exist, but we found a PUT", key));
+						progress.log(diag::Level::Error, "segment_index", &format!("on-disk segment index claims object {:?} does not exist, but we found a PUT", key));
 						ok = false;
 					}
 				}
 			}
-			for id in expected_chunks.iter() {
-				progress.log(diag::Level::Error, "chunk_cache", &format!("on-disk chunk cache claims chunk {:?} does exist, but we found no trace of it", id));
+			for id in expected_objects.iter() {
+				progress.log(diag::Level::Error, "segment_index", &format!("on-disk segment index claims object {:?} does exist, but we found no trace of it", id));
 				ok = false;
 			}
 		}
@@ -503,24 +502,24 @@ impl ObjectStore for Arc<FsStore> {
 		}
 	}
 
-	type ChunkStream = ChunkStream;
+	type ObjectStream = ObjectStream;
 
-	fn stream_chunks(&self, chunks: Vec<Id>) -> io::Result<Self::ChunkStream> {
-		Ok(Self::ChunkStream {
-			ids: chunks.into_iter(),
+	fn stream_objects(&self, object_ids: Vec<Id>) -> io::Result<Self::ObjectStream> {
+		Ok(Self::ObjectStream {
+			ids: object_ids.into_iter(),
 			store: Arc::clone(self),
 			request: None,
 		})
 	}
 }
 
-pub struct ChunkStream {
+pub struct ObjectStream {
 	store: Arc<FsStore>,
 	ids: std::vec::IntoIter<Id>,
 	request: Option<Pin<Box<dyn Future<Output = io::Result<Bytes>> + Send>>>,
 }
 
-impl Stream for ChunkStream {
+impl Stream for ObjectStream {
 	type Item = io::Result<Bytes>;
 
 	fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
