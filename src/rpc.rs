@@ -24,9 +24,9 @@ use futures::stream::{SplitSink, SplitStream, Stream, StreamExt};
 
 use serde::{Deserialize, Serialize};
 
+use super::bincode_codec::{BincodeCodec, DefaultBincodeCodec};
 use super::diag;
 use super::diag::{DiagnosticsSink, Progress};
-use super::rmp_codec::MpCodec;
 use super::segments::Id;
 use super::store::ObjectStore;
 
@@ -552,7 +552,7 @@ impl RpcWorkerConfig {
 		mpsc::Sender<RpcWorkerCommand>,
 		mpsc::Receiver<RpcWorkerMessage>,
 	) {
-		let (tx, rx) = codec::Framed::new(channel, MpCodec::new()).split();
+		let (tx, rx) = codec::Framed::new(channel, BincodeCodec::new()).split();
 		let (request_tx, request_rx) = mpsc::channel(self.request_queue_size);
 		let (message_tx, message_rx) = mpsc::channel(self.message_queue_size);
 		let worker = RpcWorker {
@@ -638,8 +638,8 @@ macro_rules! fulfill_reply {
 }
 
 struct RpcWorker<T: AsyncRead + AsyncWrite> {
-	tx: SplitSink<codec::Framed<T, MpCodec<RpcItem>>, RpcItem>,
-	rx: SplitStream<codec::Framed<T, MpCodec<RpcItem>>>,
+	tx: SplitSink<codec::Framed<T, DefaultBincodeCodec<RpcItem>>, RpcItem>,
+	rx: SplitStream<codec::Framed<T, DefaultBincodeCodec<RpcItem>>>,
 	next_id: RequestId,
 	request_rx: mpsc::Receiver<RpcWorkerCommand>,
 	message_tx: mpsc::Sender<RpcWorkerMessage>,

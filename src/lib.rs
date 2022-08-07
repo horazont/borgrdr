@@ -1,4 +1,5 @@
 mod aes_ctr;
+pub mod bincode_codec;
 pub mod compress;
 pub mod crypto;
 pub mod diag;
