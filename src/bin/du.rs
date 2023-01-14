@@ -18,13 +18,14 @@ use std::hash::{Hash, Hasher};
 use std::io;
 use std::ops::Deref;
 use std::rc::Rc;
-use std::sync::{Arc, Mutex, Weak};
+use std::sync::{atomic, atomic::AtomicU64, Arc, Mutex, Weak};
 
 use cursive::align::HAlign;
 use cursive::direction::Orientation;
+use cursive::event::Event;
 use cursive::theme::{BaseColor, Color, PaletteColor};
 use cursive::traits::*;
-use cursive::views::{Dialog, LinearLayout, Panel, ProgressBar};
+use cursive::views::{Dialog, LinearLayout, Panel, ProgressBar, TextView};
 use cursive::{Cursive, CursiveExt};
 
 use cursive_tree_view::{Placement, TreeView};
@@ -49,6 +50,9 @@ use borgrdr::segments::Id;
 use borgrdr::structs::{ArchiveItem, Chunk};
 
 type ContentHash = Box<[u8; 32]>;
+
+static MERGED_NODES: AtomicU64 = AtomicU64::new(0);
+static FINAL_NODES: AtomicU64 = AtomicU64::new(0);
 
 fn hash_content(buf: &[u8]) -> ContentHash {
 	let mut ctx = DigestContext::new(&SHA256);
@@ -481,6 +485,7 @@ static INDENT_LAST: &'static str = "  ";
 
 impl MergedNode {
 	fn new(name: Vec<u8>) -> Self {
+		MERGED_NODES.fetch_add(1, atomic::Ordering::Relaxed);
 		Self {
 			name,
 			children: HashMap::new(),
@@ -1001,6 +1006,7 @@ impl FinalNode {
 				));
 			}
 
+			FINAL_NODES.fetch_add(1, atomic::Ordering::Relaxed);
 			Self {
 				name: other.name,
 				parent,
@@ -1284,7 +1290,6 @@ impl ArchiveProgress {
 				pb.set_value(done);
 			}
 			Self::Done => {
-				pb.set_label(|_, _| "finalizing...".to_string());
 				pb.set_range(0, 1);
 				pb.set_value(1);
 			}
@@ -1295,6 +1300,14 @@ impl ArchiveProgress {
 		self.apply_to(&mut pb);
 		pb
 	}
+}
+
+fn apply_finalisation_progress(pb: &mut ProgressBar) {
+	let merged = MERGED_NODES.load(atomic::Ordering::Relaxed);
+	let finalized = FINAL_NODES.load(atomic::Ordering::Relaxed);
+	// some headroom :-)
+	pb.set_range(0, (merged + 2) as usize);
+	pb.set_value(finalized.min(merged) as usize);
 }
 
 struct Main {
@@ -1346,12 +1359,40 @@ fn main() -> Result<(), anyhow::Error> {
 				let lock = chunk_index.lock().unwrap();
 				lock.len()
 			};
+			sender.send(Box::new(move |siv: &mut Cursive| {
+				siv.add_global_callback(Event::Refresh, |siv| {
+					siv.call_on_name("progress_step", |tv: &mut TextView| {
+						tv.set_content("Step 2/2: Calculating Sizes");
+					});
+					siv.call_on_name("progress", |pb: &mut ProgressBar| {
+						pb.set_min(0);
+						pb.set_value(0);
+						pb.set_max(1);
+						pb.set_label(|value, (min, max)| {
+							format!(
+								"{:.0}%",
+								(value - min) as f64 / ((max - min).max(1) as f64) * 100.
+							)
+						});
+					});
+				});
+			}));
 			let total_chunks = merged.global_chunk_map(total_chunk_count);
+			sender.send(Box::new(move |siv: &mut Cursive| {
+				siv.set_fps(1);
+				siv.add_global_callback(Event::Refresh, |siv| {
+					siv.call_on_name("progress", |pb: &mut ProgressBar| {
+						apply_finalisation_progress(pb);
+					});
+				});
+			}));
 			let data = FinalNode::from_merged(None, merged, &total_chunks, &chunk_index);
 			drop(chunk_index);
 			drop(total_chunks);
 			Main::update_root(Arc::clone(&main), Arc::clone(&data));
 			sender.send(Box::new(move |siv: &mut Cursive| {
+				siv.set_fps(0);
+				siv.clear_global_callbacks(Event::Refresh);
 				siv.call_on_name(
 					"contents",
 					|table: &mut TableView<Arc<FinalNode>, FileListColumn>| {
@@ -1501,6 +1542,12 @@ fn main() -> Result<(), anyhow::Error> {
 					.title("File versions")
 					.full_height(),
 			)
+			.child(
+				LinearLayout::new(Orientation::Horizontal)
+					.child(TextView::new("Ready to rumble."))
+					.with_name("statusbar")
+					.fixed_height(1),
+			)
 			.full_screen(),
 	);
 
@@ -1508,10 +1555,18 @@ fn main() -> Result<(), anyhow::Error> {
 		Dialog::new()
 			.title("Loading")
 			.content(
-				ArchiveProgress::Opening
-					.applied(ProgressBar::new())
-					.with_name("progress")
-					.min_width(16),
+				LinearLayout::new(Orientation::Vertical)
+					.child(
+						TextView::new("Step 1/2: Reading archives")
+							.with_name("progress_step")
+							.fixed_height(1),
+					)
+					.child(
+						ArchiveProgress::Opening
+							.applied(ProgressBar::new())
+							.with_name("progress")
+							.min_width(16),
+					),
 			)
 			.button("Cancel", |siv| {
 				siv.quit();
