@@ -297,11 +297,6 @@ impl VersionedNode {
 	}
 }
 
-struct VersionedTree {
-	version: Version,
-	root: VersionedNode,
-}
-
 impl fmt::Debug for VersionedNode {
 	fn fmt<'f>(&self, f: &'f mut fmt::Formatter) -> fmt::Result {
 		match self {
@@ -335,65 +330,6 @@ enum HashedNodeData {
 }
 
 impl HashedNodeData {
-	fn osize(&self, chunk_index: &Arc<Mutex<ChunkIndex>>) -> u64 {
-		match self {
-			Self::Directory { children } => children.values().map(|x| x.osize).sum(),
-			Self::Regular { chunks } => {
-				let lock = chunk_index.lock().unwrap();
-				chunks.iter().map(|chunk| lock[&chunk].0).sum()
-			}
-			Self::Symlink { .. } => 0,
-		}
-	}
-
-	fn csize(&self, chunk_index: &Arc<Mutex<ChunkIndex>>) -> u64 {
-		match self {
-			Self::Directory { children } => children.values().map(|x| x.csize).sum(),
-			Self::Regular { chunks } => {
-				let lock = chunk_index.lock().unwrap();
-				chunks.iter().map(|chunk| lock[&chunk].1).sum()
-			}
-			Self::Symlink { .. } => 0,
-		}
-	}
-
-	fn unique_chunks(&self) -> HashMap<Id, usize> {
-		match self {
-			Self::Directory { children } => {
-				let mut result = HashMap::new();
-				for child in children.values() {
-					for (id, count) in child.unique_chunks.iter() {
-						match result.entry(*id) {
-							Entry::Occupied(mut o) => {
-								*o.get_mut() += *count;
-							}
-							Entry::Vacant(v) => {
-								v.insert(*count);
-							}
-						}
-					}
-				}
-				result
-			}
-			Self::Regular { chunks } => {
-				let mut result = HashMap::with_capacity(chunks.len());
-				for id in chunks.iter() {
-					match result.entry(*id) {
-						Entry::Occupied(mut o) => {
-							*o.get_mut() += 1;
-						}
-						Entry::Vacant(v) => {
-							v.insert(1);
-						}
-					}
-				}
-				result.shrink_to_fit();
-				result
-			}
-			Self::Symlink { .. } => HashMap::new(),
-		}
-	}
-
 	fn content_hash(&self) -> Bytes {
 		let mut buf = BytesMut::new();
 		match self {
@@ -451,20 +387,13 @@ impl HashedNodeData {
 #[derive(Debug)]
 struct HashedNode {
 	content_hash: Bytes,
-	osize: u64,
-	csize: u64,
-	unique_chunks: HashMap<Id, usize>,
 	data: HashedNodeData,
 }
 
 impl HashedNode {
 	pub fn from_versioned(other: VersionedNode, chunk_index: &Arc<Mutex<ChunkIndex>>) -> Self {
 		let data = HashedNodeData::from_versioned(other, chunk_index);
-		let unique_chunks = data.unique_chunks();
 		Self {
-			osize: data.osize(chunk_index),
-			csize: data.csize(chunk_index),
-			unique_chunks,
 			content_hash: data.content_hash(),
 			data,
 		}
@@ -497,12 +426,18 @@ enum MergedNodeData {
 	Symlink { target: Bytes },
 }
 
+impl SizeEstimate for MergedNodeData {
+	fn content_size(&self) -> usize {
+		match self {
+			Self::Regular { chunks } => chunks.capacity() * std::mem::size_of::<Id>(),
+			_ => 0,
+		}
+	}
+}
+
 struct MergedNodeVersion {
 	data: MergedNodeData,
 	versions: Vec<Version>,
-	osize: u64,
-	csize: u64,
-	unique_chunks: HashMap<Id, usize>,
 }
 
 struct MergedNode {
@@ -531,7 +466,6 @@ impl MergedNode {
 		let children = match self.versions.entry(node.content_hash) {
 			Entry::Occupied(mut o) => {
 				o.get_mut().versions.push(version.clone());
-				assert_eq!(o.get().osize, node.osize);
 				let (_, children) = node.data.split_for_merge();
 				children
 			}
@@ -540,9 +474,6 @@ impl MergedNode {
 				v.insert(MergedNodeVersion {
 					data,
 					versions: vec![version.clone()],
-					osize: node.osize,
-					csize: node.csize,
-					unique_chunks: node.unique_chunks,
 				});
 				children
 			}
@@ -561,87 +492,33 @@ impl MergedNode {
 		}
 	}
 
-	fn display<'f>(&self, f: &'f mut fmt::Formatter, indent: &mut String) -> fmt::Result {
-		let total_versions: usize = self.versions.values().map(|x| x.versions.len()).sum();
-		write!(
-			f,
-			"({} versions ({} distinct))\n",
-			total_versions,
-			self.versions.len()
-		)?;
+	fn gather_chunk_maps(&self, total: &mut HashMap<Id, u64>) {
 		for version in self.versions.values() {
 			match &version.data {
-				MergedNodeData::Directory { .. } => continue,
-				MergedNodeData::Regular { .. } => {
-					write!(
-						f,
-						"{}* file of size {} in {} archives\n",
-						indent,
-						version.osize,
-						version.versions.len()
-					)?;
-					for subversion in version.versions.iter() {
-						write!(f, "{}  - {:?}\n", indent, subversion)?;
+				MergedNodeData::Regular { chunks } => {
+					for id in chunks.iter() {
+						match total.entry(*id) {
+							Entry::Occupied(mut o) => {
+								*o.get_mut() += 1;
+							}
+							Entry::Vacant(v) => {
+								v.insert(1);
+							}
+						}
 					}
 				}
-				MergedNodeData::Symlink { target } => {
-					write!(
-						f,
-						"{}* symlink to {:?} in {} archives\n",
-						indent,
-						target,
-						version.versions.len()
-					)?;
-				}
+				_ => (),
 			}
 		}
-		for (i, (name, child)) in self.children.iter().enumerate() {
-			let name = String::from_utf8_lossy(name);
-			let (this_indent, this_node) = if i == self.children.len() - 1 {
-				(INDENT_LAST, "└ ")
-			} else {
-				(INDENT, "├ ")
-			};
-			write!(f, "{}{}{:?} ", indent, this_node, name)?;
-			indent.push_str(this_indent);
-			child.display(f, indent)?;
-			indent.truncate(indent.len() - this_indent.len());
+		for child in self.children.values() {
+			child.gather_chunk_maps(total)
 		}
-		Ok(())
 	}
 
-	fn chunk_maps(
-		&self,
-		chunk_estimate: usize,
-	) -> (HashMap<Id, usize>, HashMap<Version, HashMap<Id, usize>>) {
-		let mut version_chunks = HashMap::new();
-		for (version_key, version_group) in self.versions.iter() {
-			for version in version_group.versions.iter() {
-				version_chunks.insert(version.clone(), version_group.unique_chunks.clone());
-			}
-		}
-
+	fn global_chunk_map(&self, chunk_estimate: usize) -> HashMap<Id, u64> {
 		let mut total_chunks = HashMap::with_capacity(chunk_estimate);
-		for chunk_map in version_chunks.values() {
-			for (id, count) in chunk_map.iter() {
-				match total_chunks.entry(*id) {
-					Entry::Occupied(mut o) => {
-						*o.get_mut() += count;
-					}
-					Entry::Vacant(v) => {
-						v.insert(*count);
-					}
-				}
-			}
-		}
-		(total_chunks, version_chunks)
-	}
-}
-
-impl fmt::Display for MergedNode {
-	fn fmt<'f>(&self, f: &'f mut fmt::Formatter) -> fmt::Result {
-		let mut indent = String::new();
-		self.display(f, &mut indent)
+		self.gather_chunk_maps(&mut total_chunks);
+		total_chunks
 	}
 }
 
@@ -663,12 +540,26 @@ async fn hasher(
 
 type GroupKey = Bytes;
 
+trait SizeEstimate: Sized {
+	fn content_size(&self) -> usize;
+
+	fn recursive_size(&self) -> usize {
+		self.content_size() + std::mem::size_of::<Self>()
+	}
+}
+
 struct FinalNodeVersion {
 	version: Version,
 }
 
+impl SizeEstimate for FinalNodeVersion {
+	fn content_size(&self) -> usize {
+		0
+	}
+}
+
 impl FinalNodeVersion {
-	fn from_merged(other: Version, unique_chunks: &HashMap<Id, usize>) -> Arc<Self> {
+	fn from_merged(other: Version) -> Arc<Self> {
 		Arc::new(Self { version: other })
 	}
 }
@@ -686,16 +577,47 @@ struct FinalNodeVersionGroup {
 	versions: Vec<Arc<FinalNodeVersion>>,
 }
 
+impl SizeEstimate for FinalNodeVersionGroup {
+	fn content_size(&self) -> usize {
+		let versions_size: usize = self.versions.iter().map(|x| x.recursive_size()).sum();
+		self.versions.capacity() * std::mem::size_of::<Arc<FinalNodeVersion>>()
+			+ versions_size
+			+ self.data.content_size()
+	}
+}
+
 impl FinalNodeVersionGroup {
+	fn calculate_original_sizes(
+		subtree_chunks: &HashMap<Id, u64>,
+		chunk_index: &Arc<Mutex<ChunkIndex>>,
+	) -> (u64, u64) {
+		let mut osize = 0;
+		let mut csize = 0;
+		let locked_chunk_index = chunk_index.lock().unwrap();
+		for (id, count) in subtree_chunks.iter() {
+			let count = *count;
+			let (chunk_osize, chunk_csize) = locked_chunk_index
+				.get(id)
+				.map(|(osize, csize)| (*osize, *csize))
+				.unwrap_or((0, 0));
+			osize += chunk_osize * count;
+			csize += chunk_csize * count;
+		}
+		(osize, csize)
+	}
+
 	fn calculate_group_dsize(
-		unique_chunks: &HashMap<Id, usize>,
-		total_chunks: &HashMap<Id, usize>,
+		nversions: usize,
+		subtree_chunks: &HashMap<Id, u64>,
+		total_chunks: &HashMap<Id, u64>,
 		chunk_index: &Arc<Mutex<ChunkIndex>>,
 	) -> u64 {
+		let nversions = nversions as u64;
 		let mut group_dsize = 0;
 		let locked_chunk_index = chunk_index.lock().unwrap();
-		for (id, count) in unique_chunks.iter() {
-			if total_chunks.get(id).map(|x| *x).unwrap_or(0) > *count {
+		for (id, count) in subtree_chunks.iter() {
+			let count = *count * nversions;
+			if total_chunks.get(id).map(|x| *x).unwrap_or(0) > count {
 				continue;
 			}
 			group_dsize += locked_chunk_index.get(id).unwrap().1;
@@ -704,12 +626,12 @@ impl FinalNodeVersionGroup {
 	}
 
 	fn calculate_local_dsize(
-		unique_chunks: &HashMap<Id, usize>,
+		subtree_chunks: &HashMap<Id, u64>,
 		chunk_index: &Arc<Mutex<ChunkIndex>>,
 	) -> u64 {
 		let mut local_dsize = 0;
 		let locked_chunk_index = chunk_index.lock().unwrap();
-		for (id, count) in unique_chunks.iter() {
+		for id in subtree_chunks.keys() {
 			local_dsize += locked_chunk_index.get(id).unwrap().1;
 		}
 		local_dsize
@@ -717,22 +639,37 @@ impl FinalNodeVersionGroup {
 
 	fn from_merged(
 		other: MergedNodeVersion,
-		total_chunks: &HashMap<Id, usize>,
+		total_chunks: &HashMap<Id, u64>,
+		subtree_chunks: &HashMap<Version, HashMap<Id, u64>>,
 		chunk_index: &Arc<Mutex<ChunkIndex>>,
 	) -> Arc<Self> {
-		let group_dsize =
-			Self::calculate_group_dsize(&other.unique_chunks, total_chunks, chunk_index);
-		let local_dsize = Self::calculate_local_dsize(&other.unique_chunks, chunk_index);
+		let nversions = other.versions.len();
+		let (osize, csize, group_dsize, local_dsize) =
+			match other.versions.get(0).and_then(|x| subtree_chunks.get(x)) {
+				Some(version_chunks) => {
+					let (osize, csize) =
+						Self::calculate_original_sizes(version_chunks, chunk_index);
+					let group_dsize = Self::calculate_group_dsize(
+						nversions,
+						version_chunks,
+						total_chunks,
+						chunk_index,
+					);
+					let local_dsize = Self::calculate_local_dsize(version_chunks, chunk_index);
+					(osize, csize, group_dsize, local_dsize)
+				}
+				None => (0, 0, 0, 0),
+			};
 		let versions = other
 			.versions
 			.into_iter()
-			.map(|x| FinalNodeVersion::from_merged(x, &other.unique_chunks))
+			.map(|x| FinalNodeVersion::from_merged(x))
 			.collect();
 		Arc::new(Self {
 			data: other.data,
 			versions,
-			osize: other.osize,
-			csize: other.csize,
+			osize,
+			csize,
 			group_dsize,
 			local_dsize,
 		})
@@ -751,6 +688,22 @@ struct FinalNode {
 	local_dsize: u64,
 	version_groups: HashMap<GroupKey, Arc<FinalNodeVersionGroup>>,
 	children: HashMap<Bytes, Arc<FinalNode>>,
+}
+
+impl SizeEstimate for FinalNode {
+	fn content_size(&self) -> usize {
+		let children_size: usize = self.children.values().map(|x| x.recursive_size()).sum();
+		let version_groups_size: usize = self
+			.version_groups
+			.values()
+			.map(|x| x.recursive_size())
+			.sum();
+		self.version_groups.capacity()
+			* std::mem::size_of::<(GroupKey, Arc<FinalNodeVersionGroup>)>()
+			+ self.children.capacity() * std::mem::size_of::<(Bytes, Arc<FinalNode>)>()
+			+ version_groups_size
+			+ children_size
+	}
 }
 
 fn min_max<I: Iterator<Item = usize>>(i: I) -> Option<(usize, usize)> {
@@ -783,19 +736,21 @@ impl FinalNode {
 		versions: &HashMap<Bytes, MergedNodeVersion>,
 		total_chunks: usize,
 	) -> usize {
-		Self::scale_capacity_estimate(
+		/* Self::scale_capacity_estimate(
 			versions
 				.values()
 				.map(|x| x.unique_chunks.len())
 				.max()
 				.unwrap_or(0),
 			total_chunks,
-		)
+		) */
+		1
 	}
 
 	fn calculate_churn(
 		versions: &HashMap<Bytes, MergedNodeVersion>,
-		total_chunks: &HashMap<Id, usize>,
+		subtree_chunks: &HashMap<Version, HashMap<Id, u64>>,
+		total_chunks: &HashMap<Id, u64>,
 		chunk_index: &Arc<Mutex<ChunkIndex>>,
 	) -> u64 {
 		if versions.len() == 0 {
@@ -804,17 +759,23 @@ impl FinalNode {
 
 		let locked_chunk_index = chunk_index.lock().unwrap();
 		// count how many versions a chunk appears in
-		let mut versions_union = HashMap::<Id, Option<usize>>::with_capacity(
+		let mut versions_union = HashMap::<Id, Option<u64>>::with_capacity(
 			Self::capacity_with_headroom_for_union(versions, locked_chunk_index.len()),
 		);
 		for version in versions.values() {
-			for (id, count) in version.unique_chunks.iter() {
+			let representative = match subtree_chunks.get(&version.versions[0]) {
+				Some(v) => v,
+				None => continue,
+			};
+			let nversions = version.versions.len() as u64;
+			for (id, count) in representative.iter() {
 				match versions_union.entry(*id) {
 					Entry::Occupied(mut o) => {
 						*o.get_mut() = None;
 					}
 					Entry::Vacant(v) => {
-						v.insert(Some(*count));
+						let count = *count * nversions;
+						v.insert(Some(count));
 					}
 				}
 			}
@@ -840,7 +801,8 @@ impl FinalNode {
 
 	fn calculate_usage(
 		versions: &HashMap<Bytes, MergedNodeVersion>,
-		total_chunks: &HashMap<Id, usize>,
+		subtree_chunks: &HashMap<Version, HashMap<Id, u64>>,
+		total_chunks: &HashMap<Id, u64>,
 		chunk_index: &Arc<Mutex<ChunkIndex>>,
 	) -> u64 {
 		if versions.len() == 0 {
@@ -854,13 +816,19 @@ impl FinalNode {
 			locked_chunk_index.len(),
 		));
 		for version in versions.values() {
-			for (id, count) in version.unique_chunks.iter() {
+			let representative = match subtree_chunks.get(&version.versions[0]) {
+				Some(v) => v,
+				None => continue,
+			};
+			let nversions = version.versions.len() as u64;
+			for (id, count) in representative.iter() {
+				let count = *count * nversions;
 				match versions_union.entry(*id) {
 					Entry::Occupied(mut o) => {
-						*o.get_mut() += *count;
+						*o.get_mut() += count;
 					}
 					Entry::Vacant(v) => {
-						v.insert(*count);
+						v.insert(count);
 					}
 				}
 			}
@@ -881,20 +849,21 @@ impl FinalNode {
 
 	fn calculate_local_dsize(
 		versions: &HashMap<Bytes, MergedNodeVersion>,
+		subtree_chunks: &HashMap<Version, HashMap<Id, u64>>,
 		chunk_index: &Arc<Mutex<ChunkIndex>>,
 	) -> u64 {
 		let locked_chunk_index = chunk_index.lock().unwrap();
-		let mut seen_chunks = HashSet::with_capacity(Self::scale_capacity_estimate(
-			versions
-				.values()
-				.map(|x| x.unique_chunks.len())
-				.max()
-				.unwrap_or(0),
+		let mut seen_chunks = HashSet::with_capacity(Self::capacity_with_headroom_for_union(
+			versions,
 			locked_chunk_index.len(),
 		));
 		let mut dsize = 0;
 		for version in versions.values() {
-			for id in version.unique_chunks.keys() {
+			let representative = match subtree_chunks.get(&version.versions[0]) {
+				Some(v) => v,
+				None => continue,
+			};
+			for id in representative.keys() {
 				if seen_chunks.insert(*id) {
 					dsize += locked_chunk_index.get(id).unwrap().1;
 				}
@@ -903,47 +872,121 @@ impl FinalNode {
 		dsize
 	}
 
+	fn from_merged_inner(
+		parent: Option<Weak<FinalNode>>,
+		other: MergedNode,
+		total_chunks: &HashMap<Id, u64>,
+		chunk_index: &Arc<Mutex<ChunkIndex>>,
+	) -> (Arc<Self>, HashMap<Version, HashMap<Id, u64>>) {
+		let mut subtree_chunks = HashMap::new();
+		let this = Arc::new_cyclic(|this| {
+			let mut children = HashMap::with_capacity(other.children.len());
+			for (name, child) in other.children {
+				let (child, mut child_chunks) = Self::from_merged_inner(
+					Some(Weak::clone(this)),
+					child,
+					total_chunks,
+					chunk_index,
+				);
+				// we always merge into the larger one
+				if subtree_chunks.len() < child_chunks.len() {
+					std::mem::swap(&mut subtree_chunks, &mut child_chunks);
+				}
+
+				for (version_key, mut version_child_chunks) in child_chunks {
+					match subtree_chunks.entry(version_key) {
+						Entry::Vacant(v) => {
+							// not in there yet, just move child data over.
+							v.insert(version_child_chunks);
+							continue;
+						}
+						Entry::Occupied(mut o) => {
+							let version_subtree_chunks = o.get_mut();
+							// we always merge into the larger one
+							if version_subtree_chunks.len() < version_child_chunks.len() {
+								std::mem::swap(version_subtree_chunks, &mut version_child_chunks);
+							}
+							for (id, count) in version_child_chunks {
+								match version_subtree_chunks.entry(id) {
+									Entry::Occupied(mut o) => {
+										*o.get_mut() += count;
+									}
+									Entry::Vacant(v) => {
+										v.insert(count);
+									}
+								}
+							}
+						}
+					}
+				}
+				children.insert(name, child);
+			}
+
+			// now we have the accurate subtree_chunks, now we need to add any chunks from *this* object itself in order to include it in calculations
+			for version_group in other.versions.values() {
+				match &version_group.data {
+					MergedNodeData::Regular { chunks } => {
+						for version in version_group.versions.iter() {
+							let dest = match subtree_chunks.entry(version.clone()) {
+								Entry::Vacant(v) => v.insert(HashMap::new()),
+								Entry::Occupied(mut o) => o.into_mut(),
+							};
+							for id in chunks.iter() {
+								match dest.entry(*id) {
+									Entry::Vacant(v) => {
+										v.insert(1);
+									}
+									Entry::Occupied(mut o) => {
+										*o.get_mut() += 1;
+									}
+								}
+							}
+						}
+					}
+					_ => (),
+				}
+			}
+
+			let churn =
+				Self::calculate_churn(&other.versions, &subtree_chunks, total_chunks, chunk_index);
+			let local_dsize =
+				Self::calculate_local_dsize(&other.versions, &subtree_chunks, chunk_index);
+			let usage =
+				Self::calculate_usage(&other.versions, &subtree_chunks, total_chunks, chunk_index);
+
+			let mut version_groups = HashMap::with_capacity(other.versions.len());
+			for (version_key, version_group) in other.versions {
+				version_groups.insert(
+					version_key,
+					FinalNodeVersionGroup::from_merged(
+						version_group,
+						total_chunks,
+						&subtree_chunks,
+						chunk_index,
+					),
+				);
+			}
+
+			Self {
+				name: other.name,
+				parent,
+				churn,
+				usage,
+				local_dsize,
+				version_groups,
+				children,
+			}
+		});
+		(this, subtree_chunks)
+	}
+
 	pub fn from_merged(
 		parent: Option<Weak<FinalNode>>,
 		other: MergedNode,
-		total_chunks: &HashMap<Id, usize>,
-		version_chunks: &HashMap<Version, HashMap<Id, usize>>,
+		total_chunks: &HashMap<Id, u64>,
 		chunk_index: &Arc<Mutex<ChunkIndex>>,
 	) -> Arc<Self> {
-		let churn = Self::calculate_churn(&other.versions, total_chunks, chunk_index);
-		let local_dsize = Self::calculate_local_dsize(&other.versions, chunk_index);
-		let usage = Self::calculate_usage(&other.versions, total_chunks, chunk_index);
-		let mut version_groups = HashMap::new();
-		for (group_key, data) in other.versions.into_iter() {
-			version_groups.insert(
-				group_key,
-				FinalNodeVersionGroup::from_merged(data, total_chunks, chunk_index),
-			);
-		}
-		Arc::new_cyclic(|this| Self {
-			name: other.name,
-			parent,
-			churn,
-			usage,
-			local_dsize,
-			version_groups,
-			children: other
-				.children
-				.into_iter()
-				.map(|(name, data)| {
-					(
-						name,
-						FinalNode::from_merged(
-							Some(Weak::clone(this)),
-							data,
-							total_chunks,
-							version_chunks,
-							chunk_index,
-						),
-					)
-				})
-				.collect(),
-		})
+		Self::from_merged_inner(parent, other, total_chunks, chunk_index).0
 	}
 }
 
@@ -1190,11 +1233,13 @@ fn main() -> Result<(), anyhow::Error> {
 		let lock = chunk_index.lock().unwrap();
 		lock.len()
 	};
-	let (total_chunks, version_chunks) = merged.chunk_maps(total_chunk_count);
-	let data = FinalNode::from_merged(None, merged, &total_chunks, &version_chunks, &chunk_index);
+	let total_chunks = merged.global_chunk_map(total_chunk_count);
+	let data = FinalNode::from_merged(None, merged, &total_chunks, &chunk_index);
 	drop(chunk_index);
 	drop(total_chunks);
-	drop(version_chunks);
+
+	let size = data.recursive_size();
+	println!("final tree size: {} {}", size, format_bytes(size as u64));
 
 	let mut siv = cursive::Cursive::default();
 
