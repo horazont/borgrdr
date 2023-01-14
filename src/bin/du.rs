@@ -1,0 +1,1340 @@
+/*
+things to display:
+
+- local dsize: deduplicated size of the subtree within an archive
+- local usage: size of chunks not used outside that subtree within an archive
+- global dsize: deduplicated size of the subtree in the repository
+- global usage: size of chunks not used outside that subtree in any archives
+- churn: summed size of all chunks only used within that subtree *and* not in all versions
+*/
+
+use std::cell::RefCell;
+use std::cmp::Ordering;
+use std::collections::hash_map::Entry;
+use std::collections::{HashMap, HashSet};
+use std::env::args;
+use std::fmt;
+use std::hash::{Hash, Hasher};
+use std::io;
+use std::ops::Deref;
+use std::rc::Rc;
+use std::sync::{Arc, Mutex, Weak};
+
+use cursive::align::HAlign;
+use cursive::direction::Orientation;
+use cursive::theme::{BaseColor, Color, PaletteColor};
+use cursive::traits::*;
+use cursive::views::{LinearLayout, Panel};
+use cursive::{Cursive, CursiveExt};
+
+use cursive_tree_view::{Placement, TreeView};
+
+use cursive_table_view::{TableView, TableViewItem};
+
+use ring::digest::{Context as DigestContext, SHA256};
+
+use bytes::{BufMut, Bytes, BytesMut};
+
+use anyhow::{Context, Result};
+
+use tokio::sync::mpsc;
+
+use futures::stream::StreamExt;
+
+use chrono::{DateTime, TimeZone, Utc};
+
+use borgrdr::repository::Repository;
+use borgrdr::rpc::RpcStoreClient;
+use borgrdr::segments::Id;
+use borgrdr::structs::{ArchiveItem, Chunk};
+
+fn hash_content(buf: &[u8]) -> Bytes {
+	let mut ctx = DigestContext::new(&SHA256);
+	ctx.update(buf);
+	Bytes::copy_from_slice(ctx.finish().as_ref())
+}
+
+#[derive(Debug)]
+enum FileData {
+	Regular { chunks: Vec<Chunk>, size: u64 },
+	Symlink { target_path: Bytes },
+	Directory {},
+}
+
+#[derive(Debug)]
+struct Times {
+	atime: Option<DateTime<Utc>>,
+	mtime: Option<DateTime<Utc>>,
+	ctime: Option<DateTime<Utc>>,
+	birthtime: Option<DateTime<Utc>>,
+}
+
+fn convert_ts(ts: i64) -> DateTime<Utc> {
+	let secs = ts / 1000000000;
+	let nanos = (ts % 1000000000) as u32;
+	Utc.timestamp(secs, nanos)
+}
+
+impl From<&ArchiveItem> for Times {
+	fn from(other: &ArchiveItem) -> Self {
+		Self {
+			atime: other.atime().map(convert_ts),
+			mtime: other.mtime().map(convert_ts),
+			ctime: other.ctime().map(convert_ts),
+			birthtime: other.birthtime().map(convert_ts),
+		}
+	}
+}
+
+// chunkid -> osize, csize
+type ChunkIndex = HashMap<Id, (u64, u64)>;
+
+#[derive(Debug)]
+struct VersionInfo {
+	name: String,
+	// TODO: convert to DateTime<Utc>
+	timestamp: String,
+}
+
+struct Version(Arc<VersionInfo>);
+
+impl Clone for Version {
+	fn clone(&self) -> Self {
+		Self(Arc::clone(&self.0))
+	}
+}
+
+impl PartialEq for Version {
+	fn eq(&self, other: &Version) -> bool {
+		Arc::ptr_eq(&self.0, &other.0)
+	}
+}
+
+impl Eq for Version {}
+
+impl Hash for Version {
+	fn hash<H: Hasher>(&self, state: &mut H) {
+		Arc::as_ptr(&self.0).hash(state)
+	}
+}
+
+impl fmt::Debug for Version {
+	fn fmt<'f>(&self, f: &'f mut fmt::Formatter) -> fmt::Result {
+		fmt::Debug::fmt(&*self.0, f)
+	}
+}
+
+#[derive(Debug)]
+struct FileEntry {
+	path: Bytes,
+	mode: u32,
+	uid: u32,
+	gid: u32,
+	times: Times,
+	payload: FileData,
+}
+
+#[derive(Debug)]
+enum FileEntryError {
+	UnsupportedMode(u32),
+}
+
+impl TryFrom<ArchiveItem> for FileEntry {
+	type Error = (FileEntryError, ArchiveItem);
+
+	fn try_from(other: ArchiveItem) -> Result<Self, Self::Error> {
+		let times = (&other).into();
+		let mode = other.mode() & !0o7777;
+		let payload = if mode == 0o40000 {
+			// is directory
+			FileData::Directory {}
+		} else if mode == 0o120000 {
+			// is symlink
+			FileData::Symlink {
+				target_path: Bytes::new(),
+			}
+		} else if mode == 0o100000 {
+			// is regular
+			FileData::Regular {
+				chunks: other.chunks().into_iter().cloned().collect(),
+				size: other.size().unwrap_or(0),
+			}
+		} else {
+			// unsupported
+			return Err((FileEntryError::UnsupportedMode(mode), other));
+		};
+		Ok(Self {
+			path: other.path().clone(),
+			mode: other.mode(),
+			uid: other.uid(),
+			gid: other.gid(),
+			times,
+			payload,
+		})
+	}
+}
+
+async fn read_entries(
+	repo: Repository<RpcStoreClient>,
+	archive_sink: mpsc::Sender<(Version, mpsc::Receiver<FileEntry>)>,
+) -> Result<(), io::Error> {
+	let manifest = repo.manifest();
+	for v in manifest.archives().values() {
+		let (version, items) = {
+			let archive = repo.read_archive(v.id()).await?;
+			let version = Version(Arc::new(VersionInfo {
+				name: archive.name().into(),
+				timestamp: archive.start_time().into(),
+			}));
+			(version, archive.items().iter().map(|x| *x).collect())
+		};
+		let (item_sink, item_source) = mpsc::channel(128);
+		archive_sink.send((version, item_source)).await.unwrap();
+		let mut archive_item_stream = repo.archive_items(items)?;
+		while let Some(item) = archive_item_stream.next().await {
+			let item = item?;
+			let item: FileEntry = match item.try_into() {
+				Ok(v) => v,
+				Err((e, item)) => {
+					log::warn!("ignoring {:?}: {:?}", item.path(), e);
+					continue;
+				}
+			};
+			item_sink.send(item).await.unwrap();
+		}
+	}
+	Ok(())
+}
+
+enum VersionedNode {
+	Directory {
+		children: HashMap<Bytes, VersionedNode>,
+	},
+	Regular {
+		chunks: Vec<Id>,
+	},
+	Symlink {
+		target: Bytes,
+	},
+}
+
+fn split_path<'x>(a: &'x [u8]) -> (&'x [u8], Option<&'x [u8]>) {
+	for (i, b) in a.iter().enumerate() {
+		if *b == b'/' {
+			return (&a[..i], Some(&a[i + 1..]));
+		}
+	}
+	return (a, None);
+}
+
+fn has_dir_sep(a: &[u8]) -> bool {
+	return a.iter().find(|x| **x == b'/').is_some();
+}
+
+fn split_first_segment<'x>(a: &mut Bytes) -> Bytes {
+	for (i, b) in a.iter().enumerate() {
+		if *b == b'/' {
+			let mut lhs = a.split_to(i + 1);
+			lhs.truncate(i);
+			return lhs;
+		}
+	}
+	let mut result = Bytes::new();
+	std::mem::swap(&mut result, a);
+	result
+}
+
+impl VersionedNode {
+	pub fn new_directory() -> Self {
+		Self::Directory {
+			children: HashMap::new(),
+		}
+	}
+
+	pub fn from_file_entry(entry: FileEntry, chunk_index: &Arc<Mutex<ChunkIndex>>) -> Self {
+		match entry.payload {
+			FileData::Directory {} => Self::new_directory(),
+			FileData::Regular { chunks, .. } => {
+				{
+					let mut lock = chunk_index.lock().unwrap();
+					for chunk in chunks.iter() {
+						lock.insert(*chunk.id(), (chunk.size(), chunk.csize()));
+					}
+				}
+				Self::Regular {
+					chunks: chunks.into_iter().map(|x| *x.id()).collect(),
+				}
+			}
+			FileData::Symlink { target_path, .. } => Self::Symlink {
+				target: target_path,
+			},
+		}
+	}
+
+	pub fn insert_node_at_path<'x>(
+		&'x mut self,
+		mut item: FileEntry,
+		chunk_index: &'_ Arc<Mutex<ChunkIndex>>,
+	) -> &'x mut VersionedNode {
+		match self {
+			Self::Directory { children } => {
+				let entry_name = split_first_segment(&mut item.path);
+				let need_dir = item.path.len() > 0;
+				let next = match children.entry(entry_name) {
+					Entry::Vacant(v) => {
+						if need_dir {
+							v.insert(VersionedNode::new_directory())
+						} else {
+							return v.insert(Self::from_file_entry(item, chunk_index));
+						}
+					}
+					Entry::Occupied(o) => o.into_mut(),
+				};
+				next.insert_node_at_path(item, chunk_index)
+			}
+			_ => panic!("node type conflict"),
+		}
+	}
+}
+
+struct VersionedTree {
+	version: Version,
+	root: VersionedNode,
+}
+
+impl fmt::Debug for VersionedNode {
+	fn fmt<'f>(&self, f: &'f mut fmt::Formatter) -> fmt::Result {
+		match self {
+			Self::Directory { children } => {
+				let mut debug = f.debug_map();
+				for (item_path, item) in children.iter() {
+					debug.entry(item_path, item);
+				}
+				debug.finish()
+			}
+			Self::Regular { chunks } => {
+				write!(f, "<{} chunks>", chunks.len())
+			}
+			Self::Symlink { target } => {
+				write!(f, "<symlink to {:?}>", target)
+			}
+		}
+	}
+}
+
+enum HashedNodeData {
+	Directory {
+		children: HashMap<Bytes, HashedNode>,
+	},
+	Regular {
+		chunks: Vec<Id>,
+	},
+	Symlink {
+		target: Bytes,
+	},
+}
+
+impl HashedNodeData {
+	fn osize(&self, chunk_index: &Arc<Mutex<ChunkIndex>>) -> u64 {
+		match self {
+			Self::Directory { children } => children.values().map(|x| x.osize).sum(),
+			Self::Regular { chunks } => {
+				let lock = chunk_index.lock().unwrap();
+				chunks.iter().map(|chunk| lock[&chunk].0).sum()
+			}
+			Self::Symlink { .. } => 0,
+		}
+	}
+
+	fn csize(&self, chunk_index: &Arc<Mutex<ChunkIndex>>) -> u64 {
+		match self {
+			Self::Directory { children } => children.values().map(|x| x.csize).sum(),
+			Self::Regular { chunks } => {
+				let lock = chunk_index.lock().unwrap();
+				chunks.iter().map(|chunk| lock[&chunk].1).sum()
+			}
+			Self::Symlink { .. } => 0,
+		}
+	}
+
+	fn unique_chunks(&self) -> HashMap<Id, usize> {
+		match self {
+			Self::Directory { children } => {
+				let mut result = HashMap::new();
+				for child in children.values() {
+					for (id, count) in child.unique_chunks.iter() {
+						match result.entry(*id) {
+							Entry::Occupied(mut o) => {
+								*o.get_mut() += *count;
+							}
+							Entry::Vacant(v) => {
+								v.insert(*count);
+							}
+						}
+					}
+				}
+				result
+			}
+			Self::Regular { chunks } => {
+				let mut result = HashMap::with_capacity(chunks.len());
+				for id in chunks.iter() {
+					match result.entry(*id) {
+						Entry::Occupied(mut o) => {
+							*o.get_mut() += 1;
+						}
+						Entry::Vacant(v) => {
+							v.insert(1);
+						}
+					}
+				}
+				result.shrink_to_fit();
+				result
+			}
+			Self::Symlink { .. } => HashMap::new(),
+		}
+	}
+
+	fn content_hash(&self) -> Bytes {
+		let mut buf = BytesMut::new();
+		match self {
+			Self::Directory { children } => {
+				buf.put_u8(0x00);
+				for (name, child) in children.iter() {
+					buf.reserve(16 + name.len() + child.content_hash.len());
+					buf.put_u64_le(name.len() as u64);
+					buf.put_slice(&name[..]);
+					buf.put_u64_le(child.content_hash.len() as u64);
+					buf.put_slice(&child.content_hash[..]);
+				}
+			}
+			Self::Regular { chunks } => {
+				buf.put_u8(0x01);
+				buf.reserve(chunks.len() * 32 + 1);
+				for chunk in chunks.iter() {
+					buf.put_slice(&chunk.0[..]);
+				}
+			}
+			Self::Symlink { target } => {
+				buf.reserve(2 + target.len());
+				buf.put_u8(0x02);
+				buf.put_u8(0x00);
+				buf.put_slice(&target[..]);
+			}
+		}
+		hash_content(&buf)
+	}
+
+	fn split_for_merge(self) -> (MergedNodeData, Option<HashMap<Bytes, HashedNode>>) {
+		match self {
+			Self::Directory { children } => (MergedNodeData::Directory {}, Some(children)),
+			Self::Regular { chunks } => (MergedNodeData::Regular { chunks }, None),
+			Self::Symlink { target } => (MergedNodeData::Symlink { target }, None),
+		}
+	}
+}
+
+impl HashedNodeData {
+	fn from_versioned(other: VersionedNode, chunk_index: &Arc<Mutex<ChunkIndex>>) -> Self {
+		match other {
+			VersionedNode::Directory { children } => Self::Directory {
+				children: children
+					.into_iter()
+					.map(|(path, node)| (path, HashedNode::from_versioned(node, chunk_index)))
+					.collect(),
+			},
+			VersionedNode::Regular { chunks } => Self::Regular { chunks },
+			VersionedNode::Symlink { target } => Self::Symlink { target },
+		}
+	}
+}
+
+#[derive(Debug)]
+struct HashedNode {
+	content_hash: Bytes,
+	osize: u64,
+	csize: u64,
+	unique_chunks: HashMap<Id, usize>,
+	data: HashedNodeData,
+}
+
+impl HashedNode {
+	pub fn from_versioned(other: VersionedNode, chunk_index: &Arc<Mutex<ChunkIndex>>) -> Self {
+		let data = HashedNodeData::from_versioned(other, chunk_index);
+		let unique_chunks = data.unique_chunks();
+		Self {
+			osize: data.osize(chunk_index),
+			csize: data.csize(chunk_index),
+			unique_chunks,
+			content_hash: data.content_hash(),
+			data,
+		}
+	}
+}
+
+impl fmt::Debug for HashedNodeData {
+	fn fmt<'f>(&self, f: &'f mut fmt::Formatter) -> fmt::Result {
+		match self {
+			Self::Directory { children } => {
+				let mut debug = f.debug_map();
+				for (item_path, item) in children.iter() {
+					debug.entry(item_path, item);
+				}
+				debug.finish()
+			}
+			Self::Regular { chunks } => {
+				write!(f, "<{} chunks>", chunks.len())
+			}
+			Self::Symlink { target } => {
+				write!(f, "<symlink to {:?}>", target)
+			}
+		}
+	}
+}
+
+enum MergedNodeData {
+	Directory {},
+	Regular { chunks: Vec<Id> },
+	Symlink { target: Bytes },
+}
+
+struct MergedNodeVersion {
+	data: MergedNodeData,
+	versions: Vec<Version>,
+	osize: u64,
+	csize: u64,
+	unique_chunks: HashMap<Id, usize>,
+}
+
+struct MergedNode {
+	name: Bytes,
+	children: HashMap<Bytes, MergedNode>,
+	versions: HashMap<Bytes, MergedNodeVersion>,
+}
+
+static INDENT: &'static str = "│ ";
+static INDENT_LAST: &'static str = "  ";
+
+impl MergedNode {
+	fn new(name: Bytes) -> Self {
+		Self {
+			name,
+			children: HashMap::new(),
+			versions: HashMap::new(),
+		}
+	}
+
+	fn new_root() -> Self {
+		Self::new((&b"/"[..]).into())
+	}
+
+	fn merge(&mut self, version: Version, node: HashedNode) {
+		let children = match self.versions.entry(node.content_hash) {
+			Entry::Occupied(mut o) => {
+				o.get_mut().versions.push(version.clone());
+				assert_eq!(o.get().osize, node.osize);
+				let (_, children) = node.data.split_for_merge();
+				children
+			}
+			Entry::Vacant(v) => {
+				let (data, children) = node.data.split_for_merge();
+				v.insert(MergedNodeVersion {
+					data,
+					versions: vec![version.clone()],
+					osize: node.osize,
+					csize: node.csize,
+					unique_chunks: node.unique_chunks,
+				});
+				children
+			}
+		};
+		if let Some(children) = children {
+			for (path, new_child) in children {
+				let mut own_child = match self.children.entry(path) {
+					Entry::Occupied(o) => o.into_mut(),
+					Entry::Vacant(v) => {
+						let name = v.key().clone();
+						v.insert(Self::new(name))
+					}
+				};
+				own_child.merge(version.clone(), new_child);
+			}
+		}
+	}
+
+	fn display<'f>(&self, f: &'f mut fmt::Formatter, indent: &mut String) -> fmt::Result {
+		let total_versions: usize = self.versions.values().map(|x| x.versions.len()).sum();
+		write!(
+			f,
+			"({} versions ({} distinct))\n",
+			total_versions,
+			self.versions.len()
+		)?;
+		for version in self.versions.values() {
+			match &version.data {
+				MergedNodeData::Directory { .. } => continue,
+				MergedNodeData::Regular { .. } => {
+					write!(
+						f,
+						"{}* file of size {} in {} archives\n",
+						indent,
+						version.osize,
+						version.versions.len()
+					)?;
+					for subversion in version.versions.iter() {
+						write!(f, "{}  - {:?}\n", indent, subversion)?;
+					}
+				}
+				MergedNodeData::Symlink { target } => {
+					write!(
+						f,
+						"{}* symlink to {:?} in {} archives\n",
+						indent,
+						target,
+						version.versions.len()
+					)?;
+				}
+			}
+		}
+		for (i, (name, child)) in self.children.iter().enumerate() {
+			let name = String::from_utf8_lossy(name);
+			let (this_indent, this_node) = if i == self.children.len() - 1 {
+				(INDENT_LAST, "└ ")
+			} else {
+				(INDENT, "├ ")
+			};
+			write!(f, "{}{}{:?} ", indent, this_node, name)?;
+			indent.push_str(this_indent);
+			child.display(f, indent)?;
+			indent.truncate(indent.len() - this_indent.len());
+		}
+		Ok(())
+	}
+
+	fn chunk_maps(
+		&self,
+		chunk_estimate: usize,
+	) -> (HashMap<Id, usize>, HashMap<Version, HashMap<Id, usize>>) {
+		let mut version_chunks = HashMap::new();
+		for (version_key, version_group) in self.versions.iter() {
+			for version in version_group.versions.iter() {
+				version_chunks.insert(version.clone(), version_group.unique_chunks.clone());
+			}
+		}
+
+		let mut total_chunks = HashMap::with_capacity(chunk_estimate);
+		for chunk_map in version_chunks.values() {
+			for (id, count) in chunk_map.iter() {
+				match total_chunks.entry(*id) {
+					Entry::Occupied(mut o) => {
+						*o.get_mut() += count;
+					}
+					Entry::Vacant(v) => {
+						v.insert(*count);
+					}
+				}
+			}
+		}
+		(total_chunks, version_chunks)
+	}
+}
+
+impl fmt::Display for MergedNode {
+	fn fmt<'f>(&self, f: &'f mut fmt::Formatter) -> fmt::Result {
+		let mut indent = String::new();
+		self.display(f, &mut indent)
+	}
+}
+
+async fn hasher(
+	mut src: mpsc::Receiver<(Version, mpsc::Receiver<FileEntry>)>,
+	dst: mpsc::Sender<(Version, HashedNode)>,
+	chunk_index: Arc<Mutex<ChunkIndex>>,
+) {
+	while let Some((version, mut item_source)) = src.recv().await {
+		log::info!("processing archive {:?}", version);
+		let mut root = VersionedNode::new_directory();
+		while let Some(item) = item_source.recv().await {
+			root.insert_node_at_path(item, &chunk_index);
+		}
+		let root = HashedNode::from_versioned(root, &chunk_index);
+		dst.send((version, root)).await.unwrap();
+	}
+}
+
+type GroupKey = Bytes;
+
+struct FinalNodeVersion {
+	version: Version,
+}
+
+impl FinalNodeVersion {
+	fn from_merged(other: Version, unique_chunks: &HashMap<Id, usize>) -> Arc<Self> {
+		Arc::new(Self { version: other })
+	}
+}
+
+struct FinalNodeVersionGroup {
+	/// Original size of subtree
+	osize: u64,
+	/// Size after compression but before deduplication
+	csize: u64,
+	/// Accumulated size of chunks unique to this subtree and version group.
+	group_dsize: u64,
+	/// Accumulated size of chunks, deduplicated within this subtree and version group.
+	local_dsize: u64,
+	data: MergedNodeData,
+	versions: Vec<Arc<FinalNodeVersion>>,
+}
+
+impl FinalNodeVersionGroup {
+	fn calculate_group_dsize(
+		unique_chunks: &HashMap<Id, usize>,
+		total_chunks: &HashMap<Id, usize>,
+		chunk_index: &Arc<Mutex<ChunkIndex>>,
+	) -> u64 {
+		let mut group_dsize = 0;
+		let locked_chunk_index = chunk_index.lock().unwrap();
+		for (id, count) in unique_chunks.iter() {
+			if total_chunks.get(id).map(|x| *x).unwrap_or(0) > *count {
+				continue;
+			}
+			group_dsize += locked_chunk_index.get(id).unwrap().1;
+		}
+		group_dsize
+	}
+
+	fn calculate_local_dsize(
+		unique_chunks: &HashMap<Id, usize>,
+		chunk_index: &Arc<Mutex<ChunkIndex>>,
+	) -> u64 {
+		let mut local_dsize = 0;
+		let locked_chunk_index = chunk_index.lock().unwrap();
+		for (id, count) in unique_chunks.iter() {
+			local_dsize += locked_chunk_index.get(id).unwrap().1;
+		}
+		local_dsize
+	}
+
+	fn from_merged(
+		other: MergedNodeVersion,
+		total_chunks: &HashMap<Id, usize>,
+		chunk_index: &Arc<Mutex<ChunkIndex>>,
+	) -> Arc<Self> {
+		let group_dsize =
+			Self::calculate_group_dsize(&other.unique_chunks, total_chunks, chunk_index);
+		let local_dsize = Self::calculate_local_dsize(&other.unique_chunks, chunk_index);
+		let versions = other
+			.versions
+			.into_iter()
+			.map(|x| FinalNodeVersion::from_merged(x, &other.unique_chunks))
+			.collect();
+		Arc::new(Self {
+			data: other.data,
+			versions,
+			osize: other.osize,
+			csize: other.csize,
+			group_dsize,
+			local_dsize,
+		})
+	}
+}
+
+struct FinalNode {
+	parent: Option<Weak<FinalNode>>,
+	name: Bytes,
+	/// Summed on-disk size of all chunks which appear *only* in this subtree,
+	/// and only in one version of the subtree.
+	churn: u64,
+	/// Size of all chunks not used outside this subtree.
+	usage: u64,
+	/// Deduplicated size of this subtree across all version groups.
+	local_dsize: u64,
+	version_groups: HashMap<GroupKey, Arc<FinalNodeVersionGroup>>,
+	children: HashMap<Bytes, Arc<FinalNode>>,
+}
+
+fn min_max<I: Iterator<Item = usize>>(i: I) -> Option<(usize, usize)> {
+	let mut result: Option<(usize, usize)> = None;
+	for item in i {
+		match result.as_mut() {
+			Some((min, max)) => {
+				*min = (*min).min(item);
+				*max = (*max).max(item);
+			}
+			None => {
+				result = Some((item, item));
+			}
+		}
+	}
+	result
+}
+
+impl FinalNode {
+	fn scale_capacity_estimate(max_chunks: usize, total_chunks: usize) -> usize {
+		let estimated_chunks = ((max_chunks as f64) * 1.5).round();
+		let estimated_chunks: usize = match max_chunks.try_into() {
+			Ok(v) => v,
+			Err(_) => total_chunks,
+		};
+		total_chunks.min(estimated_chunks)
+	}
+
+	fn capacity_with_headroom_for_union(
+		versions: &HashMap<Bytes, MergedNodeVersion>,
+		total_chunks: usize,
+	) -> usize {
+		Self::scale_capacity_estimate(
+			versions
+				.values()
+				.map(|x| x.unique_chunks.len())
+				.max()
+				.unwrap_or(0),
+			total_chunks,
+		)
+	}
+
+	fn calculate_churn(
+		versions: &HashMap<Bytes, MergedNodeVersion>,
+		total_chunks: &HashMap<Id, usize>,
+		chunk_index: &Arc<Mutex<ChunkIndex>>,
+	) -> u64 {
+		if versions.len() == 0 {
+			return 0;
+		}
+
+		let locked_chunk_index = chunk_index.lock().unwrap();
+		// count how many versions a chunk appears in
+		let mut versions_union = HashMap::<Id, Option<usize>>::with_capacity(
+			Self::capacity_with_headroom_for_union(versions, locked_chunk_index.len()),
+		);
+		for version in versions.values() {
+			for (id, count) in version.unique_chunks.iter() {
+				match versions_union.entry(*id) {
+					Entry::Occupied(mut o) => {
+						*o.get_mut() = None;
+					}
+					Entry::Vacant(v) => {
+						v.insert(Some(*count));
+					}
+				}
+			}
+		}
+
+		let mut churned_size = 0;
+		for (id, unique_count) in versions_union {
+			let count = match unique_count {
+				Some(v) => v,
+				// chunk is not unique among versions
+				None => continue,
+			};
+			if total_chunks.get(&id).map(|x| *x).unwrap_or(0) > count {
+				// the chunk is used outside of this subtree
+				continue;
+			}
+			// chunk is unique and not used outside -> add csize to churn
+			churned_size += locked_chunk_index.get(&id).unwrap().1;
+		}
+
+		churned_size
+	}
+
+	fn calculate_usage(
+		versions: &HashMap<Bytes, MergedNodeVersion>,
+		total_chunks: &HashMap<Id, usize>,
+		chunk_index: &Arc<Mutex<ChunkIndex>>,
+	) -> u64 {
+		if versions.len() == 0 {
+			return 0;
+		}
+
+		let locked_chunk_index = chunk_index.lock().unwrap();
+		// count total chunk occurences
+		let mut versions_union = HashMap::with_capacity(Self::capacity_with_headroom_for_union(
+			versions,
+			locked_chunk_index.len(),
+		));
+		for version in versions.values() {
+			for (id, count) in version.unique_chunks.iter() {
+				match versions_union.entry(*id) {
+					Entry::Occupied(mut o) => {
+						*o.get_mut() += *count;
+					}
+					Entry::Vacant(v) => {
+						v.insert(*count);
+					}
+				}
+			}
+		}
+
+		let mut usage = 0;
+		for (id, count) in versions_union {
+			if total_chunks.get(&id).map(|x| *x).unwrap_or(0) > count {
+				// the chunk is used outside of this subtree
+				continue;
+			}
+			// chunk is unique and not used outside -> add csize to churn
+			usage += locked_chunk_index.get(&id).unwrap().1;
+		}
+
+		usage
+	}
+
+	fn calculate_local_dsize(
+		versions: &HashMap<Bytes, MergedNodeVersion>,
+		chunk_index: &Arc<Mutex<ChunkIndex>>,
+	) -> u64 {
+		let locked_chunk_index = chunk_index.lock().unwrap();
+		let mut seen_chunks = HashSet::with_capacity(Self::scale_capacity_estimate(
+			versions
+				.values()
+				.map(|x| x.unique_chunks.len())
+				.max()
+				.unwrap_or(0),
+			locked_chunk_index.len(),
+		));
+		let mut dsize = 0;
+		for version in versions.values() {
+			for id in version.unique_chunks.keys() {
+				if seen_chunks.insert(*id) {
+					dsize += locked_chunk_index.get(id).unwrap().1;
+				}
+			}
+		}
+		dsize
+	}
+
+	pub fn from_merged(
+		parent: Option<Weak<FinalNode>>,
+		other: MergedNode,
+		total_chunks: &HashMap<Id, usize>,
+		version_chunks: &HashMap<Version, HashMap<Id, usize>>,
+		chunk_index: &Arc<Mutex<ChunkIndex>>,
+	) -> Arc<Self> {
+		let churn = Self::calculate_churn(&other.versions, total_chunks, chunk_index);
+		let local_dsize = Self::calculate_local_dsize(&other.versions, chunk_index);
+		let usage = Self::calculate_usage(&other.versions, total_chunks, chunk_index);
+		let mut version_groups = HashMap::new();
+		for (group_key, data) in other.versions.into_iter() {
+			version_groups.insert(
+				group_key,
+				FinalNodeVersionGroup::from_merged(data, total_chunks, chunk_index),
+			);
+		}
+		Arc::new_cyclic(|this| Self {
+			name: other.name,
+			parent,
+			churn,
+			usage,
+			local_dsize,
+			version_groups,
+			children: other
+				.children
+				.into_iter()
+				.map(|(name, data)| {
+					(
+						name,
+						FinalNode::from_merged(
+							Some(Weak::clone(this)),
+							data,
+							total_chunks,
+							version_chunks,
+							chunk_index,
+						),
+					)
+				})
+				.collect(),
+		})
+	}
+}
+
+fn format_bytes(n: u64) -> String {
+	/* let order_of_magnitude = (64 - n.leading_zeros()) / 10;
+	let (suffix, divisor): (_, u64) = match order_of_magnitude {
+		// bytes
+		0 => ("B  ", 1),
+		1 => ("kiB", 1024),
+		2 => ("MiB", 1024*1024),
+		3 => ("GiB", 1024*1024*1024),
+		4 => ("TiB", 1024*1024*1024*1024),
+		_ => ("EiB", 1024*1024*1024*1024*1024),
+	};
+	let value = ((n as f64) / (divisor as f64));
+	format!("{:3.0} {}", value, suffix) */
+	let order_of_magnitude = if n > 0 {
+		(n as f64).log10().floor() as u64
+	} else {
+		0
+	};
+	let (suffix, divisor): (_, u64) = match order_of_magnitude / 3 {
+		0 => ("B  ", 1),
+		1 => ("kiB", 1024),
+		2 => ("MiB", 1024 * 1024),
+		3 => ("GiB", 1024 * 1024 * 1024),
+		4 => ("TiB", 1024 * 1024 * 1024 * 1024),
+		_ => ("EiB", 1024 * 1024 * 1024 * 1024 * 1024),
+	};
+	let value = ((n as f64) / (divisor as f64));
+	if order_of_magnitude >= 3 {
+		match order_of_magnitude % 3 {
+			0 => format!("{:3.2} {}", value, suffix),
+			_ => format!("{:3.0} {}", value, suffix),
+		}
+	} else {
+		format!("{:3.0} {}", value, suffix)
+	}
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+enum VersionColumn {
+	Name,
+	OriginalSize,
+	GroupDsize,
+	LocalDsize,
+}
+
+#[derive(Clone)]
+enum VersionItem {
+	VersionGroup {
+		group: Arc<FinalNodeVersionGroup>,
+	},
+	Version {
+		version: Arc<FinalNodeVersion>,
+		group: Arc<FinalNodeVersionGroup>,
+	},
+}
+
+impl VersionItem {
+	fn osize(&self) -> u64 {
+		match self {
+			Self::VersionGroup { group, .. } => group.osize,
+			Self::Version { group, .. } => group.osize,
+		}
+	}
+
+	fn group(&self) -> &Arc<FinalNodeVersionGroup> {
+		match self {
+			Self::VersionGroup { group, .. } => group,
+			Self::Version { group, .. } => group,
+		}
+	}
+
+	fn cmp_group(
+		a: &Arc<FinalNodeVersionGroup>,
+		b: &Arc<FinalNodeVersionGroup>,
+		column: VersionColumn,
+	) -> Ordering {
+		let order = match column {
+			VersionColumn::Name => a.versions.len().cmp(&b.versions.len()),
+			VersionColumn::OriginalSize => a.osize.cmp(&b.osize),
+			VersionColumn::GroupDsize => a.group_dsize.cmp(&b.group_dsize),
+			VersionColumn::LocalDsize => a.local_dsize.cmp(&b.local_dsize),
+		};
+		if order == Ordering::Equal {
+			// use memory address as tie breaker
+			return (Arc::as_ptr(a) as usize).cmp(&(Arc::as_ptr(b) as usize));
+		}
+		order
+	}
+}
+
+impl TableViewItem<VersionColumn> for VersionItem {
+	fn to_column(&self, column: VersionColumn) -> String {
+		let size = match column {
+			VersionColumn::Name => match self {
+				Self::VersionGroup { group, .. } => {
+					return format!("({} identical versions)", group.versions.len())
+				}
+				Self::Version { version, .. } => return format!("| {}", version.version.0.name),
+			},
+			VersionColumn::OriginalSize => self.osize(),
+			VersionColumn::GroupDsize => self.group().group_dsize,
+			VersionColumn::LocalDsize => self.group().local_dsize,
+		};
+		format_bytes(size)
+	}
+
+	fn cmp(&self, other: &Self, column: VersionColumn) -> Ordering {
+		let this_group = self.group();
+		let other_group = other.group();
+		// if the groups differ, we order based on the group
+		if !Arc::ptr_eq(this_group, other_group) {
+			// use the group comparison function
+			return Self::cmp_group(this_group, other_group, column);
+		}
+
+		// dig deeper
+		match self {
+			// if this is a version group, we order before the other, because we are the same group and want to be in front of our versions
+			Self::VersionGroup { .. } => Ordering::Less,
+			Self::Version {
+				version: this_version,
+				..
+			} => match other {
+				// vice versa
+				Self::VersionGroup { .. } => Ordering::Greater,
+				Self::Version {
+					version: other_version,
+					..
+				} => match column {
+					VersionColumn::Name
+					| VersionColumn::OriginalSize
+					| VersionColumn::GroupDsize
+					| VersionColumn::LocalDsize => this_version
+						.version
+						.0
+						.name
+						.cmp(&other_version.version.0.name),
+				},
+			},
+		}
+	}
+}
+
+async fn prepare(url: String) -> Result<(MergedNode, Arc<Mutex<ChunkIndex>>), anyhow::Error> {
+	let (mut backend, repo) = borgrdr::cliutil::open_url_str(&url)
+		.await
+		.with_context(|| format!("failed to open repository"))?;
+
+	let (entry_sink, archive_source) = mpsc::channel(128);
+	let (hashed_sink, mut hashed_source) = mpsc::channel(2);
+	let chunk_index = Arc::new(Mutex::new(ChunkIndex::new()));
+	let reader = tokio::spawn(read_entries(repo, entry_sink));
+	let hasher = tokio::spawn(hasher(
+		archive_source,
+		hashed_sink,
+		Arc::clone(&chunk_index),
+	));
+
+	let mut merged = MergedNode::new_root();
+	while let Some((version, hashed_tree)) = hashed_source.recv().await {
+		merged.merge(version, hashed_tree);
+	}
+
+	hasher.await.unwrap();
+	reader.await.unwrap()?;
+	let _: Result<_, _> = backend.wait_for_shutdown().await;
+
+	Ok((merged, chunk_index))
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+enum FileListColumn {
+	Name,
+	Versions,
+	MaxOSize,
+	Churn,
+	DSize,
+	Usage,
+}
+
+impl FinalNode {
+	fn max_osize(&self) -> Option<u64> {
+		self.version_groups.values().map(|x| x.osize).max()
+	}
+
+	fn distinct_versions(&self) -> u64 {
+		self.version_groups.len() as u64
+	}
+
+	fn total_versions(&self) -> u64 {
+		self.version_groups
+			.values()
+			.map(|x| x.versions.len() as u64)
+			.sum()
+	}
+}
+
+impl TableViewItem<FileListColumn> for Arc<FinalNode> {
+	fn to_column(&self, column: FileListColumn) -> String {
+		match column {
+			FileListColumn::Name => {
+				let mut name = String::from_utf8_lossy(&self.name).to_string();
+				if self.children.len() > 0 {
+					name.push_str("/")
+				}
+				name
+			}
+			FileListColumn::Versions => {
+				format!("{}/{}", self.distinct_versions(), self.total_versions())
+			}
+			FileListColumn::MaxOSize => match self.max_osize() {
+				Some(v) => format_bytes(v),
+				None => "".into(),
+			},
+			FileListColumn::Churn => format_bytes(self.churn),
+			FileListColumn::DSize => format_bytes(self.local_dsize),
+			FileListColumn::Usage => format_bytes(self.usage),
+		}
+	}
+
+	fn cmp(&self, other: &Self, column: FileListColumn) -> Ordering {
+		match column {
+			FileListColumn::Versions => self.distinct_versions().cmp(&other.distinct_versions()),
+			FileListColumn::MaxOSize => self.max_osize().cmp(&other.max_osize()),
+			FileListColumn::Churn => self.churn.cmp(&other.churn),
+			FileListColumn::DSize => self.local_dsize.cmp(&other.local_dsize),
+			FileListColumn::Usage => self.usage.cmp(&other.usage),
+			_ => self.to_column(column).cmp(&other.to_column(column)),
+		}
+	}
+}
+
+fn main() -> Result<(), anyhow::Error> {
+	env_logger::init();
+	let mut argv: Vec<String> = args().collect();
+
+	let rt = tokio::runtime::Runtime::new()?;
+	let (mut merged, chunk_index) = rt.block_on(prepare(argv.remove(1)))?;
+	rt.shutdown_background();
+	let total_chunk_count = {
+		let lock = chunk_index.lock().unwrap();
+		lock.len()
+	};
+	let (total_chunks, version_chunks) = merged.chunk_maps(total_chunk_count);
+	let data = FinalNode::from_merged(None, merged, &total_chunks, &version_chunks, &chunk_index);
+	drop(chunk_index);
+	drop(total_chunks);
+	drop(version_chunks);
+
+	let mut siv = cursive::Cursive::default();
+
+	let mut table = TableView::<Arc<FinalNode>, FileListColumn>::new()
+		.column(FileListColumn::Name, "Name", |c| c)
+		.column(FileListColumn::Versions, "#V", |c| {
+			c.width(8).align(HAlign::Right)
+		})
+		.column(FileListColumn::MaxOSize, "OSz<", |c| {
+			c.width(8).align(HAlign::Right)
+		})
+		.column(FileListColumn::DSize, "DSz", |c| {
+			c.width(8).align(HAlign::Right)
+		})
+		.column(FileListColumn::Churn, "Chrn", |c| {
+			c.width(8).align(HAlign::Right)
+		})
+		.column(FileListColumn::Usage, "Usge", |c| {
+			c.width(8).align(HAlign::Right)
+		});
+
+	let current_parent = Rc::new(RefCell::new(Arc::clone(&data)));
+
+	table.set_items(data.children.values().cloned().collect());
+	{
+		let current_parent = Rc::clone(&current_parent);
+		table.set_on_submit(move |siv: &mut Cursive, row: usize, index: usize| {
+			let current_parent = Rc::clone(&current_parent);
+			siv.call_on_name(
+				"contents",
+				|table: &mut TableView<Arc<FinalNode>, FileListColumn>| {
+					let item = table.borrow_item(index).unwrap();
+					if item.children.len() > 0 {
+						let mut lock = match current_parent.try_borrow_mut() {
+							Ok(v) => v,
+							Err(_) => return,
+						};
+						*lock = Arc::clone(&item);
+						let items: Vec<_> = item.children.values().cloned().collect();
+						drop(item);
+						let has_any = items.len() > 0;
+						table.set_items(items);
+						if has_any {
+							table.set_selected_row(0);
+						}
+					}
+				},
+			);
+		});
+	}
+	table.set_on_select(move |siv: &mut Cursive, row: usize, index: usize| {
+		let item = siv
+			.call_on_name(
+				"contents",
+				move |table: &mut TableView<Arc<FinalNode>, FileListColumn>| {
+					Arc::clone(&table.borrow_item(index).unwrap())
+				},
+			)
+			.unwrap();
+		siv.call_on_name(
+			"versions",
+			move |table: &mut TableView<VersionItem, VersionColumn>| {
+				let total_versions: usize =
+					item.version_groups.values().map(|x| x.versions.len()).sum();
+				let mut items = Vec::with_capacity(item.version_groups.len() + total_versions);
+				for version_group in item.version_groups.values() {
+					items.push(VersionItem::VersionGroup {
+						group: Arc::clone(version_group),
+					});
+					for version in version_group.versions.iter() {
+						items.push(VersionItem::Version {
+							group: Arc::clone(version_group),
+							version: Arc::clone(version),
+						});
+					}
+				}
+				let has_any = items.len() > 0;
+				table.set_items(items);
+				if has_any {
+					table.set_selected_row(0);
+				}
+			},
+		);
+	});
+
+	siv.update_theme(|th| {
+		th.palette[PaletteColor::View] = Color::Dark(BaseColor::Black);
+		th.palette[PaletteColor::Primary] = Color::Dark(BaseColor::White);
+		th.palette[PaletteColor::TitlePrimary] = Color::Light(BaseColor::Cyan);
+		th.palette[PaletteColor::Highlight] = Color::Light(BaseColor::Cyan);
+		th.palette[PaletteColor::HighlightInactive] = Color::Dark(BaseColor::Blue);
+		th.palette[PaletteColor::HighlightText] = Color::Dark(BaseColor::Black);
+	});
+	siv.add_global_callback('q', |s| s.quit());
+	{
+		let current_parent = Rc::clone(&current_parent);
+		siv.add_global_callback(cursive::event::Key::Backspace, move |s| {
+			let current_parent = Rc::clone(&current_parent);
+			s.call_on_name(
+				"contents",
+				move |table: &mut TableView<Arc<FinalNode>, FileListColumn>| {
+					let mut lock = match current_parent.try_borrow_mut() {
+						Ok(v) => v,
+						Err(_) => return,
+					};
+					if let Some(parent) = lock.parent.as_ref().and_then(|x| x.upgrade()) {
+						table.set_items(parent.children.values().cloned().collect());
+						*lock = parent;
+					}
+				},
+			);
+		});
+	}
+
+	let mut version_table = TableView::<VersionItem, VersionColumn>::new()
+		.column(VersionColumn::Name, "Name", |c| c)
+		.column(VersionColumn::OriginalSize, "OSz", |c| {
+			c.width(8).align(HAlign::Right)
+		})
+		.column(VersionColumn::GroupDsize, "Gdsz", |c| {
+			c.width(8).align(HAlign::Right)
+		})
+		.column(VersionColumn::LocalDsize, "Ldsz", |c| {
+			c.width(8).align(HAlign::Right)
+		});
+
+	siv.add_fullscreen_layer(
+		LinearLayout::new(Orientation::Vertical)
+			.child(
+				Panel::new(table.with_name("contents"))
+					.title("Repository contents")
+					.full_height(),
+			)
+			.child(
+				Panel::new(version_table.with_name("versions"))
+					.title("File versions")
+					.full_height(),
+			)
+			.full_screen(),
+	);
+	siv.run();
+	Ok(())
+}

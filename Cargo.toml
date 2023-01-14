@@ -38,6 +38,18 @@ env_logger = "^0.9"
 bincode = "^1"
 url = "^2"
 
+cursive = { version = "^0.20", optional = true }
+cursive_tree_view = { version = "^0.8", optional = true }
+cursive_table_view = { version = "^0.14", optional = true, path = "../cursive_table_view" }
+
+[features]
+default = []
+cursive = ["cursive_tree_view", "dep:cursive", "cursive_table_view"]
+
+[[bin]]
+name = "du"
+required-features = ["cursive"]
+
 [[bin]]
 name = "check"
 

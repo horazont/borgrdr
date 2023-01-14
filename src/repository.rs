@@ -97,7 +97,7 @@ impl PassphraseProvider for EnvPassphrase {
 }
 
 struct SecretProvider<'x> {
-	passphrase: &'x Box<dyn PassphraseProvider>,
+	passphrase: &'x Box<dyn PassphraseProvider + Send + Sync + 'static>,
 	repokey_data: Option<&'x str>,
 }
 
@@ -121,14 +121,14 @@ pub struct Repository<S> {
 	store: S,
 	manifest: Manifest,
 	repokey_data: Option<String>,
-	secret_provider: Box<dyn PassphraseProvider>,
+	secret_provider: Box<dyn PassphraseProvider + Send + Sync + 'static>,
 	crypto_ctx: crypto::Context,
 }
 
 impl<S: ObjectStore + Send + Sync + 'static> Repository<S> {
 	pub async fn open(
 		store: S,
-		secret_provider: Box<dyn PassphraseProvider>,
+		secret_provider: Box<dyn PassphraseProvider + Send + Sync + 'static>,
 	) -> Result<Self, Error> {
 		// once we implement crypto support, we need two things:
 		// - the ability to query the repokey from the ObjectStore
@@ -168,7 +168,7 @@ impl<S: ObjectStore + Send + Sync + 'static> Repository<S> {
 	fn detect_crypto(
 		repokey_data: Option<&str>,
 		crypto_ctx: &crypto::Context,
-		passphrase: &Box<dyn PassphraseProvider>,
+		passphrase: &Box<dyn PassphraseProvider + Send + Sync + 'static>,
 		for_data: &[u8],
 	) -> io::Result<Box<dyn Key>> {
 		crypto::detect_crypto(
@@ -219,7 +219,7 @@ impl<S: ObjectStore + Send + Sync + 'static> Repository<S> {
 		store: &S,
 		repokey_data: Option<&str>,
 		crypto_ctx: &crypto::Context,
-		passphrase: &Box<dyn PassphraseProvider>,
+		passphrase: &Box<dyn PassphraseProvider + Send + Sync + 'static>,
 	) -> io::Result<Manifest> {
 		let data = store.retrieve(&Id::zero()).await?;
 		let key = Self::detect_crypto(repokey_data, crypto_ctx, passphrase, &data[..])?;
@@ -331,6 +331,7 @@ impl<S: ObjectStore + Send + Sync + 'static> Repository<S> {
 					let ids = idbuf.split_off(0);
 					assert!(ids.len() > 0);
 					for missing_id in self.store.find_missing_objects(ids).await? {
+						ok = false;
 						progress.log(
 							diag::Level::Error,
 							"archive_items",
@@ -342,6 +343,7 @@ impl<S: ObjectStore + Send + Sync + 'static> Repository<S> {
 
 			if idbuf.len() > 0 {
 				for missing_id in self.store.find_missing_objects(idbuf).await? {
+					ok = false;
 					progress.log(
 						diag::Level::Error,
 						"archive_items",

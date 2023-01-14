@@ -1,6 +1,7 @@
 use std::borrow::Borrow;
 use std::collections::HashMap;
 use std::fmt;
+use std::hash;
 use std::hash::Hash;
 
 use serde::de;
@@ -224,8 +225,22 @@ impl Archive {
 	}
 }
 
-#[derive(Deserialize, Debug)]
+#[derive(Deserialize, Debug, Clone, Copy)]
 pub struct Chunk(Id, u64, u64);
+
+impl PartialEq<Chunk> for Chunk {
+	fn eq(&self, other: &Chunk) -> bool {
+		self.0 == other.0
+	}
+}
+
+impl Eq for Chunk {}
+
+impl Hash for Chunk {
+	fn hash<H: hash::Hasher>(&self, state: &mut H) {
+		self.0.hash(state)
+	}
+}
 
 impl Chunk {
 	pub fn id(&self) -> &Id {
