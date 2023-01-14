@@ -48,10 +48,14 @@ use borgrdr::rpc::RpcStoreClient;
 use borgrdr::segments::Id;
 use borgrdr::structs::{ArchiveItem, Chunk};
 
-fn hash_content(buf: &[u8]) -> Bytes {
+type ContentHash = Box<[u8; 32]>;
+
+fn hash_content(buf: &[u8]) -> ContentHash {
 	let mut ctx = DigestContext::new(&SHA256);
 	ctx.update(buf);
-	Bytes::copy_from_slice(ctx.finish().as_ref())
+	let mut result = [0u8; 32];
+	result.copy_from_slice(ctx.finish().as_ref());
+	Box::new(result)
 }
 
 #[derive(Debug)]
@@ -126,7 +130,7 @@ impl fmt::Debug for Version {
 
 #[derive(Debug)]
 struct FileEntry {
-	path: Bytes,
+	path: Vec<u8>,
 	mode: u32,
 	uid: u32,
 	gid: u32,
@@ -164,7 +168,7 @@ impl TryFrom<ArchiveItem> for FileEntry {
 			return Err((FileEntryError::UnsupportedMode(mode), other));
 		};
 		Ok(Self {
-			path: other.path().clone(),
+			path: other.path().to_vec(),
 			mode: other.mode(),
 			uid: other.uid(),
 			gid: other.gid(),
@@ -233,7 +237,7 @@ async fn read_entries(
 
 enum VersionedNode {
 	Directory {
-		children: HashMap<Bytes, VersionedNode>,
+		children: HashMap<Vec<u8>, VersionedNode>,
 	},
 	Regular {
 		chunks: Vec<Id>,
@@ -256,15 +260,14 @@ fn has_dir_sep(a: &[u8]) -> bool {
 	return a.iter().find(|x| **x == b'/').is_some();
 }
 
-fn split_first_segment<'x>(a: &mut Bytes) -> Bytes {
+fn split_first_segment<'x>(a: &mut Vec<u8>) -> Vec<u8> {
 	for (i, b) in a.iter().enumerate() {
 		if *b == b'/' {
-			let mut lhs = a.split_to(i + 1);
-			lhs.truncate(i);
+			let lhs = a.drain(..i + 1).take(i).collect();
 			return lhs;
 		}
 	}
-	let mut result = Bytes::new();
+	let mut result = Vec::new();
 	std::mem::swap(&mut result, a);
 	result
 }
@@ -344,7 +347,7 @@ impl fmt::Debug for VersionedNode {
 
 enum HashedNodeData {
 	Directory {
-		children: HashMap<Bytes, HashedNode>,
+		children: HashMap<Vec<u8>, HashedNode>,
 	},
 	Regular {
 		chunks: Vec<Id>,
@@ -355,7 +358,7 @@ enum HashedNodeData {
 }
 
 impl HashedNodeData {
-	fn content_hash(&self) -> Bytes {
+	fn content_hash(&self) -> ContentHash {
 		let mut buf = BytesMut::new();
 		match self {
 			Self::Directory { children } => {
@@ -387,7 +390,7 @@ impl HashedNodeData {
 		hash_content(&buf)
 	}
 
-	fn split_for_merge(self) -> (MergedNodeData, Option<HashMap<Bytes, HashedNode>>) {
+	fn split_for_merge(self) -> (MergedNodeData, Option<HashMap<Vec<u8>, HashedNode>>) {
 		match self {
 			Self::Directory { children } => (MergedNodeData::Directory {}, Some(children)),
 			Self::Regular { chunks } => (MergedNodeData::Regular { chunks }, None),
@@ -413,7 +416,7 @@ impl HashedNodeData {
 
 #[derive(Debug)]
 struct HashedNode {
-	content_hash: Bytes,
+	content_hash: ContentHash,
 	data: HashedNodeData,
 }
 
@@ -468,16 +471,16 @@ struct MergedNodeVersion {
 }
 
 struct MergedNode {
-	name: Bytes,
-	children: HashMap<Bytes, MergedNode>,
-	versions: HashMap<Bytes, MergedNodeVersion>,
+	name: Vec<u8>,
+	children: HashMap<Vec<u8>, MergedNode>,
+	versions: HashMap<ContentHash, MergedNodeVersion>,
 }
 
 static INDENT: &'static str = "│ ";
 static INDENT_LAST: &'static str = "  ";
 
 impl MergedNode {
-	fn new(name: Bytes) -> Self {
+	fn new(name: Vec<u8>) -> Self {
 		Self {
 			name,
 			children: HashMap::new(),
@@ -706,7 +709,7 @@ impl FinalNodeVersionGroup {
 
 struct FinalNode {
 	parent: Option<Weak<FinalNode>>,
-	name: Bytes,
+	name: Vec<u8>,
 	/// Summed on-disk size of all chunks which appear *only* in this subtree,
 	/// and only in one version of the subtree.
 	churn: u64,
@@ -750,7 +753,7 @@ impl FinalNode {
 	fn new_empty() -> Arc<Self> {
 		Arc::new(Self {
 			parent: None,
-			name: Bytes::from_static(b""),
+			name: b"".to_vec(),
 			churn: 0,
 			usage: 0,
 			local_dsize: 0,
@@ -779,7 +782,7 @@ impl FinalNode {
 	}
 
 	fn calculate_churn(
-		versions: &HashMap<Bytes, MergedNodeVersion>,
+		versions: &HashMap<ContentHash, MergedNodeVersion>,
 		subtree_chunks: &HashMap<Version, HashMap<Id, u64>>,
 		total_chunks: &HashMap<Id, u64>,
 		chunk_index: &Arc<Mutex<ChunkIndex>>,
@@ -831,7 +834,7 @@ impl FinalNode {
 	}
 
 	fn calculate_usage(
-		versions: &HashMap<Bytes, MergedNodeVersion>,
+		versions: &HashMap<ContentHash, MergedNodeVersion>,
 		subtree_chunks: &HashMap<Version, HashMap<Id, u64>>,
 		total_chunks: &HashMap<Id, u64>,
 		chunk_index: &Arc<Mutex<ChunkIndex>>,
@@ -882,7 +885,7 @@ impl FinalNode {
 	}
 
 	fn calculate_local_dsize(
-		versions: &HashMap<Bytes, MergedNodeVersion>,
+		versions: &HashMap<ContentHash, MergedNodeVersion>,
 		subtree_chunks: &HashMap<Version, HashMap<Id, u64>>,
 		chunk_index: &Arc<Mutex<ChunkIndex>>,
 	) -> u64 {
