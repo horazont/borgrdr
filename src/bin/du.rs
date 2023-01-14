@@ -714,21 +714,17 @@ struct FinalNode {
 	usage: u64,
 	/// Deduplicated size of this subtree across all version groups.
 	local_dsize: u64,
-	version_groups: HashMap<GroupKey, Arc<FinalNodeVersionGroup>>,
-	children: HashMap<Bytes, Arc<FinalNode>>,
+	version_groups: Vec<Arc<FinalNodeVersionGroup>>,
+	children: Vec<Arc<FinalNode>>,
 }
 
 impl SizeEstimate for FinalNode {
 	fn content_size(&self) -> usize {
-		let children_size: usize = self.children.values().map(|x| x.recursive_size()).sum();
-		let version_groups_size: usize = self
-			.version_groups
-			.values()
-			.map(|x| x.recursive_size())
-			.sum();
-		self.version_groups.capacity()
-			* std::mem::size_of::<(GroupKey, Arc<FinalNodeVersionGroup>)>()
-			+ self.children.capacity() * std::mem::size_of::<(Bytes, Arc<FinalNode>)>()
+		let children_size: usize = self.children.iter().map(|x| x.recursive_size()).sum();
+		let version_groups_size: usize =
+			self.version_groups.iter().map(|x| x.recursive_size()).sum();
+		self.version_groups.capacity() * std::mem::size_of::<Arc<FinalNodeVersionGroup>>()
+			+ self.children.capacity() * std::mem::size_of::<Arc<FinalNode>>()
 			+ version_groups_size
 			+ children_size
 	}
@@ -758,8 +754,8 @@ impl FinalNode {
 			churn: 0,
 			usage: 0,
 			local_dsize: 0,
-			version_groups: HashMap::new(),
-			children: HashMap::new(),
+			version_groups: Vec::new(),
+			children: Vec::new(),
 		})
 	}
 
@@ -922,7 +918,7 @@ impl FinalNode {
 	) -> (Arc<Self>, HashMap<Version, HashMap<Id, u64>>) {
 		let mut subtree_chunks = HashMap::new();
 		let this = Arc::new_cyclic(|this| {
-			let mut children = HashMap::with_capacity(other.children.len());
+			let mut children = Vec::with_capacity(other.children.len());
 			for (name, child) in other.children {
 				let (child, mut child_chunks) = Self::from_merged_inner(
 					Some(Weak::clone(this)),
@@ -961,7 +957,7 @@ impl FinalNode {
 						}
 					}
 				}
-				children.insert(name, child);
+				children.push(child);
 			}
 
 			// now we have the accurate subtree_chunks, now we need to add any chunks from *this* object itself in order to include it in calculations
@@ -996,17 +992,14 @@ impl FinalNode {
 			let usage =
 				Self::calculate_usage(&other.versions, &subtree_chunks, total_chunks, chunk_index);
 
-			let mut version_groups = HashMap::with_capacity(other.versions.len());
+			let mut version_groups = Vec::with_capacity(other.versions.len());
 			for (version_key, version_group) in other.versions {
-				version_groups.insert(
-					version_key,
-					FinalNodeVersionGroup::from_merged(
-						version_group,
-						total_chunks,
-						&subtree_chunks,
-						chunk_index,
-					),
-				);
+				version_groups.push(FinalNodeVersionGroup::from_merged(
+					version_group,
+					total_chunks,
+					&subtree_chunks,
+					chunk_index,
+				));
 			}
 
 			Self {
@@ -1217,7 +1210,7 @@ enum FileListColumn {
 
 impl FinalNode {
 	fn max_osize(&self) -> Option<u64> {
-		self.version_groups.values().map(|x| x.osize).max()
+		self.version_groups.iter().map(|x| x.osize).max()
 	}
 
 	fn distinct_versions(&self) -> u64 {
@@ -1226,7 +1219,7 @@ impl FinalNode {
 
 	fn total_versions(&self) -> u64 {
 		self.version_groups
-			.values()
+			.iter()
 			.map(|x| x.versions.len() as u64)
 			.sum()
 	}
@@ -1360,11 +1353,13 @@ fn main() -> Result<(), anyhow::Error> {
 			drop(total_chunks);
 			Main::update_root(Arc::clone(&main), Arc::clone(&data));
 			sender.send(Box::new(move |siv: &mut Cursive| {
-				siv.call_on_name("contents",
-				|table: &mut TableView<Arc<FinalNode>, FileListColumn>| {
-					table.set_items(data.children.values().cloned().collect());
-					table.set_selected_row(0);
-				});
+				siv.call_on_name(
+					"contents",
+					|table: &mut TableView<Arc<FinalNode>, FileListColumn>| {
+						table.set_items(data.children.clone());
+						table.set_selected_row(0);
+					},
+				);
 				siv.pop_layer();
 			}));
 		});
@@ -1401,7 +1396,7 @@ fn main() -> Result<(), anyhow::Error> {
 							let mut lock = main.lock().unwrap();
 							lock.current_parent = Arc::clone(&item);
 						}
-						let items: Vec<_> = item.children.values().cloned().collect();
+						let items: Vec<_> = item.children.clone();
 						drop(item);
 						let has_any = items.len() > 0;
 						table.set_items(items);
@@ -1426,9 +1421,9 @@ fn main() -> Result<(), anyhow::Error> {
 			"versions",
 			move |table: &mut TableView<VersionItem, VersionColumn>| {
 				let total_versions: usize =
-					item.version_groups.values().map(|x| x.versions.len()).sum();
+					item.version_groups.iter().map(|x| x.versions.len()).sum();
 				let mut items = Vec::with_capacity(item.version_groups.len() + total_versions);
-				for version_group in item.version_groups.values() {
+				for version_group in item.version_groups.iter() {
 					items.push(VersionItem::VersionGroup {
 						group: Arc::clone(version_group),
 					});
@@ -1467,8 +1462,13 @@ fn main() -> Result<(), anyhow::Error> {
 					let mut lock = main.lock().unwrap();
 					let old_parent = Arc::clone(&lock.current_parent);
 					if let Some(parent) = old_parent.parent.as_ref().and_then(|x| x.upgrade()) {
-						let items: Vec<_> = parent.children.values().cloned().collect();
-						let selected_index = items.iter().enumerate().find(|(_, x)| Arc::ptr_eq(&old_parent, x)).map(|(i, _)| i).unwrap_or(0);
+						let items: Vec<_> = parent.children.clone();
+						let selected_index = items
+							.iter()
+							.enumerate()
+							.find(|(_, x)| Arc::ptr_eq(&old_parent, x))
+							.map(|(i, _)| i)
+							.unwrap_or(0);
 						table.set_items(items);
 						lock.current_parent = parent;
 						table.set_selected_item(selected_index);
