@@ -360,7 +360,9 @@ impl HashedNodeData {
 		match self {
 			Self::Directory { children } => {
 				buf.put_u8(0x00);
-				for (name, child) in children.iter() {
+				let mut sorted: Vec<_> = children.iter().collect();
+				sorted.sort_by(|a, b| a.0.cmp(b.0));
+				for (name, child) in sorted {
 					buf.reserve(16 + name.len() + child.content_hash.len());
 					buf.put_u64_le(name.len() as u64);
 					buf.put_slice(&name[..]);
