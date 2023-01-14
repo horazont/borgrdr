@@ -1465,9 +1465,13 @@ fn main() -> Result<(), anyhow::Error> {
 				"contents",
 				move |table: &mut TableView<Arc<FinalNode>, FileListColumn>| {
 					let mut lock = main.lock().unwrap();
-					if let Some(parent) = lock.current_parent.parent.as_ref().and_then(|x| x.upgrade()) {
-						table.set_items(parent.children.values().cloned().collect());
+					let old_parent = Arc::clone(&lock.current_parent);
+					if let Some(parent) = old_parent.parent.as_ref().and_then(|x| x.upgrade()) {
+						let items: Vec<_> = parent.children.values().cloned().collect();
+						let selected_index = items.iter().enumerate().find(|(_, x)| Arc::ptr_eq(&old_parent, x)).map(|(i, _)| i).unwrap_or(0);
+						table.set_items(items);
 						lock.current_parent = parent;
+						table.set_selected_item(selected_index);
 					}
 				},
 			);
