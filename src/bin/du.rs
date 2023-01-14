@@ -773,11 +773,7 @@ impl FinalNode {
 		total_chunks: usize,
 	) -> usize {
 		Self::scale_capacity_estimate(
-			subtree_chunks
-				.values()
-				.map(|x| x.len())
-				.max()
-				.unwrap_or(0),
+			subtree_chunks.values().map(|x| x.len()).max().unwrap_or(0),
 			total_chunks,
 		)
 	}
