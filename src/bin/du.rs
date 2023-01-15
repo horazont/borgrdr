@@ -18,7 +18,7 @@ use std::hash::{Hash, Hasher};
 use std::io;
 use std::ops::Deref;
 use std::rc::Rc;
-use std::sync::{atomic, atomic::AtomicU64, Arc, Mutex, Weak};
+use std::sync::{atomic, atomic::AtomicBool, atomic::AtomicU64, Arc, Mutex, Weak};
 use std::time::Instant;
 
 use cursive::align::HAlign;
@@ -355,14 +355,15 @@ impl SizeEstimate for MergedNodeData {
 
 struct MergedNodeVersion {
 	data: MergedNodeData,
+	sizes_done: AtomicBool,
 	/// Original size of subtree
-	osize: u64,
+	osize: AtomicU64,
 	/// Size after compression but before deduplication
-	csize: u64,
+	csize: AtomicU64,
 	/// Accumulated size of chunks unique to this subtree and version group.
-	group_dsize: u64,
+	group_dsize: AtomicU64,
 	/// Accumulated size of chunks, deduplicated within this subtree and version group.
-	local_dsize: u64,
+	local_dsize: AtomicU64,
 	versions: Vec<Version>,
 }
 
@@ -423,17 +424,15 @@ impl MergedNodeVersion {
 		this.versions.push(version);
 	}
 
-	unsafe fn calculate_sizes(
+	fn calculate_sizes(
 		self: &Arc<Self>,
 		total_chunks: &HashMap<Id, u64>,
 		subtree_chunks: &HashMap<Version, HashMap<Id, u64>>,
 		chunk_index: &Arc<Mutex<ChunkIndex>>,
 	) {
-		assert_eq!(Arc::strong_count(self), 1);
-		let this = unsafe { &mut *(Arc::as_ptr(self) as *mut Self) };
-		let nversions = this.versions.len();
+		let nversions = self.versions.len();
 		let (osize, csize, group_dsize, local_dsize) =
-			match this.versions.get(0).and_then(|x| subtree_chunks.get(x)) {
+			match self.versions.get(0).and_then(|x| subtree_chunks.get(x)) {
 				Some(version_chunks) => {
 					let (osize, csize) =
 						Self::calculate_original_sizes(version_chunks, chunk_index);
@@ -448,23 +447,27 @@ impl MergedNodeVersion {
 				}
 				None => (0, 0, 0, 0),
 			};
-		this.osize = osize;
-		this.csize = csize;
-		this.group_dsize = group_dsize;
-		this.local_dsize = local_dsize;
+		self.osize.store(osize, atomic::Ordering::Relaxed);
+		self.csize.store(csize, atomic::Ordering::Relaxed);
+		self.group_dsize
+			.store(group_dsize, atomic::Ordering::Relaxed);
+		self.local_dsize
+			.store(local_dsize, atomic::Ordering::Relaxed);
+		self.sizes_done.store(true, atomic::Ordering::Release);
 	}
 }
 
 struct MergedNode {
 	parent: Option<Weak<MergedNode>>,
 	name: Vec<u8>,
+	sizes_done: AtomicBool,
 	/// Summed on-disk size of all chunks which appear *only* in this subtree,
 	/// and only in one version of the subtree.
-	churn: u64,
+	churn: AtomicU64,
 	/// Size of all chunks not used outside this subtree.
-	usage: u64,
+	usage: AtomicU64,
 	/// Deduplicated size of this subtree across all version groups.
-	local_dsize: u64,
+	local_dsize: AtomicU64,
 	children: HashMap<Vec<u8>, Arc<MergedNode>>,
 	version_groups: HashMap<ContentHash, Arc<MergedNodeVersion>>,
 }
@@ -475,9 +478,10 @@ impl MergedNode {
 		Arc::new(Self {
 			parent: Some(parent),
 			name,
-			churn: 0,
-			usage: 0,
-			local_dsize: 0,
+			sizes_done: AtomicBool::new(false),
+			churn: AtomicU64::new(0),
+			usage: AtomicU64::new(0),
+			local_dsize: AtomicU64::new(0),
 			children: HashMap::new(),
 			version_groups: HashMap::new(),
 		})
@@ -487,9 +491,10 @@ impl MergedNode {
 		Arc::new(Self {
 			parent: None,
 			name: b"".to_vec(),
-			churn: 0,
-			usage: 0,
-			local_dsize: 0,
+			sizes_done: AtomicBool::new(false),
+			churn: AtomicU64::new(0),
+			usage: AtomicU64::new(0),
+			local_dsize: AtomicU64::new(0),
 			children: HashMap::new(),
 			version_groups: HashMap::new(),
 		})
@@ -695,10 +700,11 @@ impl MergedNode {
 			Entry::Vacant(v) => {
 				v.insert(Arc::new(MergedNodeVersion {
 					data,
-					osize: 0,
-					csize: 0,
-					group_dsize: 0,
-					local_dsize: 0,
+					sizes_done: AtomicBool::new(false),
+					osize: AtomicU64::new(0),
+					csize: AtomicU64::new(0),
+					group_dsize: AtomicU64::new(0),
+					local_dsize: AtomicU64::new(0),
 					versions: vec![version.clone()],
 				}));
 			}
@@ -706,15 +712,13 @@ impl MergedNode {
 		content_hash
 	}
 
-	unsafe fn calculate_sizes_inner(
+	fn calculate_sizes_inner(
 		self: &Arc<Self>,
 		total_chunks: &HashMap<Id, u64>,
 		chunk_index: &Arc<Mutex<ChunkIndex>>,
 	) -> HashMap<Version, HashMap<Id, u64>> {
-		assert_eq!(Arc::strong_count(self), 1);
-		let this = unsafe { &mut *(Arc::as_ptr(self) as *mut Self) };
 		let mut subtree_chunks = HashMap::new();
-		for (_, child) in this.children.iter_mut() {
+		for (_, child) in self.children.iter() {
 			let mut child_chunks = child.calculate_sizes_inner(total_chunks, chunk_index);
 			// we always merge into the larger one
 			if subtree_chunks.len() < child_chunks.len() {
@@ -750,7 +754,7 @@ impl MergedNode {
 		}
 
 		// now we have the accurate subtree_chunks, now we need to add any chunks from *this* object itself in order to include it in calculations
-		for version_group in this.version_groups.values() {
+		for version_group in self.version_groups.values() {
 			match &version_group.data {
 				MergedNodeData::Regular { chunks } => {
 					for version in version_group.versions.iter() {
@@ -774,32 +778,34 @@ impl MergedNode {
 			}
 		}
 
-		for (_, version_group) in this.version_groups.iter() {
+		for (_, version_group) in self.version_groups.iter() {
 			unsafe {
 				version_group.calculate_sizes(total_chunks, &subtree_chunks, chunk_index);
 			}
 		}
 
 		let churn = Self::calculate_churn(
-			&this.version_groups,
+			&self.version_groups,
 			&subtree_chunks,
 			total_chunks,
 			chunk_index,
 		);
 		let local_dsize =
-			Self::calculate_local_dsize(&this.version_groups, &subtree_chunks, chunk_index);
+			Self::calculate_local_dsize(&self.version_groups, &subtree_chunks, chunk_index);
 		let usage = Self::calculate_usage(
-			&this.version_groups,
+			&self.version_groups,
 			&subtree_chunks,
 			total_chunks,
 			chunk_index,
 		);
 
-		this.churn = churn;
-		this.local_dsize = local_dsize;
-		this.usage = usage;
+		self.churn.store(churn, atomic::Ordering::Relaxed);
+		self.local_dsize
+			.store(local_dsize, atomic::Ordering::Relaxed);
+		self.usage.store(usage, atomic::Ordering::Relaxed);
 
 		FINAL_NODES.fetch_add(1, atomic::Ordering::Relaxed);
+		self.sizes_done.store(true, atomic::Ordering::Release);
 
 		subtree_chunks
 	}
@@ -917,11 +923,28 @@ enum VersionItem {
 }
 
 impl VersionItem {
-	fn osize(&self) -> u64 {
-		match self {
-			Self::VersionGroup { group, .. } => group.osize,
-			Self::Version { group, .. } => group.osize,
+	fn osize(&self) -> Option<u64> {
+		let group = self.group();
+		if !group.sizes_done.load(atomic::Ordering::Acquire) {
+			return None;
 		}
+		Some(group.osize.load(atomic::Ordering::Relaxed))
+	}
+
+	fn group_dsize(&self) -> Option<u64> {
+		let group = self.group();
+		if !group.sizes_done.load(atomic::Ordering::Acquire) {
+			return None;
+		}
+		Some(group.group_dsize.load(atomic::Ordering::Relaxed))
+	}
+
+	fn local_dsize(&self) -> Option<u64> {
+		let group = self.group();
+		if !group.sizes_done.load(atomic::Ordering::Acquire) {
+			return None;
+		}
+		Some(group.local_dsize.load(atomic::Ordering::Relaxed))
 	}
 
 	fn group(&self) -> &Arc<MergedNodeVersion> {
@@ -938,9 +961,18 @@ impl VersionItem {
 	) -> Ordering {
 		let order = match column {
 			VersionColumn::Name => a.versions.len().cmp(&b.versions.len()),
-			VersionColumn::OriginalSize => a.osize.cmp(&b.osize),
-			VersionColumn::GroupDsize => a.group_dsize.cmp(&b.group_dsize),
-			VersionColumn::LocalDsize => a.local_dsize.cmp(&b.local_dsize),
+			VersionColumn::OriginalSize => a
+				.osize
+				.load(atomic::Ordering::Relaxed)
+				.cmp(&b.osize.load(atomic::Ordering::Relaxed)),
+			VersionColumn::GroupDsize => a
+				.group_dsize
+				.load(atomic::Ordering::Relaxed)
+				.cmp(&b.group_dsize.load(atomic::Ordering::Relaxed)),
+			VersionColumn::LocalDsize => a
+				.local_dsize
+				.load(atomic::Ordering::Relaxed)
+				.cmp(&b.local_dsize.load(atomic::Ordering::Relaxed)),
 		};
 		if order == Ordering::Equal {
 			// use memory address as tie breaker
@@ -960,10 +992,13 @@ impl TableViewItem<VersionColumn> for VersionItem {
 				Self::Version { version, .. } => return format!("| {}", version.0.name),
 			},
 			VersionColumn::OriginalSize => self.osize(),
-			VersionColumn::GroupDsize => self.group().group_dsize,
-			VersionColumn::LocalDsize => self.group().local_dsize,
+			VersionColumn::GroupDsize => self.group_dsize(),
+			VersionColumn::LocalDsize => self.local_dsize(),
 		};
-		format_bytes(size)
+		match size {
+			Some(size) => format_bytes(size),
+			None => "??".into(),
+		}
 	}
 
 	fn cmp(&self, other: &Self, column: VersionColumn) -> Ordering {
@@ -1044,7 +1079,10 @@ enum FileListColumn {
 
 impl MergedNode {
 	fn max_osize(&self) -> Option<u64> {
-		self.version_groups.values().map(|x| x.osize).max()
+		self.version_groups
+			.values()
+			.map(|x| x.osize.load(atomic::Ordering::Relaxed))
+			.max()
 	}
 
 	fn distinct_versions(&self) -> u64 {
@@ -1076,9 +1114,9 @@ impl TableViewItem<FileListColumn> for Arc<MergedNode> {
 				Some(v) => format_bytes(v),
 				None => "".into(),
 			},
-			FileListColumn::Churn => format_bytes(self.churn),
-			FileListColumn::DSize => format_bytes(self.local_dsize),
-			FileListColumn::Usage => format_bytes(self.usage),
+			FileListColumn::Churn => format_bytes(self.churn.load(atomic::Ordering::Relaxed)),
+			FileListColumn::DSize => format_bytes(self.local_dsize.load(atomic::Ordering::Relaxed)),
+			FileListColumn::Usage => format_bytes(self.usage.load(atomic::Ordering::Relaxed)),
 		}
 	}
 
@@ -1086,9 +1124,18 @@ impl TableViewItem<FileListColumn> for Arc<MergedNode> {
 		match column {
 			FileListColumn::Versions => self.distinct_versions().cmp(&other.distinct_versions()),
 			FileListColumn::MaxOSize => self.max_osize().cmp(&other.max_osize()),
-			FileListColumn::Churn => self.churn.cmp(&other.churn),
-			FileListColumn::DSize => self.local_dsize.cmp(&other.local_dsize),
-			FileListColumn::Usage => self.usage.cmp(&other.usage),
+			FileListColumn::Churn => self
+				.churn
+				.load(atomic::Ordering::Relaxed)
+				.cmp(&other.churn.load(atomic::Ordering::Relaxed)),
+			FileListColumn::DSize => self
+				.local_dsize
+				.load(atomic::Ordering::Relaxed)
+				.cmp(&other.local_dsize.load(atomic::Ordering::Relaxed)),
+			FileListColumn::Usage => self
+				.usage
+				.load(atomic::Ordering::Relaxed)
+				.cmp(&other.usage.load(atomic::Ordering::Relaxed)),
 			_ => self.to_column(column).cmp(&other.to_column(column)),
 		}
 	}
@@ -1207,44 +1254,44 @@ fn main() -> Result<(), anyhow::Error> {
 					});
 				});
 			}));
-			let total_chunks = data.global_chunk_map(total_chunk_count);
-			sender.send(Box::new(move |siv: &mut Cursive| {
-				siv.set_fps(1);
-				siv.add_global_callback(Event::Refresh, |siv| {
-					siv.call_on_name("progress", |pb: &mut ProgressBar| {
-						apply_finalisation_progress(pb);
-					});
-				});
-			}));
-			// not shared with other threads yet, we're good
-			unsafe {
-				data.calculate_sizes_inner(&total_chunks, &chunk_index);
-			}
-			drop(total_chunks);
-			drop(chunk_index);
 			Main::update_root(Arc::clone(&main), Arc::clone(&data));
 			let t1 = Instant::now();
 			let duration = t1.duration_since(t0);
+			{
+				let data = Arc::clone(&data);
+				sender.send(Box::new(move |siv: &mut Cursive| {
+					siv.call_on_name(
+						"contents",
+						|table: &mut TableView<Arc<MergedNode>, FileListColumn>| {
+							table.set_items(data.children.values().cloned().collect());
+							table.set_selected_row(0);
+						},
+					);
+					siv.call_on_name("statusbar_text", |tv: &mut TextView| {
+						let seconds = duration.as_secs_f64();
+						let minutes = (seconds / 60.0).floor();
+						let seconds = seconds - minutes * 60.0;
+						tv.set_content(format!(
+							"Repository read in {:.0}min {:.2}s",
+							minutes, seconds
+						));
+					});
+					siv.pop_layer();
+					siv.set_fps(1);
+					siv.add_global_callback(Event::Refresh, |siv| {
+						siv.call_on_name("statusbar_progress", |pb: &mut ProgressBar| {
+							apply_finalisation_progress(pb);
+						});
+					});
+				}));
+			}
+			let total_chunks = data.global_chunk_map(total_chunk_count);
+			data.calculate_sizes_inner(&total_chunks, &chunk_index);
+			drop(total_chunks);
+			drop(chunk_index);
 			sender.send(Box::new(move |siv: &mut Cursive| {
 				siv.set_fps(0);
 				siv.clear_global_callbacks(Event::Refresh);
-				siv.call_on_name(
-					"contents",
-					|table: &mut TableView<Arc<MergedNode>, FileListColumn>| {
-						table.set_items(data.children.values().cloned().collect());
-						table.set_selected_row(0);
-					},
-				);
-				siv.call_on_name("statusbar_text", |tv: &mut TextView| {
-					let seconds = duration.as_secs_f64();
-					let minutes = (seconds / 60.0).floor();
-					let seconds = seconds - minutes * 60.0;
-					tv.set_content(format!(
-						"Repository read in {:.0}min {:.2}s",
-						minutes, seconds
-					));
-				});
-				siv.pop_layer();
 			}));
 		});
 	}
@@ -1388,7 +1435,16 @@ fn main() -> Result<(), anyhow::Error> {
 			)
 			.child(
 				LinearLayout::new(Orientation::Horizontal)
-					.child(TextView::new("Ready to rumble.").with_name("statusbar_text"))
+					.child(
+						TextView::new("Ready to rumble.")
+							.with_name("statusbar_text")
+							.full_width(),
+					)
+					.child(
+						ProgressBar::new()
+							.with_name("statusbar_progress")
+							.min_width(16),
+					)
 					.with_name("statusbar")
 					.fixed_height(1),
 			)
