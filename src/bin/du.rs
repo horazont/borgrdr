@@ -1081,7 +1081,13 @@ impl MergedNode {
 	fn max_osize(&self) -> Option<u64> {
 		self.version_groups
 			.values()
-			.map(|x| x.osize.load(atomic::Ordering::Relaxed))
+			.filter_map(|x| {
+				if x.sizes_done.load(atomic::Ordering::Acquire) {
+					Some(x.osize.load(atomic::Ordering::Relaxed))
+				} else {
+					None
+				}
+			})
 			.max()
 	}
 
@@ -1099,25 +1105,32 @@ impl MergedNode {
 
 impl TableViewItem<FileListColumn> for Arc<MergedNode> {
 	fn to_column(&self, column: FileListColumn) -> String {
-		match column {
+		let sizes_done = self.sizes_done.load(atomic::Ordering::Acquire);
+		let size = match column {
 			FileListColumn::Name => {
 				let mut name = String::from_utf8_lossy(&self.name).to_string();
 				if self.children.len() > 0 {
 					name.push_str("/")
 				}
-				name
+				return name;
 			}
 			FileListColumn::Versions => {
-				format!("{}/{}", self.distinct_versions(), self.total_versions())
+				return format!("{}/{}", self.distinct_versions(), self.total_versions());
 			}
-			FileListColumn::MaxOSize => match self.max_osize() {
-				Some(v) => format_bytes(v),
-				None => "".into(),
-			},
-			FileListColumn::Churn => format_bytes(self.churn.load(atomic::Ordering::Relaxed)),
-			FileListColumn::DSize => format_bytes(self.local_dsize.load(atomic::Ordering::Relaxed)),
-			FileListColumn::Usage => format_bytes(self.usage.load(atomic::Ordering::Relaxed)),
+			FileListColumn::MaxOSize => {
+				return match self.max_osize() {
+					Some(v) => format_bytes(v),
+					None => "??".into(),
+				}
+			}
+			FileListColumn::Churn => self.churn.load(atomic::Ordering::Relaxed),
+			FileListColumn::DSize => self.local_dsize.load(atomic::Ordering::Relaxed),
+			FileListColumn::Usage => self.usage.load(atomic::Ordering::Relaxed),
+		};
+		if !sizes_done {
+			return "??".into();
 		}
+		format_bytes(size)
 	}
 
 	fn cmp(&self, other: &Self, column: FileListColumn) -> Ordering {
