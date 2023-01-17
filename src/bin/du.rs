@@ -903,26 +903,28 @@ fn format_bytes(n: u64) -> String {
 	let value = ((n as f64) / (divisor as f64));
 	format!("{:3.0} {}", value, suffix) */
 	let order_of_magnitude = if n > 0 {
-		(n as f64).log10().floor() as u64
+		(n as f64).log(1024.).floor() as u64
 	} else {
 		0
 	};
-	let (suffix, divisor): (_, u64) = match order_of_magnitude / 3 {
-		0 => ("B  ", 1),
-		1 => ("kiB", 1024),
-		2 => ("MiB", 1024 * 1024),
-		3 => ("GiB", 1024 * 1024 * 1024),
-		4 => ("TiB", 1024 * 1024 * 1024 * 1024),
-		_ => ("EiB", 1024 * 1024 * 1024 * 1024 * 1024),
+	let (suffix, divisor): (_, u64) = match order_of_magnitude {
+		0 => (" ", 1),
+		1 => ("k", 1024),
+		2 => ("M", 1024 * 1024),
+		3 => ("G", 1024 * 1024 * 1024),
+		4 => ("T", 1024 * 1024 * 1024 * 1024),
+		_ => ("E", 1024 * 1024 * 1024 * 1024 * 1024),
 	};
 	let value = ((n as f64) / (divisor as f64));
-	if order_of_magnitude >= 3 {
-		match order_of_magnitude % 3 {
-			0 => format!("{:3.2} {}", value, suffix),
-			_ => format!("{:3.0} {}", value, suffix),
-		}
+	let ndigits = if value != 0. {
+		value.log10().floor() as u64
 	} else {
-		format!("{:3.0} {}", value, suffix)
+		3
+	};
+	match ndigits {
+		0 => format!("{:>4.2}{}", value, suffix),
+		1 => format!("{:>4.1}{}", value, suffix),
+		_ => format!("{:>4.0}{}", value, suffix),
 	}
 }
 
@@ -1337,19 +1339,19 @@ fn main() -> Result<(), anyhow::Error> {
 	let mut table = TableView::<Arc<MergedNode>, FileListColumn>::new()
 		.column(FileListColumn::Name, "Name", |c| c)
 		.column(FileListColumn::Versions, "#V", |c| {
-			c.width(8).align(HAlign::Right)
+			c.width(6).align(HAlign::Right)
 		})
-		.column(FileListColumn::MaxOSize, "OSz<", |c| {
-			c.width(8).align(HAlign::Right)
+		.column(FileListColumn::MaxOSize, "O<", |c| {
+			c.width(6).align(HAlign::Right)
 		})
-		.column(FileListColumn::DSize, "DSz", |c| {
-			c.width(8).align(HAlign::Right)
+		.column(FileListColumn::DSize, "D", |c| {
+			c.width(6).align(HAlign::Right)
 		})
-		.column(FileListColumn::Churn, "Chrn", |c| {
-			c.width(8).align(HAlign::Right)
+		.column(FileListColumn::Churn, "Ch", |c| {
+			c.width(6).align(HAlign::Right)
 		})
-		.column(FileListColumn::Usage, "Usge", |c| {
-			c.width(8).align(HAlign::Right)
+		.column(FileListColumn::Usage, "Us", |c| {
+			c.width(6).align(HAlign::Right)
 		});
 
 	{
@@ -1449,14 +1451,14 @@ fn main() -> Result<(), anyhow::Error> {
 
 	let mut version_table = TableView::<VersionItem, VersionColumn>::new()
 		.column(VersionColumn::Name, "Name", |c| c)
-		.column(VersionColumn::OriginalSize, "OSz", |c| {
-			c.width(8).align(HAlign::Right)
+		.column(VersionColumn::OriginalSize, "O", |c| {
+			c.width(6).align(HAlign::Right)
 		})
-		.column(VersionColumn::GroupDsize, "Gdsz", |c| {
-			c.width(8).align(HAlign::Right)
+		.column(VersionColumn::GroupDsize, "gD", |c| {
+			c.width(6).align(HAlign::Right)
 		})
-		.column(VersionColumn::LocalDsize, "Ldsz", |c| {
-			c.width(8).align(HAlign::Right)
+		.column(VersionColumn::LocalDsize, "lD", |c| {
+			c.width(6).align(HAlign::Right)
 		});
 
 	siv.add_fullscreen_layer(
