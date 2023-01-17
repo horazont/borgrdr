@@ -21,6 +21,8 @@ use std::rc::Rc;
 use std::sync::{atomic, atomic::AtomicBool, atomic::AtomicU64, Arc, Mutex, Weak};
 use std::time::Instant;
 
+use chrono::{DateTime, NaiveDateTime, TimeZone, Utc};
+
 use cursive::align::HAlign;
 use cursive::direction::Orientation;
 use cursive::event::Event;
@@ -42,8 +44,6 @@ use anyhow::{Context, Result};
 use tokio::sync::mpsc;
 
 use futures::stream::StreamExt;
-
-use chrono::{DateTime, TimeZone, Utc};
 
 use borgrdr::repository::Repository;
 use borgrdr::rpc::RpcStoreClient;
@@ -102,11 +102,27 @@ type ChunkIndex = HashMap<Id, (u64, u64)>;
 #[derive(Debug)]
 struct VersionInfo {
 	name: String,
-	// TODO: convert to DateTime<Utc>
-	timestamp: String,
+	timestamp: Result<DateTime<Utc>, String>,
+}
+
+impl VersionInfo {
+	fn timestamp_string(&self) -> String {
+		match &self.timestamp {
+			Ok(v) => v.format("%c").to_string(),
+			Err(v) => v.clone(),
+		}
+	}
 }
 
 struct Version(Arc<VersionInfo>);
+
+impl Deref for Version {
+	type Target = VersionInfo;
+
+	fn deref(&self) -> &Self::Target {
+		&self.0
+	}
+}
 
 impl Clone for Version {
 	fn clone(&self) -> Self {
@@ -203,9 +219,16 @@ async fn read_entries(
 	for (i, v) in manifest.archives().values().enumerate() {
 		let (version, items) = {
 			let archive = repo.read_archive(v.id()).await?;
+			let timestamp = match NaiveDateTime::parse_from_str(
+				archive.start_time(),
+				"%Y-%m-%dT%H:%M:%S%.6f",
+			) {
+				Ok(v) => Ok(DateTime::from_utc(v, Utc)),
+				Err(_) => Err(archive.start_time().into()),
+			};
 			let version = Version(Arc::new(VersionInfo {
 				name: archive.name().into(),
-				timestamp: archive.start_time().into(),
+				timestamp,
 			}));
 			(version, archive.items().iter().map(|x| *x).collect())
 		};
@@ -989,7 +1012,9 @@ impl TableViewItem<VersionColumn> for VersionItem {
 				Self::VersionGroup { group, .. } => {
 					return format!("({} identical versions)", group.versions.len())
 				}
-				Self::Version { version, .. } => return format!("| {}", version.0.name),
+				Self::Version { version, .. } => {
+					return format!("| {}", version.timestamp_string())
+				}
 			},
 			VersionColumn::OriginalSize => self.osize(),
 			VersionColumn::GroupDsize => self.group_dsize(),
