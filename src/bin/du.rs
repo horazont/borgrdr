@@ -96,8 +96,13 @@ impl From<&ArchiveItem> for Times {
 	}
 }
 
+struct ChunkSizes {
+	original: u64,
+	compressed: u64,
+}
+
 // chunkid -> osize, csize
-type ChunkIndex = HashMap<Id, (u64, u64)>;
+type ChunkSizeMap = HashMap<Id, ChunkSizes>;
 
 #[derive(Debug)]
 struct VersionInfo {
@@ -295,14 +300,20 @@ impl VersionedNode {
 		}
 	}
 
-	pub fn from_file_entry(entry: FileEntry, chunk_index: &Arc<Mutex<ChunkIndex>>) -> Self {
+	pub fn from_file_entry(entry: FileEntry, chunk_index: &Arc<Mutex<ChunkSizeMap>>) -> Self {
 		match entry.payload {
 			FileData::Directory {} => Self::new_directory(),
 			FileData::Regular { chunks, .. } => {
 				{
 					let mut lock = chunk_index.lock().unwrap();
 					for chunk in chunks.iter() {
-						lock.insert(*chunk.id(), (chunk.size(), chunk.csize()));
+						lock.insert(
+							*chunk.id(),
+							ChunkSizes {
+								original: chunk.size(),
+								compressed: chunk.csize(),
+							},
+						);
 					}
 				}
 				Self::Regular {
@@ -318,7 +329,7 @@ impl VersionedNode {
 	pub fn insert_node_at_path<'x>(
 		&'x mut self,
 		mut item: FileEntry,
-		chunk_index: &'_ Arc<Mutex<ChunkIndex>>,
+		chunk_index: &'_ Arc<Mutex<ChunkSizeMap>>,
 	) -> &'x mut VersionedNode {
 		match self {
 			Self::Directory { children } => {
@@ -393,7 +404,7 @@ struct MergedNodeVersion {
 impl MergedNodeVersion {
 	fn calculate_original_sizes(
 		subtree_chunks: &HashMap<Id, u64>,
-		chunk_index: &Arc<Mutex<ChunkIndex>>,
+		chunk_index: &Arc<Mutex<ChunkSizeMap>>,
 	) -> (u64, u64) {
 		let mut osize = 0;
 		let mut csize = 0;
@@ -402,7 +413,7 @@ impl MergedNodeVersion {
 			let count = *count;
 			let (chunk_osize, chunk_csize) = locked_chunk_index
 				.get(id)
-				.map(|(osize, csize)| (*osize, *csize))
+				.map(|sizes| (sizes.original, sizes.compressed))
 				.unwrap_or((0, 0));
 			osize += chunk_osize * count;
 			csize += chunk_csize * count;
@@ -414,7 +425,7 @@ impl MergedNodeVersion {
 		nversions: usize,
 		subtree_chunks: &HashMap<Id, u64>,
 		total_chunks: &HashMap<Id, u64>,
-		chunk_index: &Arc<Mutex<ChunkIndex>>,
+		chunk_index: &Arc<Mutex<ChunkSizeMap>>,
 	) -> u64 {
 		let nversions = nversions as u64;
 		let mut group_dsize = 0;
@@ -424,19 +435,19 @@ impl MergedNodeVersion {
 			if total_chunks.get(id).map(|x| *x).unwrap_or(0) > count {
 				continue;
 			}
-			group_dsize += locked_chunk_index.get(id).unwrap().1;
+			group_dsize += locked_chunk_index.get(id).unwrap().compressed;
 		}
 		group_dsize
 	}
 
 	fn calculate_local_dsize(
 		subtree_chunks: &HashMap<Id, u64>,
-		chunk_index: &Arc<Mutex<ChunkIndex>>,
+		chunk_index: &Arc<Mutex<ChunkSizeMap>>,
 	) -> u64 {
 		let mut local_dsize = 0;
 		let locked_chunk_index = chunk_index.lock().unwrap();
 		for id in subtree_chunks.keys() {
-			local_dsize += locked_chunk_index.get(id).unwrap().1;
+			local_dsize += locked_chunk_index.get(id).unwrap().compressed;
 		}
 		local_dsize
 	}
@@ -451,7 +462,7 @@ impl MergedNodeVersion {
 		self: &Arc<Self>,
 		total_chunks: &HashMap<Id, u64>,
 		subtree_chunks: &HashMap<Version, HashMap<Id, u64>>,
-		chunk_index: &Arc<Mutex<ChunkIndex>>,
+		chunk_index: &Arc<Mutex<ChunkSizeMap>>,
 	) {
 		let nversions = self.versions.len();
 		let (osize, csize, group_dsize, local_dsize) =
@@ -546,7 +557,7 @@ impl MergedNode {
 		versions: &HashMap<ContentHash, Arc<MergedNodeVersion>>,
 		subtree_chunks: &HashMap<Version, HashMap<Id, u64>>,
 		total_chunks: &HashMap<Id, u64>,
-		chunk_index: &Arc<Mutex<ChunkIndex>>,
+		chunk_index: &Arc<Mutex<ChunkSizeMap>>,
 	) -> u64 {
 		if versions.len() == 0 {
 			return 0;
@@ -588,7 +599,7 @@ impl MergedNode {
 				continue;
 			}
 			// chunk is unique and not used outside -> add csize to churn
-			churned_size += locked_chunk_index.get(&id).unwrap().1;
+			churned_size += locked_chunk_index.get(&id).unwrap().compressed;
 		}
 
 		churned_size
@@ -598,7 +609,7 @@ impl MergedNode {
 		versions: &HashMap<ContentHash, Arc<MergedNodeVersion>>,
 		subtree_chunks: &HashMap<Version, HashMap<Id, u64>>,
 		total_chunks: &HashMap<Id, u64>,
-		chunk_index: &Arc<Mutex<ChunkIndex>>,
+		chunk_index: &Arc<Mutex<ChunkSizeMap>>,
 	) -> u64 {
 		if versions.len() == 0 {
 			return 0;
@@ -639,7 +650,7 @@ impl MergedNode {
 				continue;
 			}
 			// chunk is unique and not used outside -> add csize to churn
-			usage += locked_chunk_index.get(&id).unwrap().1;
+			usage += locked_chunk_index.get(&id).unwrap().compressed;
 		}
 
 		usage
@@ -648,7 +659,7 @@ impl MergedNode {
 	fn calculate_local_dsize(
 		versions: &HashMap<ContentHash, Arc<MergedNodeVersion>>,
 		subtree_chunks: &HashMap<Version, HashMap<Id, u64>>,
-		chunk_index: &Arc<Mutex<ChunkIndex>>,
+		chunk_index: &Arc<Mutex<ChunkSizeMap>>,
 	) -> u64 {
 		let locked_chunk_index = chunk_index.lock().unwrap();
 		let mut seen_chunks = HashSet::with_capacity(Self::capacity_with_headroom_for_union(
@@ -663,7 +674,7 @@ impl MergedNode {
 			};
 			for id in representative.keys() {
 				if seen_chunks.insert(*id) {
-					dsize += locked_chunk_index.get(id).unwrap().1;
+					dsize += locked_chunk_index.get(id).unwrap().compressed;
 				}
 			}
 		}
@@ -738,7 +749,7 @@ impl MergedNode {
 	fn calculate_sizes_inner(
 		self: &Arc<Self>,
 		total_chunks: &HashMap<Id, u64>,
-		chunk_index: &Arc<Mutex<ChunkIndex>>,
+		chunk_index: &Arc<Mutex<ChunkSizeMap>>,
 	) -> HashMap<Version, HashMap<Id, u64>> {
 		let mut subtree_chunks = HashMap::new();
 		for (_, child) in self.children.iter() {
@@ -867,7 +878,7 @@ impl MergedNode {
 async fn hasher(
 	mut src: mpsc::Receiver<(Version, mpsc::Receiver<FileEntry>)>,
 	dst: mpsc::Sender<(Version, VersionedNode)>,
-	chunk_index: Arc<Mutex<ChunkIndex>>,
+	chunk_index: Arc<Mutex<ChunkSizeMap>>,
 ) {
 	while let Some((version, mut item_source)) = src.recv().await {
 		log::info!("processing archive {:?}", version);
@@ -1012,11 +1023,16 @@ impl TableViewItem<VersionColumn> for VersionItem {
 		let size = match column {
 			VersionColumn::Name => match self {
 				Self::VersionGroup { group, .. } => {
-					let earliest = group.versions.iter().min_by_key(|version| &version.timestamp).unwrap().timestamp_string();
+					let earliest = group
+						.versions
+						.iter()
+						.min_by_key(|version| &version.timestamp)
+						.unwrap()
+						.timestamp_string();
 					if group.versions.len() > 1 {
-						return format!("{} (+{})", earliest, group.versions.len()-1)
+						return format!("{} (+{})", earliest, group.versions.len() - 1);
 					} else {
-						return earliest
+						return earliest;
 					}
 				}
 				Self::Version { version, .. } => {
@@ -1069,14 +1085,14 @@ impl TableViewItem<VersionColumn> for VersionItem {
 async fn prepare(
 	url: String,
 	cb_sink: cursive::CbSink,
-) -> Result<(Arc<MergedNode>, Arc<Mutex<ChunkIndex>>), anyhow::Error> {
+) -> Result<(Arc<MergedNode>, Arc<Mutex<ChunkSizeMap>>), anyhow::Error> {
 	let (mut backend, repo) = borgrdr::cliutil::open_url_str(&url)
 		.await
 		.with_context(|| format!("failed to open repository"))?;
 
 	let (entry_sink, archive_source) = mpsc::channel(128);
 	let (hashed_sink, mut hashed_source) = mpsc::channel(2);
-	let chunk_index = Arc::new(Mutex::new(ChunkIndex::new()));
+	let chunk_index = Arc::new(Mutex::new(ChunkSizeMap::new()));
 	let reader = tokio::spawn(read_entries(repo, entry_sink, cb_sink));
 	let hasher = tokio::spawn(hasher(
 		archive_source,
