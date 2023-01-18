@@ -1012,7 +1012,12 @@ impl TableViewItem<VersionColumn> for VersionItem {
 		let size = match column {
 			VersionColumn::Name => match self {
 				Self::VersionGroup { group, .. } => {
-					return format!("({} identical versions)", group.versions.len())
+					let earliest = group.versions.iter().min_by_key(|version| &version.timestamp).unwrap().timestamp_string();
+					if group.versions.len() > 1 {
+						return format!("{} (+{})", earliest, group.versions.len()-1)
+					} else {
+						return earliest
+					}
 				}
 				Self::Version { version, .. } => {
 					return format!("| {}", version.timestamp_string())
@@ -1398,12 +1403,6 @@ fn main() -> Result<(), anyhow::Error> {
 					items.push(VersionItem::VersionGroup {
 						group: Arc::clone(version_group),
 					});
-					for version in version_group.versions.iter() {
-						items.push(VersionItem::Version {
-							group: Arc::clone(version_group),
-							version: version.clone(),
-						});
-					}
 				}
 				let has_any = items.len() > 0;
 				table.set_items(items);
