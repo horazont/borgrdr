@@ -387,7 +387,7 @@ impl SizeEstimate for MergedNodeData {
 	}
 }
 
-struct MergedNodeVersion {
+struct MergedNodeVersionGroup {
 	data: MergedNodeData,
 	sizes_done: AtomicBool,
 	/// Original size of subtree
@@ -401,7 +401,7 @@ struct MergedNodeVersion {
 	versions: Vec<Version>,
 }
 
-impl MergedNodeVersion {
+impl MergedNodeVersionGroup {
 	fn calculate_original_sizes(
 		subtree_chunks: &HashMap<Id, u64>,
 		chunk_index: &Arc<Mutex<ChunkSizeMap>>,
@@ -503,7 +503,7 @@ struct MergedNode {
 	/// Deduplicated size of this subtree across all version groups.
 	local_dsize: AtomicU64,
 	children: HashMap<Vec<u8>, Arc<MergedNode>>,
-	version_groups: HashMap<ContentHash, Arc<MergedNodeVersion>>,
+	version_groups: HashMap<ContentHash, Arc<MergedNodeVersionGroup>>,
 }
 
 impl MergedNode {
@@ -554,7 +554,7 @@ impl MergedNode {
 	}
 
 	fn calculate_churn(
-		versions: &HashMap<ContentHash, Arc<MergedNodeVersion>>,
+		versions: &HashMap<ContentHash, Arc<MergedNodeVersionGroup>>,
 		subtree_chunks: &HashMap<Version, HashMap<Id, u64>>,
 		total_chunks: &HashMap<Id, u64>,
 		chunk_index: &Arc<Mutex<ChunkSizeMap>>,
@@ -606,7 +606,7 @@ impl MergedNode {
 	}
 
 	fn calculate_usage(
-		versions: &HashMap<ContentHash, Arc<MergedNodeVersion>>,
+		versions: &HashMap<ContentHash, Arc<MergedNodeVersionGroup>>,
 		subtree_chunks: &HashMap<Version, HashMap<Id, u64>>,
 		total_chunks: &HashMap<Id, u64>,
 		chunk_index: &Arc<Mutex<ChunkSizeMap>>,
@@ -657,7 +657,7 @@ impl MergedNode {
 	}
 
 	fn calculate_local_dsize(
-		versions: &HashMap<ContentHash, Arc<MergedNodeVersion>>,
+		versions: &HashMap<ContentHash, Arc<MergedNodeVersionGroup>>,
 		subtree_chunks: &HashMap<Version, HashMap<Id, u64>>,
 		chunk_index: &Arc<Mutex<ChunkSizeMap>>,
 	) -> u64 {
@@ -732,7 +732,7 @@ impl MergedNode {
 				o.get_mut().add_version(version.clone());
 			},
 			Entry::Vacant(v) => {
-				v.insert(Arc::new(MergedNodeVersion {
+				v.insert(Arc::new(MergedNodeVersionGroup {
 					data,
 					sizes_done: AtomicBool::new(false),
 					osize: AtomicU64::new(0),
@@ -950,11 +950,11 @@ enum VersionColumn {
 #[derive(Clone)]
 enum VersionItem {
 	VersionGroup {
-		group: Arc<MergedNodeVersion>,
+		group: Arc<MergedNodeVersionGroup>,
 	},
 	Version {
 		version: Version,
-		group: Arc<MergedNodeVersion>,
+		group: Arc<MergedNodeVersionGroup>,
 	},
 }
 
@@ -983,7 +983,7 @@ impl VersionItem {
 		Some(group.local_dsize.load(atomic::Ordering::Relaxed))
 	}
 
-	fn group(&self) -> &Arc<MergedNodeVersion> {
+	fn group(&self) -> &Arc<MergedNodeVersionGroup> {
 		match self {
 			Self::VersionGroup { group, .. } => group,
 			Self::Version { group, .. } => group,
@@ -991,8 +991,8 @@ impl VersionItem {
 	}
 
 	fn cmp_group(
-		a: &Arc<MergedNodeVersion>,
-		b: &Arc<MergedNodeVersion>,
+		a: &Arc<MergedNodeVersionGroup>,
+		b: &Arc<MergedNodeVersionGroup>,
 		column: VersionColumn,
 	) -> Ordering {
 		let order = match column {
