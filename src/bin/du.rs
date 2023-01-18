@@ -1301,24 +1301,6 @@ fn main() -> Result<(), anyhow::Error> {
 				let lock = chunk_index.lock().unwrap();
 				lock.len()
 			};
-			sender.send(Box::new(move |siv: &mut Cursive| {
-				siv.add_global_callback(Event::Refresh, |siv| {
-					siv.call_on_name("progress_step", |tv: &mut TextView| {
-						tv.set_content("Step 2/2: Calculating Sizes");
-					});
-					siv.call_on_name("progress", |pb: &mut ProgressBar| {
-						pb.set_min(0);
-						pb.set_value(0);
-						pb.set_max(1);
-						pb.set_label(|value, (min, max)| {
-							format!(
-								"{:.0}%",
-								(value - min) as f64 / ((max - min).max(1) as f64) * 100.
-							)
-						});
-					});
-				});
-			}));
 			Main::update_root(Arc::clone(&main), Arc::clone(&data));
 			let t1 = Instant::now();
 			let duration = t1.duration_since(t0);
@@ -1357,6 +1339,11 @@ fn main() -> Result<(), anyhow::Error> {
 			sender.send(Box::new(move |siv: &mut Cursive| {
 				siv.set_fps(0);
 				siv.clear_global_callbacks(Event::Refresh);
+				siv.call_on_name("statusbar_progress", |pb: &mut ProgressBar| {
+					// ensure this shows 100% when done :-)
+					pb.set_range(0, 1);
+					pb.set_value(1);
+				});
 			}));
 		});
 	}
@@ -1516,7 +1503,7 @@ fn main() -> Result<(), anyhow::Error> {
 			.content(
 				LinearLayout::new(Orientation::Vertical)
 					.child(
-						TextView::new("Step 1/2: Reading archives")
+						TextView::new("Reading archives")
 							.with_name("progress_step")
 							.fixed_height(1),
 					)
