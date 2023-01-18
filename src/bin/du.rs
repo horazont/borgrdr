@@ -502,6 +502,10 @@ struct MergedNode {
 	usage: AtomicU64,
 	/// Deduplicated size of this subtree across all version groups.
 	local_dsize: AtomicU64,
+	// for the record: changing this into a pair of HashMap<Vec<u8>, usize> and
+	// Vec<Arc<MergedNode>> (with the hashmap pointing at the vec) and then
+	// dropping the hashmap after building the tree worsens the memory use,
+	// probably because of the fragmentation all those tiny hashmaps create.
 	children: HashMap<Vec<u8>, Arc<MergedNode>>,
 	version_groups: HashMap<ContentHash, Arc<MergedNodeVersionGroup>>,
 }
