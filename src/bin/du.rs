@@ -1,3 +1,15 @@
+use std::cmp::Ordering;
+use std::collections::hash_map::Entry;
+use std::collections::{HashMap, HashSet};
+use std::env::args;
+use std::ffi::{OsStr, OsString};
+use std::fmt;
+use std::hash::{Hash, Hasher};
+use std::io;
+use std::io::Write;
+use std::ops::Deref;
+use std::os::unix::{ffi::OsStrExt, fs::symlink};
+use std::path::MAIN_SEPARATOR;
 #[deny(unsafe_op_in_unsafe_fn)]
 /*
 things to display:
@@ -8,30 +20,21 @@ things to display:
 - global usage: size of chunks not used outside that subtree in any archives
 - churn: summed size of all chunks only used within that subtree *and* not in all versions
 */
-use std::cell::RefCell;
-use std::cmp::Ordering;
-use std::collections::hash_map::Entry;
-use std::collections::{HashMap, HashSet};
-use std::env::args;
-use std::fmt;
-use std::hash::{Hash, Hasher};
-use std::io;
-use std::ops::Deref;
 use std::rc::Rc;
 use std::sync::{atomic, atomic::AtomicBool, atomic::AtomicU64, Arc, Mutex, Weak};
 use std::time::Instant;
+
+use smartstring::alias::String as SmartString;
 
 use chrono::{DateTime, NaiveDateTime, TimeZone, Utc};
 
 use cursive::align::HAlign;
 use cursive::direction::Orientation;
-use cursive::event::Event;
+use cursive::event::{Event, EventResult};
 use cursive::theme::{BaseColor, Color, PaletteColor};
 use cursive::traits::*;
-use cursive::views::{Dialog, LinearLayout, Panel, ProgressBar, TextView};
+use cursive::views::{Dialog, EditView, LinearLayout, OnEventView, Panel, ProgressBar, TextView};
 use cursive::{Cursive, CursiveExt};
-
-use cursive_tree_view::{Placement, TreeView};
 
 use cursive_table_view::{TableView, TableViewItem};
 
@@ -41,6 +44,7 @@ use bytes::{BufMut, Bytes, BytesMut};
 
 use anyhow::{Context, Result};
 
+use tokio::io::AsyncReadExt;
 use tokio::sync::mpsc;
 
 use futures::stream::StreamExt;
@@ -77,6 +81,17 @@ struct Times {
 	mtime: Option<DateTime<Utc>>,
 	ctime: Option<DateTime<Utc>>,
 	birthtime: Option<DateTime<Utc>>,
+}
+
+impl Default for Times {
+	fn default() -> Self {
+		Self {
+			atime: None,
+			mtime: None,
+			ctime: None,
+			birthtime: None,
+		}
+	}
 }
 
 fn convert_ts(ts: i64) -> DateTime<Utc> {
@@ -156,18 +171,56 @@ impl fmt::Debug for Version {
 }
 
 #[derive(Debug)]
+struct Entity {
+	numeric: u32,
+	name: Option<SmartString>,
+}
+
+impl Entity {
+	fn root() -> Self {
+		Self {
+			numeric: 0,
+			name: Some("root".into()),
+		}
+	}
+
+	fn from_bytes_lossy(name: Option<&[u8]>, numeric: u32) -> Self {
+		Self {
+			name: name.map(|x| String::from_utf8_lossy(x).into()),
+			numeric,
+		}
+	}
+}
+
+#[derive(Debug)]
 struct FileEntry {
 	path: Vec<u8>,
 	mode: u32,
-	uid: u32,
-	gid: u32,
+	owner: Entity,
+	group: Entity,
 	times: Times,
+	xattrs: Vec<(Vec<u8>, Vec<u8>)>,
 	payload: FileData,
 }
 
 #[derive(Debug)]
 enum FileEntryError {
 	UnsupportedMode(u32),
+}
+
+impl FileEntry {
+	fn split(self) -> (FileMetadata, FileData) {
+		(
+			FileMetadata {
+				times: self.times,
+				owner: self.owner,
+				group: self.group,
+				xattrs: self.xattrs,
+				permissions: (self.mode & 0o7777) as u16,
+			},
+			self.payload,
+		)
+	}
 }
 
 impl TryFrom<ArchiveItem> for FileEntry {
@@ -194,13 +247,23 @@ impl TryFrom<ArchiveItem> for FileEntry {
 			// unsupported
 			return Err((FileEntryError::UnsupportedMode(mode), other));
 		};
+		let path = other.path().to_vec();
+		let mode = other.mode();
+		let owner = Entity::from_bytes_lossy(other.user(), other.uid());
+		let group = Entity::from_bytes_lossy(other.group(), other.gid());
+		let xattrs = other
+			.into_xattrs()
+			.into_iter()
+			.map(|(k, v)| (k.into(), v.into()))
+			.collect();
 		Ok(Self {
-			path: other.path().to_vec(),
-			mode: other.mode(),
-			uid: other.uid(),
-			gid: other.gid(),
+			path,
+			mode,
+			owner,
+			group,
 			times,
 			payload,
+			xattrs,
 		})
 	}
 }
@@ -209,7 +272,7 @@ async fn read_entries(
 	repo: Repository<RpcStoreClient>,
 	archive_sink: mpsc::Sender<(Version, mpsc::Receiver<FileEntry>)>,
 	cb_sink: cursive::CbSink,
-) -> Result<(), io::Error> {
+) -> Result<Repository<RpcStoreClient>, io::Error> {
 	let manifest = repo.manifest();
 	let narchives = manifest.archives().len();
 	cb_sink.send(Box::new(move |siv: &mut Cursive| {
@@ -266,18 +329,21 @@ async fn read_entries(
 			ArchiveProgress::Done.apply_to(pb)
 		});
 	}));
-	Ok(())
+	Ok(repo)
 }
 
 enum VersionedNode {
 	Directory {
 		children: HashMap<Vec<u8>, VersionedNode>,
+		metadata: FileMetadata,
 	},
 	Regular {
 		chunks: Vec<Id>,
+		metadata: FileMetadata,
 	},
 	Symlink {
 		target: Bytes,
+		metadata: FileMetadata,
 	},
 }
 
@@ -294,15 +360,17 @@ fn split_first_segment<'x>(a: &mut Vec<u8>) -> Vec<u8> {
 }
 
 impl VersionedNode {
-	pub fn new_directory() -> Self {
+	pub fn new_directory(metadata: FileMetadata) -> Self {
 		Self::Directory {
 			children: HashMap::new(),
+			metadata,
 		}
 	}
 
 	pub fn from_file_entry(entry: FileEntry, chunk_index: &Arc<Mutex<ChunkSizeMap>>) -> Self {
-		match entry.payload {
-			FileData::Directory {} => Self::new_directory(),
+		let (metadata, data) = entry.split();
+		match data {
+			FileData::Directory {} => Self::new_directory(metadata),
 			FileData::Regular { chunks, .. } => {
 				{
 					let mut lock = chunk_index.lock().unwrap();
@@ -318,10 +386,12 @@ impl VersionedNode {
 				}
 				Self::Regular {
 					chunks: chunks.into_iter().map(|x| *x.id()).collect(),
+					metadata,
 				}
 			}
 			FileData::Symlink { target_path, .. } => Self::Symlink {
 				target: target_path,
+				metadata,
 			},
 		}
 	}
@@ -332,13 +402,13 @@ impl VersionedNode {
 		chunk_index: &'_ Arc<Mutex<ChunkSizeMap>>,
 	) -> &'x mut VersionedNode {
 		match self {
-			Self::Directory { children } => {
+			Self::Directory { children, .. } => {
 				let entry_name = split_first_segment(&mut item.path);
 				let need_dir = item.path.len() > 0;
 				let next = match children.entry(entry_name) {
 					Entry::Vacant(v) => {
 						if need_dir {
-							v.insert(VersionedNode::new_directory())
+							v.insert(VersionedNode::new_directory(FileMetadata::default()))
 						} else {
 							return v.insert(Self::from_file_entry(item, chunk_index));
 						}
@@ -355,18 +425,21 @@ impl VersionedNode {
 impl fmt::Debug for VersionedNode {
 	fn fmt<'f>(&self, f: &'f mut fmt::Formatter) -> fmt::Result {
 		match self {
-			Self::Directory { children } => {
+			Self::Directory { children, metadata } => {
+				write!(f, "Directory {{ metadata = {:?}, ", metadata)?;
 				let mut debug = f.debug_map();
 				for (item_path, item) in children.iter() {
 					debug.entry(item_path, item);
 				}
-				debug.finish()
+				debug.finish()?;
+				f.write_str("}")?;
+				Ok(())
 			}
-			Self::Regular { chunks } => {
-				write!(f, "<{} chunks>", chunks.len())
+			Self::Regular { chunks, metadata } => {
+				write!(f, "<{} chunks {:?}>", chunks.len(), metadata)
 			}
-			Self::Symlink { target } => {
-				write!(f, "<symlink to {:?}>", target)
+			Self::Symlink { target, metadata } => {
+				write!(f, "<symlink to {:?}, {:?}>", target, metadata)
 			}
 		}
 	}
@@ -387,8 +460,31 @@ impl SizeEstimate for MergedNodeData {
 	}
 }
 
+#[derive(Debug)]
+struct FileMetadata {
+	times: Times,
+	permissions: u16,
+	owner: Entity,
+	group: Entity,
+	xattrs: Vec<(Vec<u8>, Vec<u8>)>,
+}
+
+impl Default for FileMetadata {
+	fn default() -> Self {
+		Self {
+			times: Times::default(),
+			permissions: 0o0600,
+			owner: Entity::root(),
+			group: Entity::root(),
+			xattrs: Vec::new(),
+		}
+	}
+}
+
 struct MergedNodeVersionGroup {
 	data: MergedNodeData,
+	// TODO: handle different metadata versions
+	metadata: FileMetadata,
 	sizes_done: AtomicBool,
 	/// Original size of subtree
 	osize: AtomicU64,
@@ -510,6 +606,14 @@ struct MergedNode {
 	version_groups: HashMap<ContentHash, Arc<MergedNodeVersionGroup>>,
 }
 
+fn f64_to_usize_checked(x: f64) -> Option<usize> {
+	let x = x.round();
+	if x > usize::MAX as f64 || x < usize::MIN as f64 {
+		return None;
+	}
+	Some(x as usize)
+}
+
 impl MergedNode {
 	fn new(parent: Weak<MergedNode>, name: Vec<u8>) -> Arc<Self> {
 		MERGED_NODES.fetch_add(1, atomic::Ordering::Relaxed);
@@ -540,10 +644,8 @@ impl MergedNode {
 
 	fn scale_capacity_estimate(max_chunks: usize, total_chunks: usize) -> usize {
 		let estimated_chunks = ((max_chunks as f64) * 1.5).round();
-		let estimated_chunks: usize = match max_chunks.try_into() {
-			Ok(v) => v,
-			Err(_) => total_chunks,
-		};
+		let estimated_chunks: usize =
+			f64_to_usize_checked(estimated_chunks).unwrap_or(total_chunks);
 		total_chunks.min(estimated_chunks)
 	}
 
@@ -693,8 +795,8 @@ impl MergedNode {
 		assert_eq!(Arc::strong_count(self), 1);
 		let this = unsafe { &mut *(Arc::as_ptr(self) as *mut Self) };
 		let mut buf = BytesMut::new();
-		let data = match node {
-			VersionedNode::Directory { children } => {
+		let (data, metadata) = match node {
+			VersionedNode::Directory { children, metadata } => {
 				buf.put_u8(0x00);
 				let mut sorted: Vec<_> = children.into_iter().collect();
 				sorted.sort_by(|a, b| a.0.cmp(&b.0));
@@ -712,22 +814,22 @@ impl MergedNode {
 					let content_hash = unsafe { own_child.merge_v3(version.clone(), new_child) };
 					buf.put_slice(&content_hash[..]);
 				}
-				MergedNodeData::Directory {}
+				(MergedNodeData::Directory {}, metadata)
 			}
-			VersionedNode::Regular { chunks } => {
+			VersionedNode::Regular { chunks, metadata } => {
 				buf.put_u8(0x01);
 				buf.reserve(chunks.len() * 32 + 1);
 				for chunk in chunks.iter() {
 					buf.put_slice(&chunk.0[..]);
 				}
-				MergedNodeData::Regular { chunks }
+				(MergedNodeData::Regular { chunks }, metadata)
 			}
-			VersionedNode::Symlink { target } => {
+			VersionedNode::Symlink { target, metadata } => {
 				buf.reserve(2 + target.len());
 				buf.put_u8(0x02);
 				buf.put_u8(0x00);
 				buf.put_slice(&target[..]);
-				MergedNodeData::Symlink { target }
+				(MergedNodeData::Symlink { target }, metadata)
 			}
 		};
 		let content_hash = hash_content(&buf);
@@ -738,6 +840,7 @@ impl MergedNode {
 			Entry::Vacant(v) => {
 				v.insert(Arc::new(MergedNodeVersionGroup {
 					data,
+					metadata,
 					sizes_done: AtomicBool::new(false),
 					osize: AtomicU64::new(0),
 					csize: AtomicU64::new(0),
@@ -798,7 +901,7 @@ impl MergedNode {
 					for version in version_group.versions.iter() {
 						let dest = match subtree_chunks.entry(version.clone()) {
 							Entry::Vacant(v) => v.insert(HashMap::new()),
-							Entry::Occupied(mut o) => o.into_mut(),
+							Entry::Occupied(o) => o.into_mut(),
 						};
 						for id in chunks.iter() {
 							match dest.entry(*id) {
@@ -817,9 +920,7 @@ impl MergedNode {
 		}
 
 		for (_, version_group) in self.version_groups.iter() {
-			unsafe {
-				version_group.calculate_sizes(total_chunks, &subtree_chunks, chunk_index);
-			}
+			version_group.calculate_sizes(total_chunks, &subtree_chunks, chunk_index);
 		}
 
 		let churn = Self::calculate_churn(
@@ -877,6 +978,15 @@ impl MergedNode {
 		self.gather_chunk_maps(&mut total_chunks);
 		total_chunks
 	}
+
+	fn version_group_of(&self, version: &Version) -> Option<&MergedNodeVersionGroup> {
+		for group in self.version_groups.values() {
+			if group.versions.iter().any(|x| x == version) {
+				return Some(group);
+			}
+		}
+		None
+	}
 }
 
 async fn hasher(
@@ -886,7 +996,7 @@ async fn hasher(
 ) {
 	while let Some((version, mut item_source)) = src.recv().await {
 		log::info!("processing archive {:?}", version);
-		let mut root = VersionedNode::new_directory();
+		let mut root = VersionedNode::new_directory(FileMetadata::default());
 		while let Some(item) = item_source.recv().await {
 			root.insert_node_at_path(item, &chunk_index);
 		}
@@ -930,7 +1040,7 @@ fn format_bytes(n: u64) -> String {
 		4 => ("T", 1024 * 1024 * 1024 * 1024),
 		_ => ("E", 1024 * 1024 * 1024 * 1024 * 1024),
 	};
-	let value = ((n as f64) / (divisor as f64));
+	let value = (n as f64) / (divisor as f64);
 	let ndigits = if value != 0. {
 		value.log10().floor() as u64
 	} else {
@@ -1089,7 +1199,14 @@ impl TableViewItem<VersionColumn> for VersionItem {
 async fn prepare(
 	url: String,
 	cb_sink: cursive::CbSink,
-) -> Result<(Arc<MergedNode>, Arc<Mutex<ChunkSizeMap>>), anyhow::Error> {
+) -> Result<
+	(
+		Repository<RpcStoreClient>,
+		Arc<MergedNode>,
+		Arc<Mutex<ChunkSizeMap>>,
+	),
+	anyhow::Error,
+> {
 	let (mut backend, repo) = borgrdr::cliutil::open_url_str(&url)
 		.await
 		.with_context(|| format!("failed to open repository"))?;
@@ -1104,7 +1221,7 @@ async fn prepare(
 		Arc::clone(&chunk_index),
 	));
 
-	let mut merged = MergedNode::new_root();
+	let merged = MergedNode::new_root();
 	while let Some((version, hashed_tree)) = hashed_source.recv().await {
 		// merged has not been shared between threads yet, so this is safe.
 		unsafe {
@@ -1113,10 +1230,9 @@ async fn prepare(
 	}
 
 	hasher.await.unwrap();
-	reader.await.unwrap()?;
-	let _: Result<_, _> = backend.wait_for_shutdown().await;
+	let repo = reader.await.unwrap()?;
 
-	Ok((merged, chunk_index))
+	Ok((repo, merged, chunk_index))
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
@@ -1264,6 +1380,133 @@ impl Main {
 	}
 }
 
+struct ExtractProgress {
+	extracted_nodes: AtomicU64,
+	extracted_bytes: AtomicU64,
+}
+
+#[async_recursion::async_recursion]
+async fn extract(
+	repo: &Repository<RpcStoreClient>,
+	version: &Version,
+	subtree: Arc<MergedNode>,
+	dest_path: &OsString,
+	progress: &ExtractProgress,
+) -> io::Result<()> {
+	let v = match subtree.version_group_of(&version) {
+		None => {
+			// there is nothing here in this version, skip
+			return Ok(());
+		}
+		Some(v) => v,
+	};
+	let name = OsStr::from_bytes(&subtree.name);
+	let mut path = dest_path.clone();
+	// TODO: use MAIN_SEPARATOR_STR once it stabilizes
+	let mut buf = String::new();
+	buf.push(MAIN_SEPARATOR);
+	path.push(&buf);
+	path.push(&name);
+	tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+	match &v.data {
+		MergedNodeData::Directory {} => {
+			// directory, we need to mkdir, and then recurse
+			std::fs::create_dir(&path)?;
+			for (_, node) in subtree.children.iter() {
+				extract(repo, version, Arc::clone(node), &path, progress).await?;
+			}
+			// TODO: extract metadata
+		}
+		MergedNodeData::Regular { chunks, .. } => {
+			// file, we need to extract
+			let mut out = std::fs::File::options()
+				.read(true)
+				.write(true)
+				.create_new(true)
+				.open(&path)?;
+			let mut reader = repo.open_stream(chunks.clone())?;
+			let mut buffer = Box::new([0u8; 8192]);
+			loop {
+				let data = match reader.read(&mut buffer[..]).await? {
+					0 => break,
+					n => &buffer[..n],
+				};
+				progress
+					.extracted_bytes
+					.fetch_add(data.len() as u64, atomic::Ordering::Relaxed);
+				out.write_all(data)?;
+			}
+			// TODO: extract metadata
+		}
+		MergedNodeData::Symlink { target, .. } => {
+			// symlink, need to create that
+			let target = OsString::from(OsStr::from_bytes(&target));
+			symlink(target, path)?;
+		}
+	};
+	progress
+		.extracted_nodes
+		.fetch_add(1, atomic::Ordering::Relaxed);
+	Ok(())
+}
+
+enum WorkerCommand {
+	Extract {
+		dest_path: String,
+		subtree: Arc<MergedNode>,
+		version: Version,
+		progress: Arc<ExtractProgress>,
+		reply: Box<dyn FnOnce(Result<(), io::Error>) + Send + 'static>,
+	},
+}
+
+fn safescale(v: u64, max: u64) -> usize {
+	assert!(v <= max);
+	if usize::BITS >= u64::BITS {
+		return v as usize;
+	}
+	let mut shift = 0;
+	while (max >> shift) > usize::MAX as u64 {
+		shift += 8;
+	}
+	(v >> shift) as usize
+}
+
+fn fill_versions(table: &mut TableView<VersionItem, VersionColumn>, item: &Arc<MergedNode>) {
+	let total_versions: usize = item.version_groups.values().map(|x| x.versions.len()).sum();
+	let mut items = Vec::with_capacity(item.version_groups.len() + total_versions);
+	for version_group in item.version_groups.values() {
+		items.push(VersionItem::VersionGroup {
+			group: Arc::clone(version_group),
+		});
+	}
+	let has_any = items.len() > 0;
+	table.set_items(items);
+	if has_any {
+		table.set_selected_row(0);
+	}
+}
+
+fn apply_extraction_progress(siv: &mut Cursive, progress: &ExtractProgress, osize: Option<u64>) {
+	let bytes = progress.extracted_bytes.load(atomic::Ordering::Relaxed);
+	siv.call_on_name("extracted_nodes", |tv: &mut TextView| {
+		tv.set_content(
+			progress
+				.extracted_nodes
+				.load(atomic::Ordering::Relaxed)
+				.to_string(),
+		);
+	});
+	siv.call_on_name("extracted_bytes", |tv: &mut TextView| {
+		tv.set_content(format_bytes(bytes));
+	});
+	if let Some(osize) = osize {
+		siv.call_on_name("extract_progress", |pb: &mut ProgressBar| {
+			pb.set_value(safescale(bytes, osize));
+		});
+	}
+}
+
 fn main() -> Result<(), anyhow::Error> {
 	env_logger::init();
 	let mut argv: Vec<String> = args().collect();
@@ -1277,74 +1520,96 @@ fn main() -> Result<(), anyhow::Error> {
 	let mut siv = cursive::Cursive::default();
 
 	let sender = siv.cb_sink().clone();
-
+	let (cmdtx, mut cmdrx) = mpsc::unbounded_channel();
 	{
 		let main = Arc::clone(&main);
 		std::thread::spawn(move || {
 			let t0 = Instant::now();
 			let rt = tokio::runtime::Runtime::new().unwrap();
-			let (mut data, chunk_index) = match rt.block_on(prepare(argv.remove(1), sender.clone()))
-			{
-				Ok(v) => v,
-				Err(e) => {
-					let msg = e.to_string();
-					sender
-						.send(Box::new(|siv: &mut Cursive| {
-							siv.add_layer(Dialog::text(msg).button("Quit", |siv| siv.quit()))
-						}))
-						.unwrap();
-					return;
-				}
-			};
-			rt.shutdown_background();
-			let total_chunk_count = {
-				let lock = chunk_index.lock().unwrap();
-				lock.len()
-			};
-			Main::update_root(Arc::clone(&main), Arc::clone(&data));
-			let t1 = Instant::now();
-			let duration = t1.duration_since(t0);
-			{
-				let data = Arc::clone(&data);
-				sender.send(Box::new(move |siv: &mut Cursive| {
-					siv.call_on_name(
-						"contents",
-						|table: &mut TableView<Arc<MergedNode>, FileListColumn>| {
-							table.set_items(data.children.values().cloned().collect());
-							table.set_selected_row(0);
-						},
-					);
-					siv.call_on_name("statusbar_text", |tv: &mut TextView| {
-						let seconds = duration.as_secs_f64();
-						let minutes = (seconds / 60.0).floor();
-						let seconds = seconds - minutes * 60.0;
-						tv.set_content(format!(
-							"Repository read in {:.0}min {:.2}s",
-							minutes, seconds
-						));
-					});
-					siv.pop_layer();
-					siv.set_fps(1);
-					siv.add_global_callback(Event::Refresh, |siv| {
+			rt.block_on(async move {
+				let (repo, data, chunk_index) = match prepare(argv.remove(1), sender.clone()).await
+				{
+					Ok(v) => v,
+					Err(e) => {
+						let msg = e.to_string();
+						sender
+							.send(Box::new(|siv: &mut Cursive| {
+								siv.add_layer(Dialog::text(msg).button("Quit", |siv| siv.quit()))
+							}))
+							.unwrap();
+						return;
+					}
+				};
+				std::thread::spawn(move || {
+					let total_chunk_count = {
+						let lock = chunk_index.lock().unwrap();
+						lock.len()
+					};
+					Main::update_root(Arc::clone(&main), Arc::clone(&data));
+					let t1 = Instant::now();
+					let duration = t1.duration_since(t0);
+					{
+						let data = Arc::clone(&data);
+						sender.send(Box::new(move |siv: &mut Cursive| {
+							siv.call_on_name(
+								"contents",
+								|table: &mut TableView<Arc<MergedNode>, FileListColumn>| {
+									table.set_items(data.children.values().cloned().collect());
+									table.set_selected_row(0);
+								},
+							);
+							siv.call_on_name("statusbar_text", |tv: &mut TextView| {
+								let seconds = duration.as_secs_f64();
+								let minutes = (seconds / 60.0).floor();
+								let seconds = seconds - minutes * 60.0;
+								tv.set_content(format!(
+									"Repository read in {:.0}min {:.2}s",
+									minutes, seconds
+								));
+							});
+							siv.pop_layer();
+							siv.set_fps(1);
+							siv.add_global_callback(Event::Refresh, |siv| {
+								siv.call_on_name("statusbar_progress", |pb: &mut ProgressBar| {
+									apply_finalisation_progress(pb);
+								});
+							});
+						}));
+					}
+					let total_chunks = data.global_chunk_map(total_chunk_count);
+					data.calculate_sizes_inner(&total_chunks, &chunk_index);
+					drop(total_chunks);
+					drop(chunk_index);
+					sender.send(Box::new(move |siv: &mut Cursive| {
+						siv.set_fps(0);
+						siv.clear_global_callbacks(Event::Refresh);
 						siv.call_on_name("statusbar_progress", |pb: &mut ProgressBar| {
-							apply_finalisation_progress(pb);
+							// ensure this shows 100% when done :-)
+							pb.set_range(0, 1);
+							pb.set_value(1);
 						});
-					});
-				}));
-			}
-			let total_chunks = data.global_chunk_map(total_chunk_count);
-			data.calculate_sizes_inner(&total_chunks, &chunk_index);
-			drop(total_chunks);
-			drop(chunk_index);
-			sender.send(Box::new(move |siv: &mut Cursive| {
-				siv.set_fps(0);
-				siv.clear_global_callbacks(Event::Refresh);
-				siv.call_on_name("statusbar_progress", |pb: &mut ProgressBar| {
-					// ensure this shows 100% when done :-)
-					pb.set_range(0, 1);
-					pb.set_value(1);
+					}));
 				});
-			}));
+				loop {
+					let item = match cmdrx.recv().await {
+						Some(v) => v,
+						None => break,
+					};
+					match item {
+						WorkerCommand::Extract {
+							version,
+							dest_path,
+							subtree,
+							progress,
+							reply,
+						} => {
+							let path = dest_path.into();
+							reply(extract(&repo, &version, subtree, &path, &progress).await);
+						}
+					}
+				}
+			});
+			rt.shutdown_background();
 		});
 	}
 
@@ -1368,27 +1633,44 @@ fn main() -> Result<(), anyhow::Error> {
 
 	{
 		let main = Arc::clone(&main);
-		table.set_on_submit(move |siv: &mut Cursive, row: usize, index: usize| {
+		table.set_on_submit(move |siv: &mut Cursive, _row: usize, index: usize| {
 			let main = Arc::clone(&main);
-			siv.call_on_name(
-				"contents",
-				|table: &mut TableView<Arc<MergedNode>, FileListColumn>| {
-					let item = table.borrow_item(index).unwrap();
-					if item.children.len() > 0 {
-						{
-							let mut lock = main.lock().unwrap();
-							lock.current_parent = Arc::clone(&item);
+			let item = siv
+				.call_on_name(
+					"contents",
+					|table: &mut TableView<Arc<MergedNode>, FileListColumn>| {
+						let item = table.borrow_item(index).unwrap();
+						if item.children.len() > 0 {
+							{
+								let mut lock = main.lock().unwrap();
+								lock.current_parent = Arc::clone(&item);
+							}
+							let items: Vec<_> = item.children.values().cloned().collect();
+							drop(item);
+							let has_any = items.len() > 0;
+							table.set_items(items);
+							if has_any {
+								table.set_selected_row(0);
+								table
+									.borrow_item(table.item().unwrap())
+									.map(|x| Arc::clone(x))
+							} else {
+								None
+							}
+						} else {
+							None
 						}
-						let items: Vec<_> = item.children.values().cloned().collect();
-						drop(item);
-						let has_any = items.len() > 0;
-						table.set_items(items);
-						if has_any {
-							table.set_selected_row(0);
-						}
-					}
-				},
-			);
+					},
+				)
+				.unwrap();
+			if let Some(item) = item {
+				siv.call_on_name(
+					"versions",
+					move |table: &mut TableView<VersionItem, VersionColumn>| {
+						fill_versions(table, &item);
+					},
+				);
+			}
 		});
 	}
 	table.set_on_select(move |siv: &mut Cursive, row: usize, index: usize| {
@@ -1403,21 +1685,15 @@ fn main() -> Result<(), anyhow::Error> {
 		siv.call_on_name(
 			"versions",
 			move |table: &mut TableView<VersionItem, VersionColumn>| {
-				let total_versions: usize =
-					item.version_groups.values().map(|x| x.versions.len()).sum();
-				let mut items = Vec::with_capacity(item.version_groups.len() + total_versions);
-				for version_group in item.version_groups.values() {
-					items.push(VersionItem::VersionGroup {
-						group: Arc::clone(version_group),
-					});
-				}
-				let has_any = items.len() > 0;
-				table.set_items(items);
-				if has_any {
-					table.set_selected_row(0);
-				}
+				fill_versions(table, &item);
 			},
 		);
+	});
+	let mut table = OnEventView::new(table.with_name("contents"));
+	table.set_on_event('x', |siv| {
+		siv.add_layer(Dialog::info(
+			"Select a version from the version table to extract",
+		));
 	});
 
 	/* siv.update_theme(|th| {
@@ -1429,29 +1705,67 @@ fn main() -> Result<(), anyhow::Error> {
 		th.palette[PaletteColor::HighlightText] = Color::Dark(BaseColor::Black);
 	}); */
 	siv.add_global_callback('q', |s| s.quit());
+
+	siv.add_global_callback(cursive::event::Key::F1, |siv| {
+		siv.add_layer(
+			Dialog::new()
+				.title("Help")
+				.content(TextView::new(cursive::utils::markup::markdown::parse(
+					"**Columns**
+
+**#V**  number of unique versions and number of total versions
+**O<**  maximum original size across versions
+**O**   original size in this subtree version
+**D**   deduplicated size of all versions together
+**Ch**  churn: sum of chunks of data only used in this subtree and not used in all versions
+**Us**  usage: sum of chunks only used in this subtree
+**gD**  sum of chunks unique to this subtree version
+**lD**  deduplicated size of this subtree version
+        (ignoring deduplication with data outside this subtree)
+",
+				)))
+				.button("Ok", |siv| {
+					siv.pop_layer();
+				}),
+		);
+	});
+
 	{
 		let main = Arc::clone(&main);
-		siv.add_global_callback(cursive::event::Key::Backspace, move |s| {
+		siv.add_global_callback(cursive::event::Key::Backspace, move |siv| {
 			let main = Arc::clone(&main);
-			s.call_on_name(
-				"contents",
-				move |table: &mut TableView<Arc<MergedNode>, FileListColumn>| {
-					let mut lock = main.lock().unwrap();
-					let old_parent = Arc::clone(&lock.current_parent);
-					if let Some(parent) = old_parent.parent.as_ref().and_then(|x| x.upgrade()) {
-						let items: Vec<_> = parent.children.values().cloned().collect();
-						let selected_index = items
-							.iter()
-							.enumerate()
-							.find(|(_, x)| Arc::ptr_eq(&old_parent, x))
-							.map(|(i, _)| i)
-							.unwrap_or(0);
-						table.set_items(items);
-						lock.current_parent = parent;
-						table.set_selected_item(selected_index);
-					}
-				},
-			);
+			let item = siv
+				.call_on_name(
+					"contents",
+					move |table: &mut TableView<Arc<MergedNode>, FileListColumn>| {
+						let mut lock = main.lock().unwrap();
+						let old_parent = Arc::clone(&lock.current_parent);
+						if let Some(parent) = old_parent.parent.as_ref().and_then(|x| x.upgrade()) {
+							let items: Vec<_> = parent.children.values().cloned().collect();
+							let selected_index = items
+								.iter()
+								.enumerate()
+								.find(|(_, x)| Arc::ptr_eq(&old_parent, x))
+								.map(|(i, _)| i)
+								.unwrap_or(0);
+							table.set_items(items);
+							lock.current_parent = Arc::clone(&parent);
+							table.set_selected_item(selected_index);
+							Some(parent)
+						} else {
+							None
+						}
+					},
+				)
+				.unwrap();
+			if let Some(item) = item {
+				siv.call_on_name(
+					"versions",
+					move |table: &mut TableView<VersionItem, VersionColumn>| {
+						fill_versions(table, &item);
+					},
+				);
+			}
 		});
 	}
 
@@ -1466,16 +1780,145 @@ fn main() -> Result<(), anyhow::Error> {
 		.column(VersionColumn::LocalDsize, "lD", |c| {
 			c.width(6).align(HAlign::Right)
 		});
+	version_table.set_on_submit(move |siv: &mut Cursive, _row: usize, index: usize| {
+		let group = siv
+			.call_on_name(
+				"versions",
+				|table: &mut TableView<VersionItem, VersionColumn>| {
+					Arc::clone(table.borrow_item(index).unwrap().group())
+				},
+			)
+			.unwrap();
+		let subtree = siv
+			.call_on_name(
+				"contents",
+				move |table: &mut TableView<Arc<MergedNode>, FileListColumn>| {
+					Arc::clone(&table.borrow_item(table.item().unwrap()).unwrap())
+				},
+			)
+			.unwrap();
+		let primary_version = &group.versions.get(0).unwrap().name;
+
+		let subtree = Arc::clone(&subtree);
+		let cmdtx = cmdtx.clone();
+		let version = group.versions[0].clone();
+		let group = Arc::clone(&group);
+		let extract = move |siv: &mut Cursive, s: &str| {
+			let progress = Arc::new(ExtractProgress {
+				extracted_nodes: AtomicU64::new(0),
+				extracted_bytes: AtomicU64::new(0),
+			});
+			siv.pop_layer();
+			let osize = if group.sizes_done.load(atomic::Ordering::Acquire) {
+				Some(group.osize.load(atomic::Ordering::Relaxed))
+			} else {
+				None
+			};
+			let mut progress_layout = LinearLayout::vertical()
+				.child(
+					LinearLayout::horizontal()
+						.child(TextView::new("Items:"))
+						.child(
+							TextView::new("0")
+								.h_align(HAlign::Right)
+								.with_name("extracted_nodes")
+								.fixed_width(20),
+						),
+				)
+				.child(
+					LinearLayout::horizontal()
+						.child(TextView::new("Size: "))
+						.child(
+							TextView::new("0")
+								.h_align(HAlign::Right)
+								.with_name("extracted_bytes")
+								.fixed_width(20),
+						),
+				);
+			if let Some(osize) = osize {
+				progress_layout.add_child(
+					ProgressBar::new()
+						.min(0)
+						.max(safescale(osize, osize))
+						.with_name("extract_progress"),
+				);
+			}
+			let progress_dialog = Dialog::new()
+				.title("Extracting...")
+				.content(progress_layout)
+				.with_name("extract_dialog");
+			siv.add_layer(progress_dialog);
+			siv.set_fps(1);
+			{
+				let progress = Arc::clone(&progress);
+				siv.add_global_callback(Event::Refresh, move |siv| {
+					apply_extraction_progress(siv, &progress, osize);
+				});
+			}
+
+			// now we actually have to EXTRACT things *gasp*
+			let ch = siv.cb_sink().clone();
+			cmdtx.send(WorkerCommand::Extract {
+				dest_path: s.into(),
+				version: version.clone(),
+				subtree: Arc::clone(&subtree),
+				progress: Arc::clone(&progress),
+				reply: Box::new(move |result| {
+					ch.send(Box::new(move |siv: &mut Cursive| {
+						siv.set_fps(0);
+						siv.clear_global_callbacks(Event::Refresh);
+						match result {
+							Ok(()) => {
+								apply_extraction_progress(siv, &progress, osize);
+								siv.call_on_name("extract_dialog", |d: &mut Dialog| {
+									d.add_button("Close", |siv| {
+										siv.pop_layer();
+									});
+								});
+							}
+							Err(e) => {
+								siv.pop_layer();
+								siv.add_layer(
+									Dialog::new()
+										.title("Extraction failed")
+										.content(TextView::new(e.to_string()))
+										.dismiss_button("Close"),
+								);
+							}
+						}
+					}));
+				}),
+			});
+		};
+
+		let destination_picker = Dialog::new()
+			.title("Extract files")
+			.content(
+				LinearLayout::vertical()
+					.child(TextView::new("Extract to"))
+					.child(
+						EditView::new()
+							.content(format!("./{}", primary_version))
+							.on_submit(extract.clone())
+							.with_name("extract_to"),
+					),
+			)
+			.button("Ok", move |siv| {
+				let s = siv
+					.call_on_name("extract_to", |edit: &mut EditView| edit.get_content())
+					.unwrap();
+				extract(siv, s.as_str());
+			})
+			.dismiss_button("Cancel");
+		siv.add_layer(destination_picker);
+	});
+	let version_table = OnEventView::new(version_table.with_name("versions"));
 
 	siv.add_fullscreen_layer(
 		LinearLayout::new(Orientation::Vertical)
+			.child(Panel::new(table).title("Repository contents").full_height())
 			.child(
-				Panel::new(table.with_name("contents"))
-					.title("Repository contents")
-					.full_height(),
-			)
-			.child(
-				Panel::new(version_table.with_name("versions"))
+				Panel::new(version_table)
 					.title("File versions")
 					.full_height(),
 			)

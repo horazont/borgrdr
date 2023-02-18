@@ -256,6 +256,10 @@ impl Chunk {
 	}
 }
 
+fn empty_bytes_hashmap() -> HashMap<Bytes, Bytes> {
+	HashMap::new()
+}
+
 // TODOC: names!
 #[derive(Deserialize, Debug)]
 pub struct ArchiveItem {
@@ -270,6 +274,10 @@ pub struct ArchiveItem {
 	mtime: Option<i64>,
 	birthtime: Option<i64>,
 	size: Option<u64>,
+	acl_access: Option<Bytes>,
+	acl_default: Option<Bytes>,
+	#[serde(default = "empty_bytes_hashmap")]
+	xattrs: HashMap<Bytes, Bytes>,
 	chunks: Option<Vec<Chunk>>,
 }
 
@@ -320,5 +328,21 @@ impl ArchiveItem {
 
 	pub fn chunks(&self) -> &[Chunk] {
 		self.chunks.as_ref().map(|x| &x[..]).unwrap_or(&[])
+	}
+
+	pub fn acl_access(&self) -> Option<Bytes> {
+		self.acl_access.clone()
+	}
+
+	pub fn acl_default(&self) -> Option<Bytes> {
+		self.acl_default.clone()
+	}
+
+	pub fn xattrs(&self) -> &HashMap<Bytes, Bytes> {
+		&self.xattrs
+	}
+
+	pub fn into_xattrs(self) -> HashMap<Bytes, Bytes> {
+		self.xattrs
 	}
 }

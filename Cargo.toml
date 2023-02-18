@@ -38,13 +38,15 @@ env_logger = "^0.9"
 bincode = "^1"
 url = "^2"
 
-cursive = { version = "^0.20", optional = true }
+smartstring = { version = "^1", optional = true }
+cursive = { version = "^0.20", optional = true, features = ["markdown"] }
 cursive_tree_view = { version = "^0.8", optional = true }
 cursive_table_view = { version = "^0.14", optional = true, path = "../cursive_table_view" }
+async-recursion = { version = "^1", optional = true }
 
 [features]
 default = []
-cursive = ["cursive_tree_view", "dep:cursive", "cursive_table_view"]
+cursive = ["cursive_tree_view", "dep:cursive", "cursive_table_view", "dep:smartstring", "dep:async-recursion"]
 
 [[bin]]
 name = "du"
