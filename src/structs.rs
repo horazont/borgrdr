@@ -279,6 +279,7 @@ pub struct ArchiveItem {
 	#[serde(default = "empty_bytes_hashmap")]
 	xattrs: HashMap<Bytes, Bytes>,
 	chunks: Option<Vec<Chunk>>,
+	source: Option<Bytes>,
 }
 
 impl ArchiveItem {
@@ -344,5 +345,9 @@ impl ArchiveItem {
 
 	pub fn into_xattrs(self) -> HashMap<Bytes, Bytes> {
 		self.xattrs
+	}
+
+	pub fn source(&self) -> Option<Bytes> {
+		self.source.clone()
 	}
 }

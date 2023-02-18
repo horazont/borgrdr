@@ -1,3 +1,4 @@
+use std::borrow::Cow;
 use std::cmp::Ordering;
 use std::collections::hash_map::Entry;
 use std::collections::{HashMap, HashSet};
@@ -98,6 +99,13 @@ fn convert_ts(ts: i64) -> DateTime<Utc> {
 	let secs = ts / 1000000000;
 	let nanos = (ts % 1000000000) as u32;
 	Utc.timestamp(secs, nanos)
+}
+
+fn back_to_ts<'x>(v: &'x Result<DateTime<Utc>, String>) -> Cow<'x, str> {
+	match v {
+		Ok(v) => v.to_rfc3339().into(),
+		Err(e) => e.as_str().into(),
+	}
 }
 
 impl From<&ArchiveItem> for Times {
@@ -235,7 +243,7 @@ impl TryFrom<ArchiveItem> for FileEntry {
 		} else if mode == 0o120000 {
 			// is symlink
 			FileData::Symlink {
-				target_path: Bytes::new(),
+				target_path: other.source().expect("symlink without source!"),
 			}
 		} else if mode == 0o100000 {
 			// is regular
@@ -1110,7 +1118,11 @@ impl VersionItem {
 		column: VersionColumn,
 	) -> Ordering {
 		let order = match column {
-			VersionColumn::Name => a.versions.len().cmp(&b.versions.len()),
+			VersionColumn::Name => {
+				let a_ts = a.versions.iter().map(|x| back_to_ts(&x.timestamp)).min();
+				let b_ts = b.versions.iter().map(|x| back_to_ts(&x.timestamp)).min();
+				a_ts.cmp(&b_ts)
+			}
 			VersionColumn::OriginalSize => a
 				.osize
 				.load(atomic::Ordering::Relaxed)
@@ -1381,6 +1393,7 @@ impl Main {
 }
 
 struct ExtractProgress {
+	cancel_flag: AtomicBool,
 	extracted_nodes: AtomicU64,
 	extracted_bytes: AtomicU64,
 }
@@ -1392,14 +1405,19 @@ async fn extract(
 	subtree: Arc<MergedNode>,
 	dest_path: &OsString,
 	progress: &ExtractProgress,
-) -> io::Result<()> {
+) -> Result<bool, anyhow::Error> {
 	let v = match subtree.version_group_of(&version) {
 		None => {
 			// there is nothing here in this version, skip
-			return Ok(());
+			return Ok(true);
 		}
 		Some(v) => v,
 	};
+	if subtree.name == b".." || subtree.name == b"." {
+		// we refuse to extract these!
+		// .. silently ..
+		return Ok(true);
+	}
 	let name = OsStr::from_bytes(&subtree.name);
 	let mut path = dest_path.clone();
 	// TODO: use MAIN_SEPARATOR_STR once it stabilizes
@@ -1407,47 +1425,63 @@ async fn extract(
 	buf.push(MAIN_SEPARATOR);
 	path.push(&buf);
 	path.push(&name);
-	tokio::time::sleep(std::time::Duration::from_millis(500)).await;
 	match &v.data {
 		MergedNodeData::Directory {} => {
 			// directory, we need to mkdir, and then recurse
-			std::fs::create_dir(&path)?;
+			std::fs::create_dir(&path)
+				.with_context(|| format!("creating output directory: {:?}", path))?;
 			for (_, node) in subtree.children.iter() {
-				extract(repo, version, Arc::clone(node), &path, progress).await?;
+				if !extract(repo, version, Arc::clone(node), &path, progress).await? {
+					// cancelled
+					return Ok(false);
+				}
 			}
 			// TODO: extract metadata
 		}
 		MergedNodeData::Regular { chunks, .. } => {
 			// file, we need to extract
-			let mut out = std::fs::File::options()
-				.read(true)
-				.write(true)
-				.create_new(true)
-				.open(&path)?;
-			let mut reader = repo.open_stream(chunks.clone())?;
+			let mut out = std::fs::File::create(&path)?;
+			if progress.cancel_flag.load(atomic::Ordering::Relaxed) {
+				return Ok(false);
+			}
+			let mut reader = repo
+				.open_stream(chunks.clone())
+				.with_context(|| format!("opening source stream for {:?}", path))?;
 			let mut buffer = Box::new([0u8; 8192]);
 			loop {
-				let data = match reader.read(&mut buffer[..]).await? {
+				if progress.cancel_flag.load(atomic::Ordering::Relaxed) {
+					return Ok(false);
+				}
+				let data = match reader
+					.read(&mut buffer[..])
+					.await
+					.with_context(|| format!("reading source data for {:?}", path))?
+				{
 					0 => break,
 					n => &buffer[..n],
 				};
 				progress
 					.extracted_bytes
 					.fetch_add(data.len() as u64, atomic::Ordering::Relaxed);
-				out.write_all(data)?;
+				out.write_all(data)
+					.with_context(|| format!("writing data to {:?}", path))?;
 			}
 			// TODO: extract metadata
 		}
 		MergedNodeData::Symlink { target, .. } => {
 			// symlink, need to create that
 			let target = OsString::from(OsStr::from_bytes(&target));
-			symlink(target, path)?;
+			symlink(&target, &path)
+				.with_context(|| format!("creating symlink to {:?} at {:?}", target, path))?;
 		}
 	};
 	progress
 		.extracted_nodes
 		.fetch_add(1, atomic::Ordering::Relaxed);
-	Ok(())
+	if progress.cancel_flag.load(atomic::Ordering::Relaxed) {
+		return Ok(false);
+	}
+	Ok(true)
 }
 
 enum WorkerCommand {
@@ -1456,7 +1490,7 @@ enum WorkerCommand {
 		subtree: Arc<MergedNode>,
 		version: Version,
 		progress: Arc<ExtractProgress>,
-		reply: Box<dyn FnOnce(Result<(), io::Error>) + Send + 'static>,
+		reply: Box<dyn FnOnce(Result<bool, anyhow::Error>) + Send + 'static>,
 	},
 }
 
@@ -1531,7 +1565,7 @@ fn main() -> Result<(), anyhow::Error> {
 				{
 					Ok(v) => v,
 					Err(e) => {
-						let msg = e.to_string();
+						let msg = format!("{:#}", e);
 						sender
 							.send(Box::new(|siv: &mut Cursive| {
 								siv.add_layer(Dialog::text(msg).button("Quit", |siv| siv.quit()))
@@ -1551,13 +1585,26 @@ fn main() -> Result<(), anyhow::Error> {
 					{
 						let data = Arc::clone(&data);
 						sender.send(Box::new(move |siv: &mut Cursive| {
-							siv.call_on_name(
-								"contents",
-								|table: &mut TableView<Arc<MergedNode>, FileListColumn>| {
-									table.set_items(data.children.values().cloned().collect());
-									table.set_selected_row(0);
-								},
-							);
+							let item = siv
+								.call_on_name(
+									"contents",
+									|table: &mut TableView<Arc<MergedNode>, FileListColumn>| {
+										table.set_items(data.children.values().cloned().collect());
+										table.set_selected_row(0);
+										table
+											.borrow_item(table.item().unwrap_or(0))
+											.map(|x| Arc::clone(x))
+									},
+								)
+								.unwrap();
+							if let Some(item) = item {
+								siv.call_on_name(
+									"versions",
+									move |table: &mut TableView<VersionItem, VersionColumn>| {
+										fill_versions(table, &item);
+									},
+								);
+							}
 							siv.call_on_name("statusbar_text", |tv: &mut TextView| {
 								let seconds = duration.as_secs_f64();
 								let minutes = (seconds / 60.0).floor();
@@ -1805,6 +1852,7 @@ fn main() -> Result<(), anyhow::Error> {
 		let group = Arc::clone(&group);
 		let extract = move |siv: &mut Cursive, s: &str| {
 			let progress = Arc::new(ExtractProgress {
+				cancel_flag: AtomicBool::new(false),
 				extracted_nodes: AtomicU64::new(0),
 				extracted_bytes: AtomicU64::new(0),
 			});
@@ -1843,10 +1891,16 @@ fn main() -> Result<(), anyhow::Error> {
 						.with_name("extract_progress"),
 				);
 			}
-			let progress_dialog = Dialog::new()
-				.title("Extracting...")
-				.content(progress_layout)
-				.with_name("extract_dialog");
+			let progress_dialog = {
+				let progress = Arc::clone(&progress);
+				Dialog::new()
+					.title("Extracting...")
+					.content(progress_layout)
+					.button("Cancel", move |_| {
+						progress.cancel_flag.store(true, atomic::Ordering::Relaxed)
+					})
+					.with_name("extract_dialog")
+			};
 			siv.add_layer(progress_dialog);
 			siv.set_fps(1);
 			{
@@ -1868,9 +1922,10 @@ fn main() -> Result<(), anyhow::Error> {
 						siv.set_fps(0);
 						siv.clear_global_callbacks(Event::Refresh);
 						match result {
-							Ok(()) => {
+							Ok(_) => {
 								apply_extraction_progress(siv, &progress, osize);
 								siv.call_on_name("extract_dialog", |d: &mut Dialog| {
+									d.clear_buttons();
 									d.add_button("Close", |siv| {
 										siv.pop_layer();
 									});
@@ -1891,25 +1946,79 @@ fn main() -> Result<(), anyhow::Error> {
 			});
 		};
 
-		let destination_picker = Dialog::new()
-			.title("Extract files")
-			.content(
-				LinearLayout::vertical()
-					.child(TextView::new("Extract to"))
-					.child(
-						EditView::new()
-							.content(format!("./{}", primary_version))
-							.on_submit(extract.clone())
-							.with_name("extract_to"),
-					),
-			)
-			.button("Ok", move |siv| {
-				let s = siv
-					.call_on_name("extract_to", |edit: &mut EditView| edit.get_content())
-					.unwrap();
-				extract(siv, s.as_str());
-			})
-			.dismiss_button("Cancel");
+		let try_extract =
+			move |siv: &mut Cursive, s: Rc<String>| match std::fs::metadata(s.as_str()) {
+				Ok(metadata) if metadata.is_dir() => {
+					extract(siv, s.as_str());
+				}
+				Ok(_) => {
+					siv.add_layer(
+						Dialog::new()
+							.title("Error")
+							.content(TextView::new("Output path exists, but is not a directory"))
+							.dismiss_button("Ok"),
+					);
+				}
+				Err(e) if e.kind() == io::ErrorKind::NotFound => {
+					let extract = extract.clone();
+					siv.add_layer(
+						Dialog::new()
+							.title("Create output directory?")
+							.content(TextView::new("Output directory does not exist.\nCreate?"))
+							.button("No", |siv| {
+								siv.pop_layer();
+							})
+							.button("Yes", move |siv| match std::fs::create_dir(s.as_str()) {
+								Ok(_) => {
+									siv.pop_layer();
+									extract(siv, s.as_str());
+								}
+								Err(e) => {
+									siv.pop_layer();
+									siv.add_layer(
+										Dialog::new()
+											.title("Error")
+											.content(TextView::new(e.to_string()))
+											.dismiss_button("Ok"),
+									);
+								}
+							}),
+					);
+				}
+				Err(e) => {
+					siv.add_layer(
+						Dialog::new()
+							.title("Error")
+							.content(TextView::new("Cannot access output path"))
+							.dismiss_button("Ok"),
+					);
+				}
+			};
+
+		let destination_picker = {
+			let try_extract_on_submit = try_extract.clone();
+			Dialog::new()
+				.title("Extract files")
+				.content(
+					LinearLayout::vertical()
+						.child(TextView::new("Extract to"))
+						.child(
+							EditView::new()
+								.content(format!("./{}", primary_version))
+								.on_submit(move |siv, s| {
+									try_extract_on_submit(siv, Rc::new(s.to_string()))
+								})
+								.with_name("extract_to"),
+						),
+				)
+				.button("Ok", move |siv| {
+					let s = siv
+						.call_on_name("extract_to", |edit: &mut EditView| edit.get_content())
+						.unwrap();
+					try_extract(siv, s);
+				})
+				.dismiss_button("Cancel")
+		};
 		siv.add_layer(destination_picker);
 	});
 	let version_table = OnEventView::new(version_table.with_name("versions"));
