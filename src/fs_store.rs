@@ -121,8 +121,13 @@ impl FsStore {
 		let latest_segment = Self::find_latest_segment(&root).map_err(Error::InaccessibleIndex)?;
 		let mut index = root.clone();
 		index.push(format!("index.{}", latest_segment));
-		let on_disk_index =
-			Some(MmapSegmentIndex::open(&index).expect("failed to open on-disk index"));
+		let on_disk_index = match std::env::var("BORGRDR_SKIP_INDEX")
+			.as_ref()
+			.map(|x| x.as_str())
+		{
+			Ok("yes") | Ok("true") | Ok("1") => None,
+			_ => Some(MmapSegmentIndex::open(&index).expect("failed to open on-disk index")),
+		};
 
 		Ok(Self {
 			root,
