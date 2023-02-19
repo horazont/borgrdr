@@ -211,13 +211,12 @@ impl<'x> Iterator for MmapKeyIterator<'x> {
 	fn next(&mut self) -> Option<Self::Item> {
 		let data = self.hashindex.data();
 		for index in &mut self.inner {
-			let entry = data[index];
+			let entry = &data[index];
 			if entry.is_empty() || entry.is_deleted() {
 				continue;
 			}
 			if !entry.is_deleted() {
-				// cannot return &entry.key for some reason, borrowck doesn't like that
-				return Some(&data[index].key);
+				return Some(&entry.key);
 			}
 		}
 		None

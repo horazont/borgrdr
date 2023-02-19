@@ -14,7 +14,7 @@ use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::sync::{mpsc, oneshot, RwLock};
 use tokio::time::{sleep_until, Duration, Instant};
 
-use tokio_util::codec;
+use tokio_util::codec::{self, Encoder, Decoder};
 
 use bytes::Bytes;
 
@@ -569,7 +569,7 @@ impl RpcWorkerConfig {
 		let (tx, rx) = codec::Framed::new(channel, BincodeCodec::new()).split();
 		let (request_tx, request_rx) = mpsc::channel(self.request_queue_size);
 		let (message_tx, message_rx) = mpsc::channel(self.message_queue_size);
-		let worker = RpcWorker {
+		let worker = RpcWorker::<T, std::convert::Infallible, RpcItem, DefaultBincodeCodec<RpcItem>, RpcItem, DefaultBincodeCodec<RpcItem>> {
 			tx,
 			rx,
 			next_id: 0,
@@ -582,6 +582,41 @@ impl RpcWorkerConfig {
 		};
 		let join_handle = tokio::spawn(worker.run());
 		(join_handle, request_tx, message_rx)
+	}
+
+	pub(super) async fn spawn_borg<T: AsyncRead + AsyncWrite + Send + Unpin + 'static>(
+		self,
+		channel: T,
+		repository_path: String,
+	) -> io::Result<(
+		tokio::task::JoinHandle<()>,
+		mpsc::Sender<RpcWorkerCommand>,
+		mpsc::Receiver<RpcWorkerMessage>,
+	)> {
+		use super::borg::{BorgRpcRequest, BorgRpcResponse, borg_open};
+		use crate::rmp_codec::AsymMpCodec;
+		let mut ch = codec::Framed::new(channel, AsymMpCodec::new());
+		let (request_tx, request_rx) = mpsc::channel(self.request_queue_size);
+		let (message_tx, message_rx) = mpsc::channel(self.message_queue_size);
+
+		// before we spawn the worker, we have to open the repository
+		borg_open(&mut ch, repository_path).await?;
+
+		let (tx, rx) = ch.split();
+
+		let worker = RpcWorker::<T, RpcInterfaceError, BorgRpcRequest, AsymMpCodec<BorgRpcRequest, BorgRpcResponse>, BorgRpcResponse, AsymMpCodec<BorgRpcRequest, BorgRpcResponse>> {
+			tx,
+			rx,
+			next_id: 0,
+			request_rx,
+			message_tx,
+			response_handlers: HashMap::new(),
+			message_handlers: HashMap::new(),
+			request_workers: RequestWorkers::new(),
+			name: self.name,
+		};
+		let join_handle = tokio::spawn(worker.run());
+		Ok((join_handle, request_tx, message_rx))
 	}
 }
 
@@ -624,15 +659,36 @@ impl From<&ErrorGenerator> for io::Error {
 	}
 }
 
+pub(super) enum RpcInterfaceError {
+	UnsupportedIgnore(RpcItem),
+	UnsupportedFail(RpcItem),
+}
+
 macro_rules! handle_tx {
 	(($name:expr, $obj:expr) => $tx:expr => {
 		Ok($okv:pat_param) => $ok:expr,
 		Err($errv:pat_param) => $err:expr => break,
 	}) => {
 		trace!("{}: tx: {}", $name, $obj);
-		match $tx.send($obj).await.map_err(ErrorGenerator::send) {
-			Ok($okv) => $ok,
-			Err(e) => {
+		match $obj.try_into().map_err(|x: TE| x.into()) {
+			Ok(v) => {
+				match $tx.send(v).await.map_err(ErrorGenerator::send) {
+					Ok($okv) => $ok,
+					Err(e) => {
+						{
+							let $errv = &e;
+							$err;
+						}
+						break Err(e);
+					}
+				}
+			},
+			Err(RpcInterfaceError::UnsupportedIgnore(v)) => {
+				trace!("{}: transmission of {} not supported, dropping", $name, v);
+				$ok
+			},
+			Err(RpcInterfaceError::UnsupportedFail(v)) => {
+				let e = ErrorGenerator::send(io::Error::new(io::ErrorKind::InvalidInput, format!("{} cannot be sent over transport", v)));
 				{
 					let $errv = &e;
 					$err;
@@ -651,9 +707,15 @@ macro_rules! fulfill_reply {
 	};
 }
 
-struct RpcWorker<T: AsyncRead + AsyncWrite> {
-	tx: SplitSink<codec::Framed<T, DefaultBincodeCodec<RpcItem>>, RpcItem>,
-	rx: SplitStream<codec::Framed<T, DefaultBincodeCodec<RpcItem>>>,
+impl From<std::convert::Infallible> for RpcInterfaceError {
+	fn from(_other: std::convert::Infallible) -> Self {
+		unreachable!();
+	}
+}
+
+struct RpcWorker<T: AsyncRead + AsyncWrite, TE: Into<RpcInterfaceError>, TX: TryFrom<RpcItem, Error = TE>, ENC: Encoder<TX, Error = io::Error>, RX: Into<RpcItem>, DEC: Decoder<Item = RX, Error = io::Error>> {
+	tx: SplitSink<codec::Framed<T, ENC>, TX>,
+	rx: SplitStream<codec::Framed<T, DEC>>,
 	next_id: RequestId,
 	request_rx: mpsc::Receiver<RpcWorkerCommand>,
 	message_tx: mpsc::Sender<RpcWorkerMessage>,
@@ -663,7 +725,7 @@ struct RpcWorker<T: AsyncRead + AsyncWrite> {
 	name: String,
 }
 
-impl<T: AsyncRead + AsyncWrite> RpcWorker<T> {
+impl<T: AsyncRead + AsyncWrite, TE: Into<RpcInterfaceError>, TX: TryFrom<RpcItem, Error = TE>, ENC: Encoder<TX, Error = io::Error>, RX: Into<RpcItem>, DEC: Decoder<Item = RX, Error = io::Error>> RpcWorker<T, TE, TX, ENC, RX, DEC> {
 	fn generate_next_id(&mut self) -> RequestId {
 		loop {
 			let id = self.next_id;
@@ -683,6 +745,14 @@ impl<T: AsyncRead + AsyncWrite> RpcWorker<T> {
 
 	fn rx_deadline() -> Instant {
 		Instant::now() + Duration::new(120, 0)
+	}
+
+	fn disabled_tx_deadline() -> Instant {
+		Instant::now() + Duration::new(3600, 0)
+	}
+
+	fn disabled_rx_deadline() -> Instant {
+		Instant::now() + Duration::new(7200, 0)
 	}
 
 	fn drain_with_error(mut self, e: &ErrorGenerator) {
@@ -721,61 +791,82 @@ impl<T: AsyncRead + AsyncWrite> RpcWorker<T> {
 		// 2. Exchange requests/messages/responses
 		// 3. Send goodbye
 
-		debug!("{}: sending hello", self.name);
-		match self.tx.send(RpcItem::Hello).await {
-			Ok(()) => (),
-			Err(e) => {
-				self.drain_with_error(&ErrorGenerator::handshake(e));
-				return;
-			}
-		};
 		// send heartbeat immediately after receiving the handshake
 		let tx_timeout = sleep_until(Instant::now());
 		tokio::pin!(tx_timeout);
-		match self.rx.next().await {
-			Some(Ok(RpcItem::Hello)) => (),
-			None => {
-				let e = io::Error::new(io::ErrorKind::UnexpectedEof, "no Hello received");
-				self.drain_with_error(&ErrorGenerator::handshake(e));
-				return;
+		match RpcItem::Hello.try_into() {
+			Ok(hello) => {
+				debug!("{}: sending hello", self.name);
+				match self.tx.send(hello).await {
+					Ok(()) => (),
+					Err(e) => {
+						self.drain_with_error(&ErrorGenerator::handshake(e));
+						return;
+					}
+				};
+				match self.rx.next().await.map(|x| x.map(|x| x.into())) {
+					Some(Ok(RpcItem::Hello)) => (),
+					None => {
+						let e = io::Error::new(io::ErrorKind::UnexpectedEof, "no Hello received");
+						self.drain_with_error(&ErrorGenerator::handshake(e));
+						return;
+					}
+					Some(Ok(_)) => {
+						let e = io::Error::new(
+							io::ErrorKind::InvalidData,
+							"unexpected message during handshake",
+						);
+						self.drain_with_error(&ErrorGenerator::handshake(e));
+						return;
+					}
+					Some(Err(e)) => {
+						self.drain_with_error(&ErrorGenerator::handshake(e));
+						return;
+					}
+				};
 			}
-			Some(Ok(_)) => {
-				let e = io::Error::new(
-					io::ErrorKind::InvalidData,
-					"unexpected message during handshake",
-				);
-				self.drain_with_error(&ErrorGenerator::handshake(e));
-				return;
+			Err(_) => {
+				debug!("{}: hello not supported by transport, skipping", self.name);
 			}
-			Some(Err(e)) => {
-				self.drain_with_error(&ErrorGenerator::handshake(e));
-				return;
-			}
-		};
+		}
 		let rx_timeout = sleep_until(Self::rx_deadline());
 		tokio::pin!(rx_timeout);
+		let mut heartbeats_supported = true;
 
 		debug!("{}: handshake complete", self.name);
 		// Hellos are now exchanged successfully, we can enter the main item exchange
 		let result: StdResult<(), ErrorGenerator> = loop {
 			tokio::select! {
 				// tx timeout: every 45s of silence, we send a Heartbeat
-				_ = &mut tx_timeout => {
-					match self.tx.send(RpcItem::Heartbeat).await {
-						Ok(_) => (),
-						Err(e) => break Err(ErrorGenerator::send(e)),
-					};
-					tx_timeout.as_mut().reset(Self::tx_deadline());
+				_ = &mut tx_timeout, if heartbeats_supported => {
+					match RpcItem::Heartbeat.try_into() {
+						Ok(heartbeat) => {
+							match self.tx.send(heartbeat).await {
+								Ok(_) => (),
+								Err(e) => break Err(ErrorGenerator::send(e)),
+							};
+							tx_timeout.as_mut().reset(Self::tx_deadline());
+						}
+						// if heartbeats are not supported, we disable all timeouts
+						Err(_) => {
+							debug!("{}: heartbeats not supported, disabling all timeouts", self.name);
+							heartbeats_supported = false;
+							tx_timeout.as_mut().reset(Self::disabled_tx_deadline());
+							rx_timeout.as_mut().reset(Self::disabled_rx_deadline());
+						}
+					}
 				}
 
 				// rx timeout: every 120s at least we expect to hear from our partner
 				// if we do not, that's an rx timeout, which is fatal
-				_ = &mut rx_timeout => {
+				// NOTE: the rx_timeout is set into the very far future by the tx_timeout handler if heartbaets are not supported
+				_ = &mut rx_timeout, if heartbeats_supported => {
 					break Err(ErrorGenerator::receive(io::Error::new(io::ErrorKind::TimedOut, "receive timeout elapsed")));
 				}
 
 				// received item (message) from peer
 				item = self.rx.next() => {
+					let item = item.map(|x| x.map(|x| x.into()));
 					// advance receive timeout -- as long as data is pouring in, we don't care about round-trip times
 					rx_timeout.as_mut().reset(Self::rx_deadline());
 					if let Some(Ok(item)) = item.as_ref() {
@@ -916,12 +1007,18 @@ impl<T: AsyncRead + AsyncWrite> RpcWorker<T> {
 		let errgen = match result {
 			Ok(()) => {
 				// we try to send a Goodbye message, and if we don't succeed, that changes the error state'
-				self.tx
-					.send(RpcItem::Goodbye)
-					.await
-					.map_err(ErrorGenerator::send)
-					.err()
-					.unwrap_or(ErrorGenerator::LocalShutdown)
+				match RpcItem::Goodbye.try_into() {
+					Ok(v) => {
+						self.tx
+							.send(v)
+							.await
+							.map_err(ErrorGenerator::send)
+					}
+					// if unsupported, ignore
+					Err(_) => Ok(()),
+				}
+							.err()
+							.unwrap_or(ErrorGenerator::LocalShutdown)
 			}
 			Err(e) => e,
 		};

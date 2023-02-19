@@ -133,6 +133,7 @@ dependencies = [
  "num_enum",
  "pin-project-lite",
  "ring",
+ "rmp",
  "rmp-serde",
  "rmpv",
  "rust-lzma",

@@ -108,10 +108,10 @@ impl AsyncWrite for ChildStdio {
 	}
 }
 
-pub async fn open_stdio_repository<S: AsRef<OsStr>, I: IntoIterator<Item = S>>(
+async fn open_stdio<S: AsRef<OsStr>, I: IntoIterator<Item = S>>(
 	command: impl AsRef<OsStr>,
 	argv: I,
-) -> io::Result<(Child, Repository<RpcStoreClient>)> {
+) -> io::Result<(Child, ChildStdio)> {
 	let mut cmd = Command::new(command.as_ref());
 	cmd.args(argv)
 		.stdin(std::process::Stdio::piped())
@@ -121,11 +121,33 @@ pub async fn open_stdio_repository<S: AsRef<OsStr>, I: IntoIterator<Item = S>>(
 		stdin: server.stdin.take().unwrap(),
 		stdout: server.stdout.take().unwrap(),
 	};
+	Ok((server, clientside))
+}
+
+pub async fn open_stdio_repository<S: AsRef<OsStr>, I: IntoIterator<Item = S>>(
+	command: impl AsRef<OsStr>,
+	argv: I,
+) -> io::Result<(Child, Repository<RpcStoreClient>)> {
+	let (server, clientside) = open_stdio(command, argv).await?;
 	let store = RpcStoreClient::new(clientside);
 	Ok((
 		server,
 		Repository::open(store, Box::new(EnvPassphrase::new())).await?,
 	))
+}
+
+pub async fn open_borg_repository(
+	repository_path: PathBuf,
+) -> io::Result<(Child, Repository<RpcStoreClient>)> {
+	let repository_path = repository_path.to_str().expect("valid utf-8 path").to_string();
+	let executable = match var_os("BORG_REMOTE_PATH") {
+		Some(v) => v,
+		None => "borg".into(),
+	};
+	let argv = vec!["serve"];
+	let (server, clientside) = open_stdio(&executable, argv).await?;
+	let store = RpcStoreClient::new_borg(clientside, repository_path).await?;
+	Ok((server, Repository::open(store, Box::new(EnvPassphrase::new())).await?))
 }
 
 pub async fn open_ssh(
@@ -159,7 +181,8 @@ pub async fn open_url_str(url: &str) -> io::Result<(Box<dyn Backend>, Repository
 	};
 
 	match url.scheme() {
-		"ssh" => {
+		"ssh" | "ssh+borg" => {
+			let borg_mode = url.scheme().ends_with("+borg");
 			let host = match url.host_str() {
 				Some(v) => v,
 				None => {
@@ -178,6 +201,19 @@ pub async fn open_url_str(url: &str) -> io::Result<(Box<dyn Backend>, Repository
 			connect_str.push_str(host);
 
 			let (backend, repo) = open_ssh(connect_str, url.path()).await?;
+			Ok((Box::new(backend), repo))
+		}
+		"file+borg" => {
+			let path = match url.to_file_path() {
+				Ok(v) => v,
+				Err(_) => {
+					return Err(io::Error::new(
+						io::ErrorKind::InvalidInput,
+						format!("invalid file URL: {}", url),
+					))
+				}
+			};
+			let (backend, repo) = open_borg_repository(path).await?;
 			Ok((Box::new(backend), repo))
 		}
 		"file" => {

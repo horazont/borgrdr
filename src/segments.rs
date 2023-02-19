@@ -1,6 +1,7 @@
 use std::borrow::Cow;
 use std::fmt;
 use std::io;
+use std::str::FromStr;
 
 use serde::{Deserialize, Serialize};
 use serde_with::{serde_as, Bytes};
@@ -34,6 +35,28 @@ impl fmt::Debug for Id {
 			}
 		}
 		write!(f, "_id")
+	}
+}
+
+impl FromStr for Id {
+	type Err = ();
+
+	fn from_str(s: &str) -> Result<Self, Self::Err> {
+		if s.len() != 64 {
+			return Err(());
+		}
+
+		let mut result = [0u8; 32];
+		for i in 0..32 {
+			let byte_str = &s[i * 2..i * 2 + 2];
+			let byte = match u8::from_str_radix(byte_str, 16) {
+				Ok(v) => v,
+				Err(_) => return Err(()),
+			};
+			result[i] = byte;
+		}
+
+		Ok(Self(result))
 	}
 }
 

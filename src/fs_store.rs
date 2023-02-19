@@ -227,6 +227,9 @@ impl FsStore {
 	fn search_object(&self, id: &Id) -> io::Result<Option<Bytes>> {
 		trace!("starting exhaustive search for {:?}", id);
 		let mut lock = self.segment_cache.write().unwrap();
+		// TODO: we should ignore everything before the first commit we
+		// encounter... and we should also read the segment files themselves
+		// in reverse order, I guess.
 		for item in self.iter_segment_files()? {
 			let (fileno, item) = item?;
 			let mut rdr = SegmentReader::new(io::BufReader::new(item));

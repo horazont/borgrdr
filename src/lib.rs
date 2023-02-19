@@ -11,5 +11,9 @@ pub mod rpc;
 pub mod segments;
 pub mod store;
 pub mod structs;
+//pub mod borgrpc;
 
 pub mod cliutil;
+
+#[cfg(feature = "cursive")]
+pub mod tuiutil;

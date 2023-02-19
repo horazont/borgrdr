@@ -126,6 +126,10 @@ pub struct Repository<S> {
 }
 
 impl<S: ObjectStore + Send + Sync + 'static> Repository<S> {
+	pub fn into_store(self) -> S {
+		self.store
+	}
+
 	pub async fn open(
 		store: S,
 		secret_provider: Box<dyn PassphraseProvider + Send + Sync + 'static>,
