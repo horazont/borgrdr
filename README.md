@@ -55,7 +55,7 @@ The `/path/to/your/repo` may either be a relative path, or:
   Requires a working borg 1.2 installation on the *remote* side.
   `BORG_REMOTE_COMMAND` is honoured.
 
-### Dumping contents / files
+### Dumping contents / files
 
 ```console
 $ cargo run --release --bin dump /path/to/your/repo
