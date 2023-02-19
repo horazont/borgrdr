@@ -24,19 +24,48 @@ you should probably review the code before letting it loose on your backups.
 In addition, the following Borg features are not compatible:
 
 - Repositories touched with Borg 2.x
-- Encryption (except repokey, and you need to edit the config to remove the newlines from the key there)
+- Encryption (except repokey, and you need to edit the config to remove the newlines from the key there unless you use any of the `+borg` URL types (see below))
 
 ## Usage
 
+To access encrypted repositories,
+export the `BORG_PASSPHRASE` environment variable.
+Only repokey repositories are supported.
+
+### Interactive browser
+
 ```console
-$ cargo run /path/to/your/repo
+$ cargo run --release --bin du --features cursive /path/to/your/repo
+```
+
+The `/path/to/your/repo` may either be a relative path, or:
+
+- An absolute `file://` URL
+- An absolute `file+borg://` URL,
+  to use borg serve to access the local repository.
+  Requires a working borg 1.2 installation.
+- A `ssh://` URL.
+  Requires `BORGRDR_REMOTE_COMMAND`
+  to be set to the remote path
+  where the `serve` binary can be found
+  (build it using `cargo build --release --bin serve`).
+- A `ssh+borg://` URL.
+  Accesses the repository through `borg serve`
+  on the remote side.
+  Requires a working borg 1.2 installation on the *remote* side.
+  `BORG_REMOTE_COMMAND` is honoured.
+
+### Dumping contents / files
+
+```console
+$ cargo run --release --bin dump /path/to/your/repo
 ```
 
 will print a listing of all archives and files within them,
 in snail tempo.
 
 ```console
-$ cargo run /path/to/your/repo archivename filepath
+$ cargo run --release --bin dump /path/to/your/repo archivename filepath
 ```
 
 will first print the listing (to stderr)
