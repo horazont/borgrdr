@@ -1,10 +1,10 @@
 use std::collections::VecDeque;
+use std::future::Future;
 use std::io;
 use std::pin::Pin;
 use std::result::Result as StdResult;
 use std::sync::Arc;
 use std::task::{Context, Poll};
-use std::future::Future;
 
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::sync::{mpsc, oneshot};
@@ -46,12 +46,23 @@ pub struct RpcStoreClient {
 impl RpcStoreClient {
 	pub fn new<I: AsyncRead + AsyncWrite + Send + 'static>(inner: I) -> Self {
 		let (_, ch_tx, _) = RpcWorkerConfig::with_name_prefix("client").spawn(inner);
-		Self { request_ch: ch_tx, stream_block_size: 128 }
+		Self {
+			request_ch: ch_tx,
+			stream_block_size: 128,
+		}
 	}
 
-	pub async fn new_borg<I: AsyncRead + AsyncWrite + Send + Unpin + 'static>(inner: I, repository_path: String) -> io::Result<Self> {
-		let (_, ch_tx, _) = RpcWorkerConfig::with_name_prefix("client").spawn_borg(inner, repository_path).await?;
-		Ok(Self { request_ch: ch_tx, stream_block_size: 1 })
+	pub async fn new_borg<I: AsyncRead + AsyncWrite + Send + Unpin + 'static>(
+		inner: I,
+		repository_path: String,
+	) -> io::Result<Self> {
+		let (_, ch_tx, _) = RpcWorkerConfig::with_name_prefix("client")
+			.spawn_borg(inner, repository_path)
+			.await?;
+		Ok(Self {
+			request_ch: ch_tx,
+			stream_block_size: 1,
+		})
 	}
 
 	async fn rpc_call(
@@ -189,7 +200,12 @@ impl Iterator for Chunker {
 		if self.block_size == 1 {
 			Some(Chunk::Single(self.inner.next()?))
 		} else {
-			let nitems = self.inner.size_hint().1.unwrap_or(self.block_size).min(self.block_size);
+			let nitems = self
+				.inner
+				.size_hint()
+				.1
+				.unwrap_or(self.block_size)
+				.min(self.block_size);
 			let mut buf = Vec::with_capacity(nitems);
 			for _ in 0..nitems {
 				match self.inner.next() {
@@ -237,30 +253,34 @@ impl Stream for ObjectStreamChunk {
 		let this = self.project();
 		match this {
 			ObjectStreamChunkProj::None => Poll::Ready(None),
-			ObjectStreamChunkProj::Single{ mut inner } => {
-				match inner.as_mut().as_pin_mut() {
-					Some(v) => match v.poll(cx) {
-						Poll::Ready(Ok(Ok(RpcResponse::DataReply(v)))) => {
-							*inner = None;
-							Poll::Ready(Some(CompletionStreamItem::Data(RpcMessage::StreamedChunk(Ok(v)))))
-						}
-						Poll::Ready(Ok(Ok(other))) => {
-							*inner = None;
-							Poll::Ready(Some(CompletionStreamItem::Completed(Err(Error::UnexpectedResponse(other).into()))))
-						}
-						Poll::Ready(Ok(Err(e))) => {
-							*inner = None;
-							Poll::Ready(Some(CompletionStreamItem::Completed(Err(e))))
-						}
-						Poll::Ready(Err(_)) => {
-							*inner = None;
-							Poll::Ready(Some(CompletionStreamItem::Crashed))
-						}
-						Poll::Pending => Poll::Pending,
+			ObjectStreamChunkProj::Single { mut inner } => match inner.as_mut().as_pin_mut() {
+				Some(v) => match v.poll(cx) {
+					Poll::Ready(Ok(Ok(RpcResponse::DataReply(v)))) => {
+						*inner = None;
+						Poll::Ready(Some(CompletionStreamItem::Data(RpcMessage::StreamedChunk(
+							Ok(v),
+						))))
 					}
-					None => Poll::Ready(Some(CompletionStreamItem::Completed(Ok(RpcResponse::Success))))
-				}
-			}
+					Poll::Ready(Ok(Ok(other))) => {
+						*inner = None;
+						Poll::Ready(Some(CompletionStreamItem::Completed(Err(
+							Error::UnexpectedResponse(other).into(),
+						))))
+					}
+					Poll::Ready(Ok(Err(e))) => {
+						*inner = None;
+						Poll::Ready(Some(CompletionStreamItem::Completed(Err(e))))
+					}
+					Poll::Ready(Err(_)) => {
+						*inner = None;
+						Poll::Ready(Some(CompletionStreamItem::Crashed))
+					}
+					Poll::Pending => Poll::Pending,
+				},
+				None => Poll::Ready(Some(CompletionStreamItem::Completed(Ok(
+					RpcResponse::Success,
+				)))),
+			},
 			ObjectStreamChunkProj::Streamed { inner } => inner.poll_next(cx),
 		}
 	}
@@ -309,7 +329,9 @@ impl Stream for ObjectStream {
 							Ok(()) => (),
 							Err(_) => return Poll::Ready(Some(Err(Error::LostWorker.into()))),
 						};
-						ObjectStreamChunk::Single{inner: Some(result_rx)}
+						ObjectStreamChunk::Single {
+							inner: Some(result_rx),
+						}
 					}
 					Chunk::Block(ids) => {
 						let (result_tx, result_rx) = oneshot::channel();
@@ -322,7 +344,9 @@ impl Stream for ObjectStream {
 							Ok(()) => (),
 							Err(_) => return Poll::Ready(Some(Err(Error::LostWorker.into()))),
 						};
-						ObjectStreamChunk::Streamed{inner: CompletionStream::wrap(msg_rx, result_rx)}
+						ObjectStreamChunk::Streamed {
+							inner: CompletionStream::wrap(msg_rx, result_rx),
+						}
 					}
 				};
 			}

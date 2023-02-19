@@ -1,5 +1,5 @@
 use std::env::var_os;
-use std::ffi::OsStr;
+use std::ffi::{OsStr, OsString};
 use std::io;
 use std::path::PathBuf;
 use std::pin::Pin;
@@ -127,9 +127,13 @@ async fn open_stdio<S: AsRef<OsStr>, I: IntoIterator<Item = S>>(
 pub async fn open_stdio_repository<S: AsRef<OsStr>, I: IntoIterator<Item = S>>(
 	command: impl AsRef<OsStr>,
 	argv: I,
+	borg_mode: Option<String>,
 ) -> io::Result<(Child, Repository<RpcStoreClient>)> {
 	let (server, clientside) = open_stdio(command, argv).await?;
-	let store = RpcStoreClient::new(clientside);
+	let store = match borg_mode {
+		Some(path) => RpcStoreClient::new_borg(clientside, path).await?,
+		None => RpcStoreClient::new(clientside),
+	};
 	Ok((
 		server,
 		Repository::open(store, Box::new(EnvPassphrase::new())).await?,
@@ -139,32 +143,48 @@ pub async fn open_stdio_repository<S: AsRef<OsStr>, I: IntoIterator<Item = S>>(
 pub async fn open_borg_repository(
 	repository_path: PathBuf,
 ) -> io::Result<(Child, Repository<RpcStoreClient>)> {
-	let repository_path = repository_path.to_str().expect("valid utf-8 path").to_string();
+	let repository_path = repository_path
+		.to_str()
+		.expect("valid utf-8 path")
+		.to_string();
 	let executable = match var_os("BORG_REMOTE_PATH") {
 		Some(v) => v,
 		None => "borg".into(),
 	};
 	let argv = vec!["serve"];
-	let (server, clientside) = open_stdio(&executable, argv).await?;
-	let store = RpcStoreClient::new_borg(clientside, repository_path).await?;
-	Ok((server, Repository::open(store, Box::new(EnvPassphrase::new())).await?))
+	open_stdio_repository(&executable, argv, Some(repository_path)).await
 }
 
 pub async fn open_ssh(
 	connect: impl AsRef<OsStr>,
 	path: impl AsRef<OsStr>,
+	borg_mode: Option<String>,
 ) -> io::Result<(Child, Repository<RpcStoreClient>)> {
-	let executable = match var_os("BORGRDR_REMOTE_COMMAND") {
-		Some(v) => v,
+	let mut argv: Vec<OsString> = vec![connect.as_ref().to_os_string()];
+	match borg_mode.as_ref() {
+		Some(_) => {
+			let borg = match var_os("BORG_REMOTE_PATH") {
+				Some(v) => v,
+				None => "borg".into(),
+			};
+			argv.push(borg.into());
+			argv.push("serve".into());
+		}
 		None => {
-			return Err(io::Error::new(
-				io::ErrorKind::InvalidInput,
-				"BORGRDR_REMOTE_COMMAND must be set for SSH operation",
-			))
+			let serve = match var_os("BORGRDR_REMOTE_COMMAND") {
+				Some(v) => v,
+				None => {
+					return Err(io::Error::new(
+						io::ErrorKind::InvalidInput,
+						"BORGRDR_REMOTE_COMMAND must be set for SSH operation",
+					))
+				}
+			};
+			argv.push(serve.into());
+			argv.push(path.as_ref().to_os_string());
 		}
 	};
-	let argv = vec![connect.as_ref(), executable.as_ref(), path.as_ref()];
-	open_stdio_repository("ssh", argv).await
+	open_stdio_repository("ssh", argv, borg_mode).await
 }
 
 pub async fn open_url_str(url: &str) -> io::Result<(Box<dyn Backend>, Repository<RpcStoreClient>)> {
@@ -182,7 +202,6 @@ pub async fn open_url_str(url: &str) -> io::Result<(Box<dyn Backend>, Repository
 
 	match url.scheme() {
 		"ssh" | "ssh+borg" => {
-			let borg_mode = url.scheme().ends_with("+borg");
 			let host = match url.host_str() {
 				Some(v) => v,
 				None => {
@@ -200,7 +219,11 @@ pub async fn open_url_str(url: &str) -> io::Result<(Box<dyn Backend>, Repository
 			}
 			connect_str.push_str(host);
 
-			let (backend, repo) = open_ssh(connect_str, url.path()).await?;
+			let borg_mode = match url.scheme().ends_with("+borg") {
+				true => Some(url.path().into()),
+				false => None,
+			};
+			let (backend, repo) = open_ssh(connect_str, url.path(), borg_mode).await?;
 			Ok((Box::new(backend), repo))
 		}
 		"file+borg" => {

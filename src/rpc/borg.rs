@@ -1,19 +1,19 @@
 use std::collections::HashMap;
-use std::io;
-use std::fmt;
 use std::collections::VecDeque;
+use std::fmt;
+use std::future::Future;
+use std::io;
 use std::pin::Pin;
 use std::result::Result as StdResult;
 use std::sync::Arc;
 use std::task::{Context, Poll};
-use std::future::Future;
 
 use bytes::Bytes;
 
 use futures::stream::{Stream, StreamExt};
-use futures::{SinkExt};
+use futures::SinkExt;
 
-use serde::{Serialize, Deserialize};
+use serde::{Deserialize, Serialize};
 use serde_with::{serde_as, Bytes as SerdeBytes};
 
 use tokio::io::{AsyncRead, AsyncWrite};
@@ -28,10 +28,8 @@ use crate::store::ObjectStore;
 
 use super::worker::{
 	CompletionStream, CompletionStreamItem, Error, MessageSendError, MessageSender, Result,
-	RpcMessage, RpcRequest, RpcResponse, RpcWorkerCommand, RpcWorkerConfig, RpcWorkerMessage,
-	TryMessageSendError,
-	RpcItem,
-	RpcInterfaceError,
+	RpcInterfaceError, RpcItem, RpcMessage, RpcRequest, RpcResponse, RpcWorkerCommand,
+	RpcWorkerConfig, RpcWorkerMessage, TryMessageSendError,
 };
 
 #[serde_as]
@@ -79,16 +77,22 @@ impl TryFrom<RpcItem> for BorgRpcRequest {
 		let result = match other {
 			RpcItem::Hello => Err(Self::Error::UnsupportedIgnore(RpcItem::Hello)),
 			RpcItem::Goodbye => Err(Self::Error::UnsupportedIgnore(RpcItem::Goodbye)),
-			RpcItem::Message { in_reply_to, payload } => Err(Self::Error::UnsupportedIgnore(RpcItem::Message{ in_reply_to, payload })),
+			RpcItem::Message {
+				in_reply_to,
+				payload,
+			} => Err(Self::Error::UnsupportedIgnore(RpcItem::Message {
+				in_reply_to,
+				payload,
+			})),
 			RpcItem::Heartbeat => Err(Self::Error::UnsupportedIgnore(RpcItem::Heartbeat)),
 			RpcItem::Request { id, payload } => match payload {
-				RpcRequest::RetrieveObject { id: object_id } => {
-					Ok(BorgRpcRequest {
-						msgid: id,
-						method: "get".into(),
-						args: vec![("id".to_string(), object_id.0[..].to_vec().into())].into_iter().collect(),
-					})
-				}
+				RpcRequest::RetrieveObject { id: object_id } => Ok(BorgRpcRequest {
+					msgid: id,
+					method: "get".into(),
+					args: vec![("id".to_string(), object_id.0[..].to_vec().into())]
+						.into_iter()
+						.collect(),
+				}),
 				RpcRequest::GetRepositoryConfigKey { key } => {
 					if key == "key" {
 						Ok(BorgRpcRequest {
@@ -97,11 +101,17 @@ impl TryFrom<RpcItem> for BorgRpcRequest {
 							args: HashMap::new(),
 						})
 					} else {
-						Err(Self::Error::UnsupportedFail(RpcItem::Request{ id, payload: RpcRequest::GetRepositoryConfigKey{ key }}))
+						Err(Self::Error::UnsupportedFail(RpcItem::Request {
+							id,
+							payload: RpcRequest::GetRepositoryConfigKey { key },
+						}))
 					}
 				}
-				other => Err(Self::Error::UnsupportedFail(RpcItem::Request{ id, payload: other }))
-			}
+				other => Err(Self::Error::UnsupportedFail(RpcItem::Request {
+					id,
+					payload: other,
+				})),
+			},
 			other => Err(Self::Error::UnsupportedFail(other)),
 		};
 		if let Ok(v) = result.as_ref() {
@@ -115,7 +125,7 @@ impl TryFrom<RpcItem> for BorgRpcRequest {
 #[derive(Deserialize)]
 #[serde(untagged)]
 pub(super) enum BorgRpcResponse {
-	Exception{
+	Exception {
 		#[serde(rename = "i")]
 		msgid: u64,
 		#[serde_as(as = "SerdeBytes")]
@@ -123,12 +133,12 @@ pub(super) enum BorgRpcResponse {
 		#[serde_as(as = "SerdeBytes")]
 		exception_short: Vec<u8>,
 	},
-	Result{
+	Result {
 		#[serde(rename = "i")]
 		msgid: u64,
 		#[serde(rename = "r")]
 		result: BorgRpcValue,
-	}
+	},
 }
 
 impl From<BorgRpcValue> for RpcResponse {
@@ -146,19 +156,21 @@ impl From<BorgRpcValue> for RpcResponse {
 impl From<BorgRpcResponse> for RpcItem {
 	fn from(other: BorgRpcResponse) -> Self {
 		match other {
-			BorgRpcResponse::Exception { msgid, exception_short, .. } => {
+			BorgRpcResponse::Exception {
+				msgid,
+				exception_short,
+				..
+			} => {
 				let exception_short = String::from_utf8_lossy(&exception_short);
 				Self::Response {
 					id: msgid,
 					payload: RpcResponse::Error(exception_short.into_owned()),
 				}
 			}
-			BorgRpcResponse::Result { msgid, result } => {
-				Self::Response {
-					id: msgid,
-					payload: result.into(),
-				}
-			}
+			BorgRpcResponse::Result { msgid, result } => Self::Response {
+				id: msgid,
+				payload: result.into(),
+			},
 		}
 	}
 }
@@ -176,19 +188,32 @@ macro_rules! match_rpc_response {
 	}
 }
 
-pub(super) async fn borg_open<T: AsyncRead + AsyncWrite + Send + Unpin>(ch: &mut codec::Framed<T, AsymMpCodec<BorgRpcRequest, BorgRpcResponse>>, repository_path: String) -> io::Result<()> {
+pub(super) async fn borg_open<T: AsyncRead + AsyncWrite + Send + Unpin>(
+	ch: &mut codec::Framed<T, AsymMpCodec<BorgRpcRequest, BorgRpcResponse>>,
+	repository_path: String,
+) -> io::Result<()> {
 	ch.send(BorgRpcRequest {
 		msgid: 0,
 		method: "open".into(),
 		args: vec![
 			("path".to_string(), repository_path.into()),
 			("exclusive".to_string(), false.into()),
-		].into_iter().collect(),
-	}).await?;
-	match ch.next().await.map(|x| x.map(|x: BorgRpcResponse| x.into())) {
+		]
+		.into_iter()
+		.collect(),
+	})
+	.await?;
+	match ch
+		.next()
+		.await
+		.map(|x| x.map(|x: BorgRpcResponse| x.into()))
+	{
 		Some(Ok(RpcItem::Response { id, payload })) => {
 			if id != 0 {
-				return Err(io::Error::new(io::ErrorKind::InvalidData, format!("unexpected rpc id: {:?}", id)))
+				return Err(io::Error::new(
+					io::ErrorKind::InvalidData,
+					format!("unexpected rpc id: {:?}", id),
+				));
 			}
 			match payload {
 				RpcResponse::Error(e) => Err(Error::Remote(e).into()),
@@ -196,10 +221,14 @@ pub(super) async fn borg_open<T: AsyncRead + AsyncWrite + Send + Unpin>(ch: &mut
 				other => Err(Error::UnexpectedResponse(other).into()),
 			}
 		}
-		Some(Ok(other)) => {
-			Err(io::Error::new(io::ErrorKind::InvalidData, format!("unexpected rpc item after open: {:?}", other)))
-		}
+		Some(Ok(other)) => Err(io::Error::new(
+			io::ErrorKind::InvalidData,
+			format!("unexpected rpc item after open: {:?}", other),
+		)),
 		Some(Err(e)) => Err(e),
-		None => Err(io::Error::new(io::ErrorKind::UnexpectedEof, "channel closed before reply to open".to_string())),
+		None => Err(io::Error::new(
+			io::ErrorKind::UnexpectedEof,
+			"channel closed before reply to open".to_string(),
+		)),
 	}
 }

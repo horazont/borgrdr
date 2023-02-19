@@ -14,7 +14,7 @@ use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::sync::{mpsc, oneshot, RwLock};
 use tokio::time::{sleep_until, Duration, Instant};
 
-use tokio_util::codec::{self, Encoder, Decoder};
+use tokio_util::codec::{self, Decoder, Encoder};
 
 use bytes::Bytes;
 
@@ -569,7 +569,14 @@ impl RpcWorkerConfig {
 		let (tx, rx) = codec::Framed::new(channel, BincodeCodec::new()).split();
 		let (request_tx, request_rx) = mpsc::channel(self.request_queue_size);
 		let (message_tx, message_rx) = mpsc::channel(self.message_queue_size);
-		let worker = RpcWorker::<T, std::convert::Infallible, RpcItem, DefaultBincodeCodec<RpcItem>, RpcItem, DefaultBincodeCodec<RpcItem>> {
+		let worker = RpcWorker::<
+			T,
+			std::convert::Infallible,
+			RpcItem,
+			DefaultBincodeCodec<RpcItem>,
+			RpcItem,
+			DefaultBincodeCodec<RpcItem>,
+		> {
 			tx,
 			rx,
 			next_id: 0,
@@ -593,7 +600,7 @@ impl RpcWorkerConfig {
 		mpsc::Sender<RpcWorkerCommand>,
 		mpsc::Receiver<RpcWorkerMessage>,
 	)> {
-		use super::borg::{BorgRpcRequest, BorgRpcResponse, borg_open};
+		use super::borg::{borg_open, BorgRpcRequest, BorgRpcResponse};
 		use crate::rmp_codec::AsymMpCodec;
 		let mut ch = codec::Framed::new(channel, AsymMpCodec::new());
 		let (request_tx, request_rx) = mpsc::channel(self.request_queue_size);
@@ -604,7 +611,14 @@ impl RpcWorkerConfig {
 
 		let (tx, rx) = ch.split();
 
-		let worker = RpcWorker::<T, RpcInterfaceError, BorgRpcRequest, AsymMpCodec<BorgRpcRequest, BorgRpcResponse>, BorgRpcResponse, AsymMpCodec<BorgRpcRequest, BorgRpcResponse>> {
+		let worker = RpcWorker::<
+			T,
+			RpcInterfaceError,
+			BorgRpcRequest,
+			AsymMpCodec<BorgRpcRequest, BorgRpcResponse>,
+			BorgRpcResponse,
+			AsymMpCodec<BorgRpcRequest, BorgRpcResponse>,
+		> {
 			tx,
 			rx,
 			next_id: 0,
@@ -671,24 +685,25 @@ macro_rules! handle_tx {
 	}) => {
 		trace!("{}: tx: {}", $name, $obj);
 		match $obj.try_into().map_err(|x: TE| x.into()) {
-			Ok(v) => {
-				match $tx.send(v).await.map_err(ErrorGenerator::send) {
-					Ok($okv) => $ok,
-					Err(e) => {
-						{
-							let $errv = &e;
-							$err;
-						}
-						break Err(e);
+			Ok(v) => match $tx.send(v).await.map_err(ErrorGenerator::send) {
+				Ok($okv) => $ok,
+				Err(e) => {
+					{
+						let $errv = &e;
+						$err;
 					}
+					break Err(e);
 				}
 			},
 			Err(RpcInterfaceError::UnsupportedIgnore(v)) => {
 				trace!("{}: transmission of {} not supported, dropping", $name, v);
 				$ok
-			},
+			}
 			Err(RpcInterfaceError::UnsupportedFail(v)) => {
-				let e = ErrorGenerator::send(io::Error::new(io::ErrorKind::InvalidInput, format!("{} cannot be sent over transport", v)));
+				let e = ErrorGenerator::send(io::Error::new(
+					io::ErrorKind::InvalidInput,
+					format!("{} cannot be sent over transport", v),
+				));
 				{
 					let $errv = &e;
 					$err;
@@ -713,7 +728,14 @@ impl From<std::convert::Infallible> for RpcInterfaceError {
 	}
 }
 
-struct RpcWorker<T: AsyncRead + AsyncWrite, TE: Into<RpcInterfaceError>, TX: TryFrom<RpcItem, Error = TE>, ENC: Encoder<TX, Error = io::Error>, RX: Into<RpcItem>, DEC: Decoder<Item = RX, Error = io::Error>> {
+struct RpcWorker<
+	T: AsyncRead + AsyncWrite,
+	TE: Into<RpcInterfaceError>,
+	TX: TryFrom<RpcItem, Error = TE>,
+	ENC: Encoder<TX, Error = io::Error>,
+	RX: Into<RpcItem>,
+	DEC: Decoder<Item = RX, Error = io::Error>,
+> {
 	tx: SplitSink<codec::Framed<T, ENC>, TX>,
 	rx: SplitStream<codec::Framed<T, DEC>>,
 	next_id: RequestId,
@@ -725,7 +747,15 @@ struct RpcWorker<T: AsyncRead + AsyncWrite, TE: Into<RpcInterfaceError>, TX: Try
 	name: String,
 }
 
-impl<T: AsyncRead + AsyncWrite, TE: Into<RpcInterfaceError>, TX: TryFrom<RpcItem, Error = TE>, ENC: Encoder<TX, Error = io::Error>, RX: Into<RpcItem>, DEC: Decoder<Item = RX, Error = io::Error>> RpcWorker<T, TE, TX, ENC, RX, DEC> {
+impl<
+		T: AsyncRead + AsyncWrite,
+		TE: Into<RpcInterfaceError>,
+		TX: TryFrom<RpcItem, Error = TE>,
+		ENC: Encoder<TX, Error = io::Error>,
+		RX: Into<RpcItem>,
+		DEC: Decoder<Item = RX, Error = io::Error>,
+	> RpcWorker<T, TE, TX, ENC, RX, DEC>
+{
 	fn generate_next_id(&mut self) -> RequestId {
 		loop {
 			let id = self.next_id;
@@ -1008,17 +1038,12 @@ impl<T: AsyncRead + AsyncWrite, TE: Into<RpcInterfaceError>, TX: TryFrom<RpcItem
 			Ok(()) => {
 				// we try to send a Goodbye message, and if we don't succeed, that changes the error state'
 				match RpcItem::Goodbye.try_into() {
-					Ok(v) => {
-						self.tx
-							.send(v)
-							.await
-							.map_err(ErrorGenerator::send)
-					}
+					Ok(v) => self.tx.send(v).await.map_err(ErrorGenerator::send),
 					// if unsupported, ignore
 					Err(_) => Ok(()),
 				}
-							.err()
-							.unwrap_or(ErrorGenerator::LocalShutdown)
+				.err()
+				.unwrap_or(ErrorGenerator::LocalShutdown)
 			}
 			Err(e) => e,
 		};

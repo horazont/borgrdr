@@ -53,7 +53,7 @@ The `/path/to/your/repo` may either be a relative path, or:
   Accesses the repository through `borg serve`
   on the remote side.
   Requires a working borg 1.2 installation on the *remote* side.
-  `BORG_REMOTE_COMMAND` is honoured.
+  `BORG_REMOTE_PATH` is honoured.
 
 ### Dumping contents / files
 

@@ -5,7 +5,7 @@ use log::{debug, trace};
 
 use bytes::{Buf, BufMut, BytesMut};
 
-use serde::{de::DeserializeOwned, ser::Serialize, ser::Serializer, ser};
+use serde::{de::DeserializeOwned, ser, ser::Serialize, ser::Serializer};
 
 use tokio_util::codec::{Decoder, Encoder};
 
@@ -15,14 +15,13 @@ struct EvilCompound<'a, W: 'a, C: 'a> {
 	inner: &'a mut EvilSerializer<W, C>,
 }
 
-impl<'a, W: io::Write + 'a, C: rmp_serde::config::SerializerConfig + 'a> ser::SerializeTuple for EvilCompound<'a, W, C> {
+impl<'a, W: io::Write + 'a, C: rmp_serde::config::SerializerConfig + 'a> ser::SerializeTuple
+	for EvilCompound<'a, W, C>
+{
 	type Ok = <encode::Compound<'a, W, C> as ser::SerializeTuple>::Ok;
 	type Error = <encode::Compound<'a, W, C> as ser::SerializeTuple>::Error;
 
-	fn serialize_element<T: ?Sized + Serialize>(
-		&mut self,
-		value: &T
-	) -> Result<(), Self::Error> {
+	fn serialize_element<T: ?Sized + Serialize>(&mut self, value: &T) -> Result<(), Self::Error> {
 		value.serialize(&mut *self.inner)
 	}
 
@@ -31,14 +30,13 @@ impl<'a, W: io::Write + 'a, C: rmp_serde::config::SerializerConfig + 'a> ser::Se
 	}
 }
 
-impl<'a, W: io::Write + 'a, C: rmp_serde::config::SerializerConfig + 'a> ser::SerializeTupleStruct for EvilCompound<'a, W, C> {
+impl<'a, W: io::Write + 'a, C: rmp_serde::config::SerializerConfig + 'a> ser::SerializeTupleStruct
+	for EvilCompound<'a, W, C>
+{
 	type Ok = <encode::Compound<'a, W, C> as ser::SerializeTupleStruct>::Ok;
 	type Error = <encode::Compound<'a, W, C> as ser::SerializeTupleStruct>::Error;
 
-	fn serialize_field<T: ?Sized + Serialize>(
-		&mut self,
-		value: &T
-	) -> Result<(), Self::Error> {
+	fn serialize_field<T: ?Sized + Serialize>(&mut self, value: &T) -> Result<(), Self::Error> {
 		value.serialize(&mut *self.inner)
 	}
 
@@ -47,14 +45,13 @@ impl<'a, W: io::Write + 'a, C: rmp_serde::config::SerializerConfig + 'a> ser::Se
 	}
 }
 
-impl<'a, W: io::Write + 'a, C: rmp_serde::config::SerializerConfig + 'a> ser::SerializeTupleVariant for EvilCompound<'a, W, C> {
+impl<'a, W: io::Write + 'a, C: rmp_serde::config::SerializerConfig + 'a> ser::SerializeTupleVariant
+	for EvilCompound<'a, W, C>
+{
 	type Ok = <encode::Compound<'a, W, C> as ser::SerializeTupleVariant>::Ok;
 	type Error = <encode::Compound<'a, W, C> as ser::SerializeTupleVariant>::Error;
 
-	fn serialize_field<T: ?Sized + Serialize>(
-		&mut self,
-		value: &T
-	) -> Result<(), Self::Error> {
+	fn serialize_field<T: ?Sized + Serialize>(&mut self, value: &T) -> Result<(), Self::Error> {
 		value.serialize(&mut *self.inner)
 	}
 
@@ -63,14 +60,16 @@ impl<'a, W: io::Write + 'a, C: rmp_serde::config::SerializerConfig + 'a> ser::Se
 	}
 }
 
-impl<'a, W: io::Write + 'a, C: rmp_serde::config::SerializerConfig + 'a> ser::SerializeStruct for EvilCompound<'a, W, C> {
+impl<'a, W: io::Write + 'a, C: rmp_serde::config::SerializerConfig + 'a> ser::SerializeStruct
+	for EvilCompound<'a, W, C>
+{
 	type Ok = <encode::Compound<'a, W, C> as ser::SerializeStruct>::Ok;
 	type Error = <encode::Compound<'a, W, C> as ser::SerializeStruct>::Error;
 
 	fn serialize_field<T: ?Sized + Serialize>(
 		&mut self,
 		key: &'static str,
-		value: &T
+		value: &T,
 	) -> Result<(), Self::Error> {
 		C::write_struct_field(&mut *self.inner, key, value)
 	}
@@ -80,14 +79,16 @@ impl<'a, W: io::Write + 'a, C: rmp_serde::config::SerializerConfig + 'a> ser::Se
 	}
 }
 
-impl<'a, W: io::Write + 'a, C: rmp_serde::config::SerializerConfig + 'a> ser::SerializeStructVariant for EvilCompound<'a, W, C> {
+impl<'a, W: io::Write + 'a, C: rmp_serde::config::SerializerConfig + 'a> ser::SerializeStructVariant
+	for EvilCompound<'a, W, C>
+{
 	type Ok = <encode::Compound<'a, W, C> as ser::SerializeStruct>::Ok;
 	type Error = <encode::Compound<'a, W, C> as ser::SerializeStruct>::Error;
 
 	fn serialize_field<T: ?Sized + Serialize>(
 		&mut self,
 		key: &'static str,
-		value: &T
+		value: &T,
 	) -> Result<(), Self::Error> {
 		C::write_struct_field(&mut *self.inner, key, value)
 	}
@@ -97,14 +98,13 @@ impl<'a, W: io::Write + 'a, C: rmp_serde::config::SerializerConfig + 'a> ser::Se
 	}
 }
 
-impl<'a, W: io::Write + 'a, C: rmp_serde::config::SerializerConfig + 'a> ser::SerializeSeq for EvilCompound<'a, W, C> {
+impl<'a, W: io::Write + 'a, C: rmp_serde::config::SerializerConfig + 'a> ser::SerializeSeq
+	for EvilCompound<'a, W, C>
+{
 	type Ok = <encode::MaybeUnknownLengthCompound<'a, W, C> as ser::SerializeSeq>::Ok;
 	type Error = <encode::MaybeUnknownLengthCompound<'a, W, C> as ser::SerializeSeq>::Error;
 
-	fn serialize_element<T: ?Sized + Serialize>(
-		&mut self,
-		value: &T
-	) -> Result<(), Self::Error> {
+	fn serialize_element<T: ?Sized + Serialize>(&mut self, value: &T) -> Result<(), Self::Error> {
 		value.serialize(&mut *self.inner)
 	}
 
@@ -113,21 +113,17 @@ impl<'a, W: io::Write + 'a, C: rmp_serde::config::SerializerConfig + 'a> ser::Se
 	}
 }
 
-impl<'a, W: io::Write + 'a, C: rmp_serde::config::SerializerConfig + 'a> ser::SerializeMap for EvilCompound<'a, W, C> {
+impl<'a, W: io::Write + 'a, C: rmp_serde::config::SerializerConfig + 'a> ser::SerializeMap
+	for EvilCompound<'a, W, C>
+{
 	type Ok = <encode::MaybeUnknownLengthCompound<'a, W, C> as ser::SerializeMap>::Ok;
 	type Error = <encode::MaybeUnknownLengthCompound<'a, W, C> as ser::SerializeMap>::Error;
 
-	fn serialize_key<T: ?Sized + Serialize>(
-		&mut self,
-		key: &T
-	) -> Result<(), Self::Error> {
+	fn serialize_key<T: ?Sized + Serialize>(&mut self, key: &T) -> Result<(), Self::Error> {
 		<Self as ser::SerializeSeq>::serialize_element(self, key)
 	}
 
-	fn serialize_value<T: ?Sized + Serialize>(
-		&mut self,
-		value: &T
-	) -> Result<(), Self::Error> {
+	fn serialize_value<T: ?Sized + Serialize>(&mut self, value: &T) -> Result<(), Self::Error> {
 		<Self as ser::SerializeSeq>::serialize_element(self, value)
 	}
 
@@ -140,14 +136,13 @@ struct EvilMaybeUnknownLengthCompound<'a, W: 'a, C: 'a> {
 	inner: &'a mut EvilSerializer<W, C>,
 }
 
-impl<'a, W: io::Write + 'a, C: rmp_serde::config::SerializerConfig + 'a> ser::SerializeSeq for EvilMaybeUnknownLengthCompound<'a, W, C> {
+impl<'a, W: io::Write + 'a, C: rmp_serde::config::SerializerConfig + 'a> ser::SerializeSeq
+	for EvilMaybeUnknownLengthCompound<'a, W, C>
+{
 	type Ok = <encode::MaybeUnknownLengthCompound<'a, W, C> as ser::SerializeSeq>::Ok;
 	type Error = <encode::MaybeUnknownLengthCompound<'a, W, C> as ser::SerializeSeq>::Error;
 
-	fn serialize_element<T: ?Sized + Serialize>(
-		&mut self,
-		value: &T
-	) -> Result<(), Self::Error> {
+	fn serialize_element<T: ?Sized + Serialize>(&mut self, value: &T) -> Result<(), Self::Error> {
 		todo!();
 	}
 
@@ -156,21 +151,17 @@ impl<'a, W: io::Write + 'a, C: rmp_serde::config::SerializerConfig + 'a> ser::Se
 	}
 }
 
-impl<'a, W: io::Write + 'a, C: rmp_serde::config::SerializerConfig + 'a> ser::SerializeMap for EvilMaybeUnknownLengthCompound<'a, W, C> {
+impl<'a, W: io::Write + 'a, C: rmp_serde::config::SerializerConfig + 'a> ser::SerializeMap
+	for EvilMaybeUnknownLengthCompound<'a, W, C>
+{
 	type Ok = <encode::MaybeUnknownLengthCompound<'a, W, C> as ser::SerializeMap>::Ok;
 	type Error = <encode::MaybeUnknownLengthCompound<'a, W, C> as ser::SerializeMap>::Error;
 
-	fn serialize_key<T: ?Sized + Serialize>(
-		&mut self,
-		value: &T
-	) -> Result<(), Self::Error> {
+	fn serialize_key<T: ?Sized + Serialize>(&mut self, value: &T) -> Result<(), Self::Error> {
 		todo!();
 	}
 
-	fn serialize_value<T: ?Sized + Serialize>(
-		&mut self,
-		value: &T
-	) -> Result<(), Self::Error> {
+	fn serialize_value<T: ?Sized + Serialize>(&mut self, value: &T) -> Result<(), Self::Error> {
 		todo!();
 	}
 
@@ -180,7 +171,7 @@ impl<'a, W: io::Write + 'a, C: rmp_serde::config::SerializerConfig + 'a> ser::Se
 }
 
 struct EvilSerializer<W, C = rmp_serde::config::DefaultConfig> {
-	inner: encode::Serializer<W, C>
+	inner: encode::Serializer<W, C>,
 }
 
 impl<W: io::Write, C> rmp_serde::encode::UnderlyingWrite for EvilSerializer<W, C> {
@@ -200,12 +191,16 @@ impl<W: io::Write, C> rmp_serde::encode::UnderlyingWrite for EvilSerializer<W, C
 }
 
 impl<'a, W: io::Write, C: rmp_serde::config::SerializerConfig> EvilSerializer<W, C> {
-	fn compound(&'a mut self) -> Result<EvilCompound<'a, W, C>, <&'a mut encode::Serializer<W, C> as Serializer>::Error> {
-		Ok(EvilCompound{inner: self})
+	fn compound(
+		&'a mut self,
+	) -> Result<EvilCompound<'a, W, C>, <&'a mut encode::Serializer<W, C> as Serializer>::Error> {
+		Ok(EvilCompound { inner: self })
 	}
 }
 
-impl<'a, W: io::Write, C: rmp_serde::config::SerializerConfig> Serializer for &'a mut EvilSerializer<W, C> {
+impl<'a, W: io::Write, C: rmp_serde::config::SerializerConfig> Serializer
+	for &'a mut EvilSerializer<W, C>
+{
 	type Ok = <&'a mut encode::Serializer<W, C> as Serializer>::Ok;
 	type Error = <&'a mut encode::Serializer<W, C> as Serializer>::Error;
 	type SerializeSeq = EvilCompound<'a, W, C>;
@@ -221,10 +216,10 @@ impl<'a, W: io::Write, C: rmp_serde::config::SerializerConfig> Serializer for &'
 	}
 
 	fn serialize_bytes(self, v: &[u8]) -> Result<Self::Ok, Self::Error> {
-		log::trace!("serialize_bytes called: {:?}", v);
 		let w = self.inner.get_mut();
 		rmp::encode::write_str_len(w, v.len() as u32)?;
-		w.write_all(v).map_err(rmp::encode::ValueWriteError::InvalidDataWrite)?;
+		w.write_all(v)
+			.map_err(rmp::encode::ValueWriteError::InvalidDataWrite)?;
 		Ok(())
 	}
 
@@ -278,11 +273,21 @@ impl<'a, W: io::Write, C: rmp_serde::config::SerializerConfig> Serializer for &'
 		self.compound()
 	}
 
-	fn serialize_newtype_struct<T: Serialize + ?Sized>(self, name: &'static str, value: &T) -> Result<Self::Ok, Self::Error> {
+	fn serialize_newtype_struct<T: Serialize + ?Sized>(
+		self,
+		name: &'static str,
+		value: &T,
+	) -> Result<Self::Ok, Self::Error> {
 		value.serialize(self)
 	}
 
-	fn serialize_newtype_variant<T: Serialize + ?Sized>(self, name: &'static str, variant_index: u32, variant: &'static str, value: &T) -> Result<Self::Ok, Self::Error> {
+	fn serialize_newtype_variant<T: Serialize + ?Sized>(
+		self,
+		name: &'static str,
+		variant_index: u32,
+		variant: &'static str,
+		value: &T,
+	) -> Result<Self::Ok, Self::Error> {
 		rmp::encode::write_map_len(self.inner.get_mut(), 1)?;
 		C::write_variant_ident(self, variant_index, variant)?;
 		value.serialize(self)
@@ -303,16 +308,25 @@ impl<'a, W: io::Write, C: rmp_serde::config::SerializerConfig> Serializer for &'
 	}
 
 	fn serialize_str(self, v: &str) -> Result<Self::Ok, Self::Error> {
-		log::trace!("serialize_str called: {:?}", v);
 		self.inner.serialize_str(v)
 	}
 
-	fn serialize_struct(self, name: &'static str, len: usize) -> Result<Self::SerializeStruct, Self::Error> {
+	fn serialize_struct(
+		self,
+		name: &'static str,
+		len: usize,
+	) -> Result<Self::SerializeStruct, Self::Error> {
 		C::write_struct_len(self, len)?;
 		self.compound()
 	}
 
-	fn serialize_struct_variant(self, name: &'static str, variant_index: u32, variant: &'static str, len: usize) -> Result<Self::SerializeStructVariant, Self::Error> {
+	fn serialize_struct_variant(
+		self,
+		name: &'static str,
+		variant_index: u32,
+		variant: &'static str,
+		len: usize,
+	) -> Result<Self::SerializeStructVariant, Self::Error> {
 		rmp::encode::write_map_len(self.inner.get_mut(), 1)?;
 		C::write_variant_ident(self, variant_index, variant)?;
 		self.serialize_struct(name, len)
@@ -323,12 +337,22 @@ impl<'a, W: io::Write, C: rmp_serde::config::SerializerConfig> Serializer for &'
 		self.compound()
 	}
 
-	fn serialize_tuple_struct(self, name: &'static str, len: usize) -> Result<Self::SerializeTupleStruct, Self::Error> {
+	fn serialize_tuple_struct(
+		self,
+		name: &'static str,
+		len: usize,
+	) -> Result<Self::SerializeTupleStruct, Self::Error> {
 		rmp::encode::write_array_len(self.inner.get_mut(), len as u32)?;
 		self.compound()
 	}
 
-	fn serialize_tuple_variant(self, name: &'static str, variant_index: u32, variant: &'static str, len: usize) -> Result<Self::SerializeTupleVariant, Self::Error> {
+	fn serialize_tuple_variant(
+		self,
+		name: &'static str,
+		variant_index: u32,
+		variant: &'static str,
+		len: usize,
+	) -> Result<Self::SerializeTupleVariant, Self::Error> {
 		rmp::encode::write_map_len(self.inner.get_mut(), 1)?;
 		C::write_variant_ident(self, variant_index, variant)?;
 		self.serialize_tuple(len)
@@ -342,8 +366,14 @@ impl<'a, W: io::Write, C: rmp_serde::config::SerializerConfig> Serializer for &'
 		self.inner.serialize_unit_struct(name)
 	}
 
-	fn serialize_unit_variant(self, name: &'static str, variant_index: u32, variant: &'static str) -> Result<Self::Ok, Self::Error> {
-		self.inner.serialize_unit_variant(name, variant_index, variant)
+	fn serialize_unit_variant(
+		self,
+		name: &'static str,
+		variant_index: u32,
+		variant: &'static str,
+	) -> Result<Self::Ok, Self::Error> {
+		self.inner
+			.serialize_unit_variant(name, variant_index, variant)
 	}
 }
 
@@ -402,6 +432,7 @@ impl<TX: Serialize, RX> Encoder<TX> for AsymMpCodec<TX, RX> {
 		let mut se = EvilSerializer {
 			inner: rmp_serde::encode::Serializer::new(&mut wr).with_struct_map(),
 		};
-		item.serialize(&mut se).map_err(|x| io::Error::new(io::ErrorKind::InvalidInput, x))
+		item.serialize(&mut se)
+			.map_err(|x| io::Error::new(io::ErrorKind::InvalidInput, x))
 	}
 }
