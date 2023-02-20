@@ -124,6 +124,8 @@ struct Keys {
 
 /// Decrypt a base64-encoded keybox and extract the keys
 fn decrypt_keybox(keybox: Bytes, passphrase: Bytes) -> io::Result<Keys> {
+	let mut keybox: Vec<u8> = keybox.into();
+	keybox.retain(|x| *x != b' ' && *x != b'\n' && *x != b'\t' && *x != b'\r');
 	let keybox = match base64::decode(&keybox) {
 		Ok(v) => v,
 		Err(_) => {
