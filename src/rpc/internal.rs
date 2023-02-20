@@ -13,6 +13,8 @@ use bytes::Bytes;
 
 use futures::stream::{Stream, StreamExt};
 
+use tokio_util::sync::PollSender;
+
 use crate::diag;
 use crate::diag::{DiagnosticsSink, Progress};
 use crate::segments::Id;
@@ -40,16 +42,12 @@ macro_rules! match_rpc_response {
 #[derive(Clone)]
 pub struct RpcStoreClient {
 	request_ch: mpsc::Sender<RpcWorkerCommand>,
-	stream_block_size: usize,
 }
 
 impl RpcStoreClient {
 	pub fn new<I: AsyncRead + AsyncWrite + Send + 'static>(inner: I) -> Self {
 		let (_, ch_tx, _) = RpcWorkerConfig::with_name_prefix("client").spawn(inner);
-		Self {
-			request_ch: ch_tx,
-			stream_block_size: 128,
-		}
+		Self { request_ch: ch_tx }
 	}
 
 	pub async fn new_borg<I: AsyncRead + AsyncWrite + Send + Unpin + 'static>(
@@ -59,10 +57,7 @@ impl RpcStoreClient {
 		let (_, ch_tx, _) = RpcWorkerConfig::with_name_prefix("client")
 			.spawn_borg(inner, repository_path)
 			.await?;
-		Ok(Self {
-			request_ch: ch_tx,
-			stream_block_size: 1,
-		})
+		Ok(Self { request_ch: ch_tx })
 	}
 
 	async fn rpc_call(
@@ -166,122 +161,92 @@ impl ObjectStore for RpcStoreClient {
 	type ObjectStream = ObjectStream;
 
 	fn stream_objects(&self, object_ids: Vec<Id>) -> io::Result<ObjectStream> {
+		let backend = self.request_ch.clone();
+		let mut src = object_ids.into_iter().peekable();
+		let mut buffer = ObjectStreamBuffer::new(8);
+		buffer.try_fill(&backend, &mut src)?;
+		let backend = PollSender::new(backend);
 		Ok(ObjectStream {
-			backend: tokio_util::sync::PollSender::new(self.request_ch.clone()),
-			src: Chunker::new(object_ids, self.stream_block_size).peekable(),
-			curr_chunk: ObjectStreamChunk::None,
+			backend,
+			src,
+			buffer,
 		})
 	}
 }
 
-enum Chunk {
-	Single(Id),
-	Block(Vec<Id>),
+struct ObjectStreamBuffer {
+	inner: VecDeque<oneshot::Receiver<io::Result<RpcResponse>>>,
 }
 
-struct Chunker {
-	inner: std::vec::IntoIter<Id>,
-	block_size: usize,
-}
-
-impl Chunker {
-	fn new(src: Vec<Id>, block_size: usize) -> Self {
+impl ObjectStreamBuffer {
+	fn new(depth: usize) -> Self {
 		Self {
-			inner: src.into_iter(),
-			block_size,
+			inner: VecDeque::with_capacity(depth),
 		}
 	}
-}
 
-impl Iterator for Chunker {
-	type Item = Chunk;
+	fn try_fill<I: Iterator<Item = Id>>(
+		&mut self,
+		backend: &mpsc::Sender<RpcWorkerCommand>,
+		src: &mut std::iter::Peekable<I>,
+	) -> Result<()> {
+		while self.inner.len() < self.inner.capacity() {
+			if src.peek().is_none() {
+				return Ok(());
+			}
+			let permit = match backend.try_reserve() {
+				Ok(permit) => permit,
+				Err(mpsc::error::TrySendError::Closed(())) => return Err(Error::LostWorker),
+				Err(mpsc::error::TrySendError::Full(())) => return Ok(()),
+			};
+			let id = src.next().unwrap(); // peeked before
+			let (result_tx, result_rx) = oneshot::channel();
+			permit.send((RpcRequest::RetrieveObject { id }, None, result_tx));
+			self.inner.push_back(result_rx);
+		}
+		Ok(())
+	}
 
-	fn next(&mut self) -> Option<Self::Item> {
-		if self.block_size == 1 {
-			Some(Chunk::Single(self.inner.next()?))
-		} else {
-			let nitems = self
-				.inner
-				.size_hint()
-				.1
-				.unwrap_or(self.block_size)
-				.min(self.block_size);
-			let mut buf = Vec::with_capacity(nitems);
-			for _ in 0..nitems {
-				match self.inner.next() {
-					Some(v) => buf.push(v),
-					None => break,
+	fn poll_fill<I: Iterator<Item = Id>>(
+		&mut self,
+		mut backend: Pin<&mut PollSender<RpcWorkerCommand>>,
+		src: &mut std::iter::Peekable<I>,
+		cx: &mut Context<'_>,
+	) -> Poll<Result<()>> {
+		while self.inner.len() < self.inner.capacity() {
+			if src.peek().is_none() {
+				return Poll::Ready(Ok(()));
+			}
+			match backend.as_mut().poll_reserve(cx) {
+				Poll::Pending => return Poll::Pending,
+				Poll::Ready(Err(_)) => return Poll::Ready(Err(Error::LostWorker)),
+				Poll::Ready(Ok(())) => (),
+			}
+			let id = src.next().unwrap(); // peeked before
+			let (result_tx, result_rx) = oneshot::channel();
+			match backend.send_item((RpcRequest::RetrieveObject { id }, None, result_tx)) {
+				Ok(()) => (),
+				Err(_) => return Poll::Ready(Err(Error::LostWorker)),
+			};
+			self.inner.push_back(result_rx);
+		}
+		Poll::Pending
+	}
+
+	fn poll_front(&mut self, cx: &mut Context<'_>) -> Poll<Option<io::Result<RpcResponse>>> {
+		let item = match self.inner.front_mut() {
+			None => return Poll::Ready(None),
+			Some(item) => item,
+		};
+		match Pin::new(item).poll(cx) {
+			Poll::Pending => Poll::Pending,
+			Poll::Ready(result) => {
+				self.inner.pop_front();
+				match result {
+					Ok(v) => Poll::Ready(Some(v)),
+					Err(_) => Poll::Ready(Some(Err(Error::LostWorker.into()))),
 				}
 			}
-			if buf.len() == 0 {
-				None
-			} else {
-				Some(Chunk::Block(buf))
-			}
-		}
-	}
-}
-
-pin_project_lite::pin_project! {
-	#[project = ObjectStreamChunkProj]
-	enum ObjectStreamChunk {
-		None,
-		Streamed{
-			#[pin]
-			inner: CompletionStream<RpcMessage, io::Result<RpcResponse>>,
-		},
-		Single{
-			#[pin]
-			inner: Option<oneshot::Receiver<io::Result<RpcResponse>>>,
-		},
-	}
-}
-
-impl ObjectStreamChunk {
-	fn is_none(self: Pin<&mut Self>) -> bool {
-		match self.project() {
-			ObjectStreamChunkProj::None => true,
-			_ => false,
-		}
-	}
-}
-
-impl Stream for ObjectStreamChunk {
-	type Item = CompletionStreamItem<RpcMessage, io::Result<RpcResponse>>;
-
-	fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
-		let this = self.project();
-		match this {
-			ObjectStreamChunkProj::None => Poll::Ready(None),
-			ObjectStreamChunkProj::Single { mut inner } => match inner.as_mut().as_pin_mut() {
-				Some(v) => match v.poll(cx) {
-					Poll::Ready(Ok(Ok(RpcResponse::DataReply(v)))) => {
-						*inner = None;
-						Poll::Ready(Some(CompletionStreamItem::Data(RpcMessage::StreamedChunk(
-							Ok(v),
-						))))
-					}
-					Poll::Ready(Ok(Ok(other))) => {
-						*inner = None;
-						Poll::Ready(Some(CompletionStreamItem::Completed(Err(
-							Error::UnexpectedResponse(other).into(),
-						))))
-					}
-					Poll::Ready(Ok(Err(e))) => {
-						*inner = None;
-						Poll::Ready(Some(CompletionStreamItem::Completed(Err(e))))
-					}
-					Poll::Ready(Err(_)) => {
-						*inner = None;
-						Poll::Ready(Some(CompletionStreamItem::Crashed))
-					}
-					Poll::Pending => Poll::Pending,
-				},
-				None => Poll::Ready(Some(CompletionStreamItem::Completed(Ok(
-					RpcResponse::Success,
-				)))),
-			},
-			ObjectStreamChunkProj::Streamed { inner } => inner.poll_next(cx),
 		}
 	}
 }
@@ -290,9 +255,8 @@ pin_project_lite::pin_project! {
 	pub struct ObjectStream {
 		#[pin]
 		backend: tokio_util::sync::PollSender<RpcWorkerCommand>,
-		src: std::iter::Peekable<Chunker>,
-		#[pin]
-		curr_chunk: ObjectStreamChunk,
+		src: std::iter::Peekable<std::vec::IntoIter<Id>>,
+		buffer: ObjectStreamBuffer,
 	}
 }
 
@@ -302,87 +266,28 @@ impl Stream for ObjectStream {
 	fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
 		//println!("ObjectStream asked for more");
 		let mut this = self.project();
-		loop {
-			if this.curr_chunk.as_mut().is_none() {
-				//println!("ObjectStream needs to request more");
-				if this.src.peek().is_none() {
-					//println!("ObjectStream exhausted");
-					return Poll::Ready(None);
+		// we ignore the result of *this* polling, because we only do this
+		// for opportunistic reasons.
+		let _: Poll<_> = this.buffer.poll_fill(this.backend.as_mut(), this.src, cx);
+		match this.buffer.poll_front(cx) {
+			Poll::Ready(Some(v)) => match v {
+				Ok(RpcResponse::DataReply(data)) => return Poll::Ready(Some(Ok(data))),
+				Ok(other) => {
+					return Poll::Ready(Some(Err(Error::UnexpectedResponse(other).into())))
 				}
+				Err(e) => return Poll::Ready(Some(Err(e))),
+			},
+			Poll::Pending => return Poll::Pending,
+			// nothing in the buffer right now, try to fill some again below.
+			Poll::Ready(None) => (),
+		};
 
-				match this.backend.as_mut().poll_reserve(cx) {
-					Poll::Pending => return Poll::Pending,
-					Poll::Ready(Err(_)) => return Poll::Ready(Some(Err(Error::LostWorker.into()))),
-					Poll::Ready(Ok(())) => (),
-				}
-
-				// we can now prepare the sending :-)
-				let chunk = this.src.next().unwrap();
-				*this.curr_chunk = match chunk {
-					Chunk::Single(id) => {
-						let (result_tx, result_rx) = oneshot::channel();
-						match this.backend.send_item((
-							RpcRequest::RetrieveObject { id },
-							None,
-							result_tx,
-						)) {
-							Ok(()) => (),
-							Err(_) => return Poll::Ready(Some(Err(Error::LostWorker.into()))),
-						};
-						ObjectStreamChunk::Single {
-							inner: Some(result_rx),
-						}
-					}
-					Chunk::Block(ids) => {
-						let (result_tx, result_rx) = oneshot::channel();
-						let (msg_tx, msg_rx) = mpsc::channel(ids.len());
-						match this.backend.send_item((
-							RpcRequest::StreamObjects { ids },
-							Some(msg_tx),
-							result_tx,
-						)) {
-							Ok(()) => (),
-							Err(_) => return Poll::Ready(Some(Err(Error::LostWorker.into()))),
-						};
-						ObjectStreamChunk::Streamed {
-							inner: CompletionStream::wrap(msg_rx, result_rx),
-						}
-					}
-				};
-			}
-
-			//println!("ObjectStream asking inner stream");
-			match this.curr_chunk.as_mut().poll_next(cx) {
-				// forward streamed data to user
-				Poll::Ready(Some(CompletionStreamItem::Data(RpcMessage::StreamedChunk(data)))) => {
-					return Poll::Ready(Some(data.map_err(Error::Remote).map_err(|x| x.into())))
-				}
-				// ignore unexpected messages
-				Poll::Ready(Some(CompletionStreamItem::Data(_))) => (),
-				// if completed ...
-				Poll::Ready(Some(CompletionStreamItem::Completed(Ok(v)))) => {
-					*this.curr_chunk = ObjectStreamChunk::None;
-					match v.result() {
-						// ... with success, we try the next one
-						Ok(_) => (),
-						// ... with error, we return the error
-						Err(e) => return Poll::Ready(Some(Err(e.into()))),
-					}
-				}
-				// if completed with error (e.g. send error), we return the error
-				Poll::Ready(Some(CompletionStreamItem::Completed(Err(e)))) => {
-					*this.curr_chunk = ObjectStreamChunk::None;
-					return Poll::Ready(Some(Err(e)));
-				}
-				// if completed unexpectedly, continue and inject LostWorker error
-				Poll::Ready(None) | Poll::Ready(Some(CompletionStreamItem::Crashed)) => {
-					*this.curr_chunk = ObjectStreamChunk::None;
-					return Poll::Ready(Some(Err(Error::LostWorker.into())));
-				}
-				Poll::Pending => return Poll::Pending,
-			}
-
-			*this.curr_chunk = ObjectStreamChunk::None;
+		match this.buffer.poll_fill(this.backend.as_mut(), this.src, cx) {
+			// there is nothing left in the buffer, and nothing in src.
+			Poll::Ready(Ok(())) => Poll::Ready(None),
+			// there is nothing left in the buffer, and we cannot fill it because of errors.
+			Poll::Ready(Err(e)) => Poll::Ready(Some(Err(e.into()))),
+			Poll::Pending => Poll::Pending,
 		}
 	}
 }
