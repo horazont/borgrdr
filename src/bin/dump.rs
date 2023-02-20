@@ -1,4 +1,5 @@
 use std::env::args;
+use std::pin::Pin;
 
 use anyhow::{Context, Result};
 
@@ -45,11 +46,83 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 	println!("  Version   : {}", manifest.version());
 	println!("  Timestamp : {}", manifest.timestamp());
 	println!("  Item Keys : {}", manifest.item_keys().join(", "));
-	println!("\nArchives:");
+	let mut archives = Vec::new();
 	for (k, v) in manifest.archives().iter() {
+		let archive = repo
+			.read_archive(v.id())
+			.await
+			.with_context(|| format!("while reading archive info of archive {}", k))?;
+		archives.push((k.clone(), v, archive));
+	}
+	println!("\nArchives:");
+	archives.sort_by_key(|(k, _, _)| k.clone());
+	{
+		let mut i = 0;
+		let mut stream = repo
+			.grouped_archive_items(
+				archives
+					.iter()
+					.map(|(_, v, archive)| {
+						(
+							*v.id(),
+							archive
+								.items()
+								.iter()
+								.map(|x| *x)
+								.collect::<Vec<_>>()
+								.into_iter(),
+						)
+					})
+					.collect::<Vec<_>>()
+					.into_iter(),
+			)
+			.await?;
+		while let Some(k) = stream.identity() {
+			assert_eq!(archives[i].1.id(), k);
+			let (k, v, archive) = &archives[i];
+			let archive_matches = archive_name.as_ref().map(|x| &k == x).unwrap_or(false);
+			println!("{}  [{}] id={:?}", k, v.timestamp(), v.id());
+			println!("  Version: {}", archive.version());
+			println!("  Name: {:?}", archive.name());
+			println!("  Hostname: {:?}", archive.hostname());
+			println!("  Username: {:?}", archive.username());
+			println!("  Start time: {:?}", archive.start_time());
+			println!("  End time: {:?}", archive.end_time());
+			println!("  Comment: {:?}", archive.comment());
+			println!("  Items:");
+			while let Some(item) = stream.next().await {
+				let item = item.with_context(|| format!("while reading item of archive {}", k))?;
+				print!("    {} ", mode_to_str(item.mode()));
+				if let Some(sz) = item.size() {
+					print!(" {:>9}", sz)
+				} else {
+					print!(" {:>9}", "")
+				};
+				print!(" {:>5} {:>5}", item.uid(), item.gid());
+				if let Some(mtime) = item.mtime() {
+					print!(" {:>9}", convert_ts(mtime));
+				} else {
+					print!(" {:>9}", "");
+				}
+				print!(" {:?}", item.path());
+				println!();
+				if archive_matches {
+					let path_matches = file_name
+						.as_ref()
+						.map(|x| item.path() == x)
+						.unwrap_or(false);
+					if path_matches {
+						chunks_to_extract = Some(item.chunks().iter().map(|x| *x.id()).collect());
+					}
+				}
+			}
+			Pin::new(&mut stream).next_group();
+			i += 1;
+		}
+	}
+	/* for (k, v, archive) in archives {
 		let archive_matches = archive_name.as_ref().map(|x| &k == x).unwrap_or(false);
 		println!("{}  [{}] id={:?}", k, v.timestamp(), v.id());
-		let archive = repo.read_archive(v.id()).await?;
 		println!("  Version: {}", archive.version());
 		println!("  Name: {:?}", archive.name());
 		println!("  Hostname: {:?}", archive.hostname());
@@ -86,7 +159,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 				}
 			}
 		}
-	}
+	} */
 
 	if let Some(chunks) = chunks_to_extract {
 		let mut stream = repo.open_stream(chunks)?;

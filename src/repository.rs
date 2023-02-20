@@ -1,4 +1,5 @@
 use std::fmt;
+use std::future::Future;
 use std::io;
 use std::pin::Pin;
 use std::task::{Context, Poll};
@@ -263,6 +264,33 @@ impl<S: ObjectStore + Send + Sync + 'static> Repository<S> {
 		Ok(FramedRead::new(self.open_stream(ids)?, MpCodec::new()))
 	}
 
+	pub async fn grouped_archive_items<
+		'x,
+		K: 'static + Copy + PartialEq + Eq + Send + Sync + Unpin,
+		II: 'static + Iterator<Item = Id> + Send + Sync,
+		I: 'static + Iterator<Item = (K, II)> + Send + Sync,
+	>(
+		&'x self,
+		i: I,
+	) -> io::Result<PrefetchedArchiveItems<'x, K, S::PrefetchStream<K, II, I>, S>> {
+		let first = PrefetchStreamOuter {
+			inner: Some(Box::pin(self.store.stream_objects_with_prefetch(i)?)),
+		};
+		let stream = first.await?;
+		let inner = match stream {
+			None => None,
+			Some(stream) => Some(FramedRead::new(
+				StreamReader {
+					repo: self,
+					src: stream,
+					curr: None,
+				},
+				MpCodec::new(),
+			)),
+		};
+		Ok(PrefetchedArchiveItems { inner })
+	}
+
 	pub async fn check_archives(
 		&self,
 		mut progress: Option<&mut (dyn DiagnosticsSink + Send)>,
@@ -379,6 +407,18 @@ pin_project_lite::pin_project! {
 }
 
 impl<'p, 'x, S: ObjectStore + Send + Sync + 'static, I: Stream<Item = io::Result<Bytes>>>
+	StreamReader<'x, S, I>
+{
+	fn into_inner(self) -> (&'x Repository<S>, I) {
+		(self.repo, self.src)
+	}
+
+	fn get_stream(&self) -> &I {
+		&self.src
+	}
+}
+
+impl<'p, 'x, S: ObjectStore + Send + Sync + 'static, I: Stream<Item = io::Result<Bytes>>>
 	StreamReaderProj<'p, 'x, S, I>
 {
 	fn poll_next_object(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<Option<Bytes>>> {
@@ -453,5 +493,158 @@ impl<'p, 'x, S: ObjectStore + Send + Sync + 'static, I: Stream<Item = io::Result
 			}
 		}
 		Poll::Ready(Ok(this.curr.as_ref().unwrap().chunk()))
+	}
+}
+
+enum PrefetchStreamGroupState<M, T> {
+	Running(Option<T>),
+	Complete(Option<(M, T)>),
+}
+
+pub struct PrefetchStreamGroup<M, T, S> {
+	inner: Pin<Box<S>>,
+	identity: M,
+	state: PrefetchStreamGroupState<M, T>,
+}
+
+impl<M: PartialEq + Eq + Unpin, T: Unpin, S: Stream<Item = io::Result<(M, Bytes)>>>
+	PrefetchStreamGroup<M, T, S>
+{
+	fn into_next(self) -> Option<Self> {
+		match self.state {
+			PrefetchStreamGroupState::Running(_) => panic!("stream group is not depleted yet"),
+			PrefetchStreamGroupState::Complete(substate) => match substate {
+				None => None,
+				Some((next_metadata, next_data)) => Some(Self {
+					state: PrefetchStreamGroupState::Running(Some(next_data)),
+					identity: next_metadata,
+					inner: self.inner,
+				}),
+			},
+		}
+	}
+
+	fn identity(&self) -> &M {
+		&self.identity
+	}
+}
+
+impl<M: PartialEq + Eq + Unpin, T: Unpin, S: Stream<Item = io::Result<(M, T)>>> Stream
+	for PrefetchStreamGroup<M, T, S>
+{
+	type Item = io::Result<T>;
+
+	fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+		match self.state {
+			PrefetchStreamGroupState::Running(ref mut opt) => match opt.take() {
+				Some(v) => return Poll::Ready(Some(Ok(v))),
+				None => (),
+			},
+			PrefetchStreamGroupState::Complete(_) => return Poll::Ready(None),
+		};
+
+		match self.as_mut().inner.as_mut().poll_next(cx) {
+			Poll::Pending => Poll::Pending,
+			Poll::Ready(Some(Err(e))) => Poll::Ready(Some(Err(e))),
+			Poll::Ready(Some(Ok((metadata, data)))) => {
+				if metadata == self.identity {
+					Poll::Ready(Some(Ok(data)))
+				} else {
+					self.state = PrefetchStreamGroupState::Complete(Some((metadata, data)));
+					Poll::Ready(None)
+				}
+			}
+			Poll::Ready(None) => {
+				self.state = PrefetchStreamGroupState::Complete(None);
+				Poll::Ready(None)
+			}
+		}
+	}
+}
+
+pub struct PrefetchStreamOuter<S> {
+	inner: Option<Pin<Box<S>>>,
+}
+
+impl<M, T, S: Stream<Item = io::Result<(M, T)>>> Future for PrefetchStreamOuter<S> {
+	type Output = io::Result<Option<PrefetchStreamGroup<M, T, S>>>;
+
+	fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+		match self.as_mut().inner.as_mut() {
+			Some(inner) => match inner.as_mut().poll_next(cx) {
+				Poll::Pending => Poll::Pending,
+				Poll::Ready(None) => Poll::Ready(Ok(None)),
+				Poll::Ready(Some(Err(e))) => Poll::Ready(Err(e)),
+				Poll::Ready(Some(Ok((metadata, data)))) => {
+					Poll::Ready(Ok(Some(PrefetchStreamGroup {
+						inner: self.inner.take().unwrap(),
+						identity: metadata,
+						state: PrefetchStreamGroupState::Running(Some(data)),
+					})))
+				}
+			},
+			None => Poll::Ready(Ok(None)),
+		}
+	}
+}
+
+pin_project_lite::pin_project! {
+	#[project = PrefetchedArchiveItemsProj]
+	pub struct PrefetchedArchiveItems<'x, K, Src, Store> {
+		#[pin]
+		inner: Option<FramedRead<StreamReader<'x, Store, PrefetchStreamGroup<K, Bytes, Src>>, MpCodec<ArchiveItem>>>,
+	}
+}
+
+impl<
+		'x,
+		K: PartialEq + Eq + Send + Sync + Unpin,
+		Src: Stream<Item = io::Result<(K, Bytes)>>,
+		Store: ObjectStore + Send + Sync + 'static,
+	> PrefetchedArchiveItems<'x, K, Src, Store>
+{
+	pub fn next_group(self: Pin<&mut Self>) {
+		let mut this = self.project();
+		let (repo, inner) = match this.inner.take() {
+			None => return,
+			Some(v) => v.into_inner().into_inner(),
+		};
+		let new_inner = match inner.into_next() {
+			None => return,
+			Some(v) => v,
+		};
+		*this.inner = Some(FramedRead::new(
+			StreamReader {
+				repo,
+				curr: None,
+				src: new_inner,
+			},
+			MpCodec::new(),
+		));
+	}
+
+	pub fn identity(&self) -> Option<&K> {
+		Some(self.inner.as_ref()?.get_ref().get_stream().identity())
+	}
+}
+
+impl<
+		'x,
+		K: PartialEq + Eq + Send + Sync + Unpin,
+		Src: Stream<Item = io::Result<(K, Bytes)>>,
+		Store: ObjectStore + Send + Sync + 'static,
+	> Stream for PrefetchedArchiveItems<'x, K, Src, Store>
+{
+	type Item = io::Result<ArchiveItem>;
+
+	fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+		let this = self.project();
+		match this.inner.as_pin_mut() {
+			None => Poll::Ready(None),
+			Some(inner) => match inner.poll_next(cx) {
+				Poll::Ready(v) => Poll::Ready(v),
+				Poll::Pending => Poll::Pending,
+			},
+		}
 	}
 }

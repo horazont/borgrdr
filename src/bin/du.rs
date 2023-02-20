@@ -11,6 +11,7 @@ use std::io::Write;
 use std::ops::Deref;
 use std::os::unix::{ffi::OsStrExt, fs::symlink};
 use std::path::MAIN_SEPARATOR;
+use std::pin::Pin;
 #[deny(unsafe_op_in_unsafe_fn)]
 /*
 things to display:
@@ -280,7 +281,7 @@ async fn read_entries(
 	repo: Repository<RpcStoreClient>,
 	archive_sink: mpsc::Sender<(Version, mpsc::Receiver<FileEntry>)>,
 	cb_sink: cursive::CbSink,
-) -> Result<Repository<RpcStoreClient>, io::Error> {
+) -> anyhow::Result<Repository<RpcStoreClient>> {
 	let manifest = repo.manifest();
 	let narchives = manifest.archives().len();
 	cb_sink.send(Box::new(move |siv: &mut Cursive| {
@@ -292,27 +293,56 @@ async fn read_entries(
 			.apply_to(pb)
 		});
 	}));
-	for (i, v) in manifest.archives().values().enumerate() {
-		let (version, items) = {
-			let archive = repo.read_archive(v.id()).await?;
-			let timestamp = match NaiveDateTime::parse_from_str(
-				archive.start_time(),
-				"%Y-%m-%dT%H:%M:%S%.6f",
-			) {
+	let mut prepared_archives: Vec<(Id, borgrdr::structs::Archive)> = Vec::new();
+	for (k, v) in manifest.archives().iter() {
+		let archive = repo
+			.read_archive(v.id())
+			.await
+			.with_context(|| format!("while reading archive info for {:?}", k))?;
+		prepared_archives.push((*v.id(), archive));
+	}
+
+	let mut stream = repo
+		.grouped_archive_items(
+			prepared_archives
+				.iter()
+				.map(|(id, archive)| {
+					(
+						*id,
+						archive
+							.items()
+							.iter()
+							.map(|x| *x)
+							.collect::<Vec<_>>()
+							.into_iter(),
+					)
+				})
+				.collect::<Vec<_>>()
+				.into_iter(),
+		)
+		.await?;
+
+	let mut i = 0;
+	while let Some(id) = stream.identity() {
+		assert!(*id == prepared_archives[i].0);
+		let archive = &prepared_archives[i].1;
+		let timestamp =
+			match NaiveDateTime::parse_from_str(archive.start_time(), "%Y-%m-%dT%H:%M:%S%.6f") {
 				Ok(v) => Ok(DateTime::from_utc(v, Utc)),
 				Err(_) => Err(archive.start_time().into()),
 			};
-			let version = Version(Arc::new(VersionInfo {
-				name: archive.name().into(),
-				timestamp,
-			}));
-			(version, archive.items().iter().map(|x| *x).collect())
-		};
+		let version = Version(Arc::new(VersionInfo {
+			name: archive.name().into(),
+			timestamp,
+		}));
 		let (item_sink, item_source) = mpsc::channel(128);
-		archive_sink.send((version, item_source)).await.unwrap();
-		let mut archive_item_stream = repo.archive_items(items)?;
-		while let Some(item) = archive_item_stream.next().await {
-			let item = item?;
+		archive_sink
+			.send((version.clone(), item_source))
+			.await
+			.unwrap();
+		while let Some(item) = stream.next().await {
+			let item = item
+				.with_context(|| format!("while reading item from archive {:?}", version.name))?;
 			let item: FileEntry = match item.try_into() {
 				Ok(v) => v,
 				Err((e, item)) => {
@@ -322,16 +352,20 @@ async fn read_entries(
 			};
 			item_sink.send(item).await.unwrap();
 		}
+		Pin::new(&mut stream).next_group();
+		i += 1;
 		cb_sink.send(Box::new(move |siv: &mut Cursive| {
 			siv.call_on_name("progress", |pb: &mut ProgressBar| {
 				ArchiveProgress::ReadingArchives {
-					done: i + 1,
+					done: i,
 					total: narchives,
 				}
 				.apply_to(pb)
 			});
 		}));
 	}
+	drop(stream);
+
 	cb_sink.send(Box::new(move |siv: &mut Cursive| {
 		siv.call_on_name("progress", |pb: &mut ProgressBar| {
 			ArchiveProgress::Done.apply_to(pb)

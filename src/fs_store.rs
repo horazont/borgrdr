@@ -2,9 +2,9 @@ use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::fs;
-use std::future::Future;
 use std::io;
 use std::io::Seek;
+use std::marker::PhantomData;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::sync::Arc;
@@ -532,6 +532,23 @@ impl ObjectStore for Arc<FsStore> {
 			store: Arc::clone(self),
 			request: None,
 		})
+	}
+
+	type PrefetchStream<
+		M: 'static + Copy + Sync + Send,
+		II: 'static + Send + Sync + Iterator<Item = Id>,
+		IO: 'static + Send + Sync + Iterator<Item = (M, II)>,
+	> = crate::rpc::internal::PrefetchStream<M, crate::rpc::internal::PrefetchFlattener<M, II, IO>>;
+
+	fn stream_objects_with_prefetch<
+		M: 'static + Copy + Sync + Send,
+		II: 'static + Iterator<Item = Id> + Send + Sync,
+		IO: 'static + Iterator<Item = (M, II)> + Send + Sync,
+	>(
+		&self,
+		_groups: IO,
+	) -> io::Result<Self::PrefetchStream<M, II, IO>> {
+		todo!();
 	}
 }
 
