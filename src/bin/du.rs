@@ -208,7 +208,7 @@ struct FileEntry {
 	owner: Entity,
 	group: Entity,
 	times: Times,
-	xattrs: Vec<(Vec<u8>, Vec<u8>)>,
+	xattrs: Vec<(Vec<u8>, Option<Vec<u8>>)>,
 	payload: FileData,
 }
 
@@ -263,7 +263,7 @@ impl TryFrom<ArchiveItem> for FileEntry {
 		let xattrs = other
 			.into_xattrs()
 			.into_iter()
-			.map(|(k, v)| (k.into(), v.into()))
+			.map(|(k, v)| (k.into(), v.map(|x| x.into())))
 			.collect();
 		Ok(Self {
 			path,
@@ -508,7 +508,7 @@ struct FileMetadata {
 	permissions: u16,
 	owner: Entity,
 	group: Entity,
-	xattrs: Vec<(Vec<u8>, Vec<u8>)>,
+	xattrs: Vec<(Vec<u8>, Option<Vec<u8>>)>,
 }
 
 impl Default for FileMetadata {
