@@ -51,6 +51,7 @@ use tokio::sync::mpsc;
 
 use futures::stream::StreamExt;
 
+use borgrdr::pipeline::SegmentedStream;
 use borgrdr::repository::Repository;
 use borgrdr::rpc::RpcStoreClient;
 use borgrdr::segments::Id;
@@ -323,8 +324,8 @@ async fn read_entries(
 		.await?;
 
 	let mut i = 0;
-	while let Some(id) = stream.identity() {
-		assert!(*id == prepared_archives[i].0);
+	while let Some(id) = stream.next_segment() {
+		assert!(id == prepared_archives[i].0);
 		let archive = &prepared_archives[i].1;
 		let timestamp =
 			match NaiveDateTime::parse_from_str(archive.start_time(), "%Y-%m-%dT%H:%M:%S%.6f") {
@@ -352,7 +353,6 @@ async fn read_entries(
 			};
 			item_sink.send(item).await.unwrap();
 		}
-		Pin::new(&mut stream).next_group();
 		i += 1;
 		cb_sink.send(Box::new(move |siv: &mut Cursive| {
 			siv.call_on_name("progress", |pb: &mut ProgressBar| {

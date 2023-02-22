@@ -1,5 +1,4 @@
 use std::fmt;
-use std::future::Future;
 use std::io;
 use std::pin::Pin;
 use std::task::{Context, Poll};
@@ -25,8 +24,9 @@ use super::diag;
 use super::diag::{DiagnosticsSink, Progress};
 use super::rmp_codec::MpCodec;
 use super::segments::Id;
-use super::store::{ObjectStore, PrefetchStreamItem};
+use super::store::ObjectStore;
 use super::structs::{Archive, ArchiveItem, Manifest};
+use crate::pipeline::{Pipeline, PipelineStream, SegmentedStream};
 
 #[derive(Debug)]
 pub enum Error {
@@ -126,7 +126,7 @@ pub struct Repository<S> {
 	crypto_ctx: crypto::Context,
 }
 
-impl<S: ObjectStore + Send + Sync + 'static> Repository<S> {
+impl<S: ObjectStore + Send + Sync + Clone + 'static> Repository<S> {
 	pub fn into_store(self) -> S {
 		self.store
 	}
@@ -266,14 +266,16 @@ impl<S: ObjectStore + Send + Sync + 'static> Repository<S> {
 
 	pub async fn grouped_archive_items<
 		'x,
-		K: 'static + Copy + PartialEq + Eq + Send + Sync + Unpin,
-		II: 'static + Iterator<Item = Id> + Send + Sync,
-		I: 'static + Iterator<Item = (K, II)> + Send + Sync,
+		K: 'static + Send + Sync + Unpin,
+		II: 'static + Iterator<Item = Id> + Send + Sync + Unpin,
+		IO: 'static + Iterator<Item = (K, II)> + Send + Sync + Unpin,
 	>(
 		&'x self,
-		i: I,
-	) -> io::Result<PrefetchedArchiveItems<'x, K, S::PrefetchStream<K, II, I>, S>> {
-		let first = PrefetchStreamOuter {
+		i: IO,
+	) -> io::Result<PrefetchedArchiveItems<'x, PipelineStream<K, Pipeline<'x, S, K, II, IO>>, S>> {
+		let stream = PipelineStream::new(Pipeline::start(&self.store, i)).await?;
+		Ok(PrefetchedArchiveItems::new(self, stream))
+		/* let first = PrefetchStreamOuter {
 			inner: Some(Box::pin(self.store.stream_objects_with_prefetch(i)?)),
 		};
 		let stream = first.await?;
@@ -288,7 +290,7 @@ impl<S: ObjectStore + Send + Sync + 'static> Repository<S> {
 				MpCodec::new(),
 			)),
 		};
-		Ok(PrefetchedArchiveItems { inner })
+		Ok(PrefetchedArchiveItems { inner }) */
 	}
 
 	pub async fn check_archives(
@@ -410,14 +412,14 @@ impl<'p, 'x, S, I> StreamReader<'x, S, I> {
 	fn into_inner(self) -> (&'x Repository<S>, I) {
 		(self.repo, self.src)
 	}
-
-	fn get_stream(&self) -> &I {
-		&self.src
-	}
 }
 
-impl<'p, 'x, S: ObjectStore + Send + Sync + 'static, I: Stream<Item = io::Result<Bytes>>>
-	StreamReaderProj<'p, 'x, S, I>
+impl<
+		'p,
+		'x,
+		S: ObjectStore + Send + Sync + Clone + 'static,
+		I: Stream<Item = io::Result<Bytes>>,
+	> StreamReaderProj<'p, 'x, S, I>
 {
 	fn poll_next_object(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<Option<Bytes>>> {
 		//println!("StreamReader looking for next object");
@@ -430,8 +432,12 @@ impl<'p, 'x, S: ObjectStore + Send + Sync + 'static, I: Stream<Item = io::Result
 	}
 }
 
-impl<'p, 'x, S: ObjectStore + Send + Sync + 'static, I: Stream<Item = io::Result<Bytes>>> AsyncRead
-	for StreamReader<'x, S, I>
+impl<
+		'p,
+		'x,
+		S: ObjectStore + Send + Sync + Clone + 'static,
+		I: Stream<Item = io::Result<Bytes>>,
+	> AsyncRead for StreamReader<'x, S, I>
 {
 	fn poll_read(
 		mut self: Pin<&mut Self>,
@@ -454,8 +460,12 @@ impl<'p, 'x, S: ObjectStore + Send + Sync + 'static, I: Stream<Item = io::Result
 	}
 }
 
-impl<'p, 'x, S: ObjectStore + Send + Sync + 'static, I: Stream<Item = io::Result<Bytes>>>
-	AsyncBufRead for StreamReader<'x, S, I>
+impl<
+		'p,
+		'x,
+		S: ObjectStore + Send + Sync + Clone + 'static,
+		I: Stream<Item = io::Result<Bytes>>,
+	> AsyncBufRead for StreamReader<'x, S, I>
 {
 	fn consume(self: Pin<&mut Self>, amt: usize) {
 		if amt == 0 {
@@ -494,144 +504,68 @@ impl<'p, 'x, S: ObjectStore + Send + Sync + 'static, I: Stream<Item = io::Result
 	}
 }
 
-enum PrefetchStreamGroupState<M> {
-	Running,
-	Complete(Option<M>),
-}
-
-pub struct PrefetchStreamGroup<M, S> {
-	inner: Pin<Box<S>>,
-	identity: M,
-	state: PrefetchStreamGroupState<M>,
-}
-
-impl<M: Unpin, T: Unpin, S: Stream<Item = PrefetchStreamItem<M, T>>> PrefetchStreamGroup<M, S> {
-	fn into_next(self) -> Option<Self> {
-		match self.state {
-			PrefetchStreamGroupState::Running => panic!("stream group is not depleted yet"),
-			PrefetchStreamGroupState::Complete(substate) => match substate {
-				None => None,
-				Some(next_metadata) => Some(Self {
-					state: PrefetchStreamGroupState::Running,
-					identity: next_metadata,
-					inner: self.inner,
-				}),
-			},
-		}
-	}
-
-	fn identity(&self) -> &M {
-		&self.identity
-	}
-}
-
-impl<M: Unpin, T: Unpin, S: Stream<Item = PrefetchStreamItem<M, T>>> Stream
-	for PrefetchStreamGroup<M, S>
-{
-	type Item = io::Result<T>;
-
-	fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
-		match self.state {
-			PrefetchStreamGroupState::Running => (),
-			PrefetchStreamGroupState::Complete(_) => return Poll::Ready(None),
-		};
-
-		match self.as_mut().inner.as_mut().poll_next(cx) {
-			Poll::Pending => Poll::Pending,
-			Poll::Ready(None) => {
-				self.state = PrefetchStreamGroupState::Complete(None);
-				Poll::Ready(None)
-			}
-			Poll::Ready(Some(PrefetchStreamItem::Metadata(metadata))) => {
-				self.state = PrefetchStreamGroupState::Complete(Some(metadata));
-				Poll::Ready(None)
-			}
-			Poll::Ready(Some(PrefetchStreamItem::Data(d))) => Poll::Ready(Some(d)),
-		}
-	}
-}
-
-pub struct PrefetchStreamOuter<S> {
-	inner: Option<Pin<Box<S>>>,
-}
-
-impl<M, T, S: Stream<Item = PrefetchStreamItem<M, T>>> Future for PrefetchStreamOuter<S> {
-	type Output = io::Result<Option<PrefetchStreamGroup<M, S>>>;
-
-	fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-		match self.as_mut().inner.as_mut() {
-			Some(inner) => match inner.as_mut().poll_next(cx) {
-				Poll::Pending => Poll::Pending,
-				Poll::Ready(None) => Poll::Ready(Ok(None)),
-				Poll::Ready(Some(PrefetchStreamItem::Metadata(m))) => {
-					Poll::Ready(Ok(Some(PrefetchStreamGroup {
-						inner: self.inner.take().unwrap(),
-						identity: m,
-						state: PrefetchStreamGroupState::Running,
-					})))
-				}
-				Poll::Ready(Some(PrefetchStreamItem::Data(Err(e)))) => Poll::Ready(Err(e)),
-				Poll::Ready(Some(_)) => panic!("prefetch stream is not at beginning"),
-			},
-			None => Poll::Ready(Ok(None)),
-		}
-	}
-}
-
-pin_project_lite::pin_project! {
-	#[project = PrefetchedArchiveItemsProj]
-	pub struct PrefetchedArchiveItems<'x, K, Src, Store> {
-		#[pin]
-		inner: Option<FramedRead<StreamReader<'x, Store, PrefetchStreamGroup<K, Src>>, MpCodec<ArchiveItem>>>,
-	}
+pub struct PrefetchedArchiveItems<'x, Src: 'x, Store> {
+	inner: Option<FramedRead<StreamReader<'x, Store, Src>, MpCodec<ArchiveItem>>>,
 }
 
 impl<
 		'x,
-		K: PartialEq + Eq + Send + Sync + Unpin,
-		Src: Stream<Item = PrefetchStreamItem<K, Bytes>>,
-		Store: ObjectStore + Send + Sync + 'static,
-	> PrefetchedArchiveItems<'x, K, Src, Store>
+		K: Unpin,
+		Src: Stream<Item = io::Result<Bytes>> + SegmentedStream<Delimiter = K> + Unpin + 'x,
+		Store: ObjectStore + Send + Sync + Clone + 'static,
+	> PrefetchedArchiveItems<'x, Src, Store>
 {
-	pub fn next_group(self: Pin<&mut Self>) {
-		let mut this = self.project();
-		let (repo, inner) = match this.inner.take() {
-			None => return,
-			Some(v) => v.into_inner().into_inner(),
-		};
-		let new_inner = match inner.into_next() {
-			None => return,
-			Some(v) => v,
-		};
-		*this.inner = Some(FramedRead::new(
+	fn wrap(
+		repo: &'x Repository<Store>,
+		inner: Src,
+	) -> FramedRead<StreamReader<'x, Store, Src>, MpCodec<ArchiveItem>> {
+		FramedRead::new(
 			StreamReader {
 				repo,
 				curr: None,
-				src: new_inner,
+				src: inner,
 			},
 			MpCodec::new(),
-		));
+		)
 	}
 
-	pub fn identity(&self) -> Option<&K> {
-		Some(self.inner.as_ref()?.get_ref().get_stream().identity())
+	fn new(repo: &'x Repository<Store>, inner: Src) -> Self {
+		Self {
+			inner: Some(Self::wrap(repo, inner)),
+		}
 	}
 }
 
 impl<
 		'x,
-		K: PartialEq + Eq + Send + Sync + Unpin,
-		Src: Stream<Item = PrefetchStreamItem<K, Bytes>>,
-		Store: ObjectStore + Send + Sync + 'static,
-	> Stream for PrefetchedArchiveItems<'x, K, Src, Store>
+		K: Unpin,
+		Src: Stream<Item = io::Result<Bytes>> + SegmentedStream<Delimiter = K> + Unpin + 'x,
+		Store: ObjectStore + Send + Sync + Clone + 'static,
+	> SegmentedStream for PrefetchedArchiveItems<'x, Src, Store>
+{
+	type Delimiter = K;
+
+	fn next_segment(&mut self) -> Option<Self::Delimiter> {
+		let (repo, mut inner) = self.inner.take()?.into_inner().into_inner();
+		let result = inner.next_segment();
+		self.inner = Some(Self::wrap(repo, inner));
+		result
+	}
+}
+
+impl<
+		'x,
+		K: Unpin,
+		Src: Stream<Item = io::Result<Bytes>> + SegmentedStream<Delimiter = K> + Unpin + 'x,
+		Store: ObjectStore + Send + Sync + Clone + 'static,
+	> Stream for PrefetchedArchiveItems<'x, Src, Store>
 {
 	type Item = io::Result<ArchiveItem>;
 
-	fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
-		let this = self.project();
-		match this.inner.as_pin_mut() {
+	fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+		match self.inner.as_mut() {
 			None => Poll::Ready(None),
-			Some(inner) => match inner.poll_next(cx) {
+			Some(inner) => match Pin::new(inner).poll_next(cx) {
 				Poll::Ready(v) => Poll::Ready(v),
 				Poll::Pending => Poll::Pending,
 			},

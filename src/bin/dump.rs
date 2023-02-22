@@ -1,5 +1,4 @@
 use std::env::args;
-use std::pin::Pin;
 
 use anyhow::{Context, Result};
 
@@ -7,6 +6,7 @@ use futures::stream::StreamExt;
 
 use chrono::{DateTime, TimeZone, Utc};
 
+use borgrdr::pipeline::SegmentedStream;
 use borgrdr::segments::Id;
 
 fn mode_to_str(mode: u32) -> String {
@@ -77,8 +77,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 					.into_iter(),
 			)
 			.await?;
-		while let Some(k) = stream.identity() {
-			assert_eq!(archives[i].1.id(), k);
+		while let Some(k) = stream.next_segment() {
+			assert_eq!(*archives[i].1.id(), k);
 			let (k, v, archive) = &archives[i];
 			let archive_matches = archive_name.as_ref().map(|x| &k == x).unwrap_or(false);
 			println!("{}  [{}] id={:?}", k, v.timestamp(), v.id());
@@ -116,7 +116,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 					}
 				}
 			}
-			Pin::new(&mut stream).next_group();
 			i += 1;
 		}
 	}

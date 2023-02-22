@@ -12,6 +12,7 @@ pub mod segments;
 pub mod store;
 pub mod structs;
 //pub mod borgrpc;
+pub mod pipeline;
 
 pub mod cliutil;
 

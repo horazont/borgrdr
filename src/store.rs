@@ -17,7 +17,6 @@ pub enum PrefetchStreamItem<M, D> {
 #[async_trait::async_trait]
 pub trait ObjectStore {
 	type ObjectStream: Stream<Item = io::Result<Bytes>> + Send + Unpin + 'static;
-	type PrefetchStream<M: 'static + Copy + Sync + Send + Unpin, II: 'static + Send + Sync + Iterator<Item = Id>, IO: 'static + Send + Sync + Iterator<Item = (M, II)>>: Stream<Item = PrefetchStreamItem<M, Bytes>> + Send + Unpin;
 
 	async fn retrieve<K: AsRef<Id> + Send>(&self, id: K) -> io::Result<Bytes>;
 	async fn contains<K: AsRef<Id> + Send>(&self, id: K) -> io::Result<bool>;
@@ -32,25 +31,11 @@ pub trait ObjectStore {
 	// this will likely only be implementable on Arc<ObjectStore>,
 	// for lack of lifetime-GATs
 	fn stream_objects(&self, object_ids: Vec<Id>) -> io::Result<Self::ObjectStream>;
-
-	fn stream_objects_with_prefetch<
-		M: 'static + Copy + Sync + Send + Unpin,
-		II: 'static + Iterator<Item = Id> + Send + Sync,
-		IO: 'static + Iterator<Item = (M, II)> + Send + Sync,
-	>(
-		&self,
-		groups: IO,
-	) -> io::Result<Self::PrefetchStream<M, II, IO>>;
 }
 
 #[async_trait::async_trait]
 impl<S: ObjectStore + Send + Sync> ObjectStore for Arc<S> {
 	type ObjectStream = S::ObjectStream;
-	type PrefetchStream<
-		M: 'static + Copy + Sync + Send + Unpin,
-		II: 'static + Send + Sync + Iterator<Item = Id>,
-		IO: 'static + Send + Sync + Iterator<Item = (M, II)>,
-	> = S::PrefetchStream<M, II, IO>;
 
 	async fn retrieve<K: AsRef<Id> + Send>(&self, id: K) -> io::Result<Bytes> {
 		(**self).retrieve(id).await
@@ -77,16 +62,5 @@ impl<S: ObjectStore + Send + Sync> ObjectStore for Arc<S> {
 
 	fn stream_objects(&self, object_ids: Vec<Id>) -> io::Result<Self::ObjectStream> {
 		(**self).stream_objects(object_ids)
-	}
-
-	fn stream_objects_with_prefetch<
-		M: 'static + Copy + Sync + Send + Unpin,
-		II: 'static + Iterator<Item = Id> + Send + Sync,
-		IO: 'static + Iterator<Item = (M, II)> + Send + Sync,
-	>(
-		&self,
-		groups: IO,
-	) -> io::Result<Self::PrefetchStream<M, II, IO>> {
-		(**self).stream_objects_with_prefetch(groups)
 	}
 }

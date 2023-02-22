@@ -1,7 +1,6 @@
 use std::collections::VecDeque;
 use std::future::Future;
 use std::io;
-use std::ops::ControlFlow;
 use std::pin::Pin;
 use std::result::Result as StdResult;
 use std::sync::Arc;
@@ -19,7 +18,7 @@ use tokio_util::sync::PollSender;
 use crate::diag;
 use crate::diag::{DiagnosticsSink, Progress};
 use crate::segments::Id;
-use crate::store::{ObjectStore, PrefetchStreamItem};
+use crate::store::ObjectStore;
 
 use super::worker::{
 	CompletionStream, CompletionStreamItem, Error, MessageSendError, MessageSender, Result,
@@ -176,37 +175,6 @@ impl ObjectStore for RpcStoreClient {
 			backend,
 			src,
 			buffer,
-		})
-	}
-
-	type PrefetchStream<
-		M: 'static + Copy + Sync + Send + Unpin,
-		II: 'static + Send + Sync + Iterator<Item = Id>,
-		IO: 'static + Send + Sync + Iterator<Item = (M, II)>,
-	> = PrefetchStream<M, II, IO>;
-
-	fn stream_objects_with_prefetch<
-		M: 'static + Copy + Sync + Send + Unpin,
-		II: 'static + Iterator<Item = Id> + Send + Sync,
-		IO: 'static + Iterator<Item = (M, II)> + Send + Sync,
-	>(
-		&self,
-		groups: IO,
-	) -> io::Result<Self::PrefetchStream<M, II, IO>> {
-		let backend = self.request_ch.clone();
-		let mut src = groups;
-		let mut buffer = PrefetchStreamBuffer::new(8);
-		let mut backend = PollSender::new(backend);
-		buffer.try_fill(
-			RpcRetrieveStarter {
-				backend: &mut backend,
-			},
-			&mut src,
-		)?;
-		Ok(PrefetchStream {
-			backend,
-			buffer,
-			src,
 		})
 	}
 }
@@ -373,36 +341,6 @@ impl Stream for ObjectStream {
 	}
 }
 
-pub struct PrefetchFlattener<M, II, IO> {
-	outer: IO,
-	current: Option<(M, II)>,
-}
-
-impl<M: Copy, T, II: Iterator<Item = T>, IO: Iterator<Item = (M, II)>> Iterator
-	for PrefetchFlattener<M, II, IO>
-{
-	type Item = (M, T);
-
-	fn next(&mut self) -> Option<Self::Item> {
-		loop {
-			match self.current.as_mut() {
-				Some((m, inner)) => match inner.next() {
-					Some(item) => return Some((*m, item)),
-					None => (),
-				},
-				None => (),
-			}
-			self.current = None;
-			match self.outer.next() {
-				Some(v) => {
-					self.current = Some(v);
-				}
-				None => return None,
-			};
-		}
-	}
-}
-
 struct ReceiverWrapper<T>(oneshot::Receiver<io::Result<T>>);
 
 impl<T> From<oneshot::Receiver<io::Result<T>>> for ReceiverWrapper<T> {
@@ -419,194 +357,6 @@ impl<T> Future for ReceiverWrapper<T> {
 			Poll::Pending => Poll::Pending,
 			Poll::Ready(Ok(v)) => Poll::Ready(v),
 			Poll::Ready(Err(_)) => Poll::Ready(Err(Error::LostWorker.into())),
-		}
-	}
-}
-
-enum PrefetchQueueItem<M, F> {
-	Header(M),
-	Future(F),
-	Completed,
-}
-
-impl<T, M: Unpin, F: Unpin + Future<Output = io::Result<T>>> Future for PrefetchQueueItem<M, F> {
-	type Output = PrefetchStreamItem<M, T>;
-
-	fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-		match self.as_mut().get_mut() {
-			Self::Completed => panic!("prefetch queue item already completed"),
-			Self::Header(_) => {
-				let mut data = Self::Completed;
-				std::mem::swap(&mut data, self.get_mut());
-				match data {
-					Self::Header(m) => Poll::Ready(PrefetchStreamItem::Metadata(m)),
-					_ => unreachable!(),
-				}
-			}
-			Self::Future(ref mut f) => match Pin::new(f).poll(cx) {
-				Poll::Pending => Poll::Pending,
-				Poll::Ready(v) => {
-					let mut data = Self::Completed;
-					std::mem::swap(&mut data, self.get_mut());
-					Poll::Ready(PrefetchStreamItem::Data(v))
-				}
-			},
-		}
-	}
-}
-
-struct PrefetchStreamBuffer<M, II: Iterator, F> {
-	queue: VecDeque<PrefetchQueueItem<M, F>>,
-	batch: Option<std::iter::Peekable<II>>,
-}
-
-impl<M: Unpin, II: Iterator<Item = Id>> PrefetchStreamBuffer<M, II, ReceiverWrapper<RpcResponse>> {
-	fn new(depth: usize) -> Self {
-		Self {
-			queue: VecDeque::with_capacity(depth),
-			batch: None,
-		}
-	}
-
-	#[must_use]
-	fn ensure_more<IO: Iterator<Item = (M, II)>>(&mut self, src: &mut IO) -> ControlFlow<(), bool> {
-		if self.batch.as_mut().map(|x| x.peek()).flatten().is_none() {
-			let (metadata, new_batch) = match src.next() {
-				Some(v) => v,
-				None => return ControlFlow::Break(()),
-			};
-			self.queue.push_back(PrefetchQueueItem::Header(metadata));
-			self.batch = Some(new_batch.peekable());
-			// ensure the loop condition is checked here once more
-			ControlFlow::Continue(true)
-		} else {
-			ControlFlow::Continue(false)
-		}
-	}
-
-	fn try_fill<IO: Iterator<Item = (M, II)>>(
-		&mut self,
-		starter: RpcRetrieveStarter<'_>,
-		mut src: IO,
-	) -> Result<()> {
-		while self.queue.len() < self.queue.capacity() {
-			match self.ensure_more(&mut src) {
-				// eof!
-				ControlFlow::Break(()) => break,
-				// inserted something -> need to re-check loop condition
-				ControlFlow::Continue(true) => continue,
-				// more data available without insertion
-				ControlFlow::Continue(false) => (),
-			}
-			match starter.try_start(self.batch.as_mut().unwrap()) {
-				Some(fut) => self.queue.push_back(PrefetchQueueItem::Future(fut?)),
-				// no slot right now, stop here
-				None => return Ok(()),
-			}
-		}
-		Ok(())
-	}
-
-	fn poll_fill<IO: Iterator<Item = (M, II)>>(
-		&mut self,
-		mut starter: RpcRetrieveStarter<'_>,
-		mut src: IO,
-		cx: &mut Context<'_>,
-	) -> Poll<Result<()>> {
-		while self.queue.len() < self.queue.capacity() {
-			match self.ensure_more(&mut src) {
-				// eof!
-				ControlFlow::Break(()) => return Poll::Ready(Ok(())),
-				// inserted something -> need to re-check loop condition
-				ControlFlow::Continue(true) => continue,
-				// more data available without insertion
-				ControlFlow::Continue(false) => (),
-			}
-			match starter.poll_start(self.batch.as_mut().unwrap(), cx) {
-				Poll::Pending => return Poll::Pending,
-				Poll::Ready(fut) => self.queue.push_back(PrefetchQueueItem::Future(fut?)),
-			}
-		}
-		Poll::Pending
-	}
-
-	fn poll_front(
-		&mut self,
-		cx: &mut Context<'_>,
-	) -> Poll<Option<PrefetchStreamItem<M, RpcResponse>>> {
-		let item = match self.queue.front_mut() {
-			None => return Poll::Ready(None),
-			Some(item) => item,
-		};
-		match Pin::new(item).poll(cx) {
-			Poll::Pending => Poll::Pending,
-			Poll::Ready(result) => {
-				self.queue.pop_front();
-				Poll::Ready(Some(result))
-			}
-		}
-	}
-}
-
-pin_project_lite::pin_project! {
-	pub struct PrefetchStream<M, II: Iterator, IO: Iterator> {
-		#[pin]
-		backend: tokio_util::sync::PollSender<RpcWorkerCommand>,
-		src: IO,
-		buffer: PrefetchStreamBuffer<M, II, ReceiverWrapper<RpcResponse>>,
-	}
-}
-
-impl<'x, M: 'static + Copy + Unpin, II: Iterator<Item = Id>, IO: Iterator<Item = (M, II)>> Stream
-	for PrefetchStream<M, II, IO>
-{
-	type Item = PrefetchStreamItem<M, Bytes>;
-
-	fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
-		let mut this = self.project();
-		// we ignore the result of *this* polling, because we only do this
-		// for opportunistic reasons.
-		let _: Poll<_> = this.buffer.poll_fill(
-			RpcRetrieveStarter {
-				backend: this.backend.as_mut().get_mut(),
-			},
-			&mut this.src,
-			cx,
-		);
-		match this.buffer.poll_front(cx) {
-			Poll::Ready(Some(v)) => match v {
-				PrefetchStreamItem::Metadata(m) => {
-					return Poll::Ready(Some(PrefetchStreamItem::Metadata(m)))
-				}
-				PrefetchStreamItem::Data(Ok(RpcResponse::DataReply(data))) => {
-					return Poll::Ready(Some(PrefetchStreamItem::Data(Ok(data))))
-				}
-				PrefetchStreamItem::Data(Ok(other)) => {
-					return Poll::Ready(Some(PrefetchStreamItem::Data(Err(
-						Error::UnexpectedResponse(other).into(),
-					))))
-				}
-				PrefetchStreamItem::Data(Err(e)) => {
-					return Poll::Ready(Some(PrefetchStreamItem::Data(Err(e))))
-				}
-			},
-			Poll::Pending => return Poll::Pending,
-			// nothing in the buffer right now, try to fill some again below.
-			Poll::Ready(None) => (),
-		};
-
-		match this.buffer.poll_fill(
-			RpcRetrieveStarter {
-				backend: this.backend.as_mut().get_mut(),
-			},
-			&mut this.src,
-			cx,
-		) {
-			// there is nothing left in the buffer, and nothing in src.
-			Poll::Ready(Ok(())) => Poll::Ready(None),
-			// there is nothing left in the buffer, and we cannot fill it because of errors.
-			Poll::Ready(Err(e)) => Poll::Ready(Some(PrefetchStreamItem::Data(Err(e.into())))),
-			Poll::Pending => Poll::Pending,
 		}
 	}
 }

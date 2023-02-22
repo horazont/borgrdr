@@ -533,23 +533,6 @@ impl ObjectStore for Arc<FsStore> {
 			request: None,
 		})
 	}
-
-	type PrefetchStream<
-		M: 'static + Copy + Sync + Send + Unpin,
-		II: 'static + Send + Sync + Iterator<Item = Id>,
-		IO: 'static + Send + Sync + Iterator<Item = (M, II)>,
-	> = crate::rpc::internal::PrefetchStream<M, II, IO>;
-
-	fn stream_objects_with_prefetch<
-		M: 'static + Copy + Sync + Send + Unpin,
-		II: 'static + Iterator<Item = Id> + Send + Sync,
-		IO: 'static + Iterator<Item = (M, II)> + Send + Sync,
-	>(
-		&self,
-		_groups: IO,
-	) -> io::Result<Self::PrefetchStream<M, II, IO>> {
-		todo!();
-	}
 }
 
 pub struct ObjectStream {
