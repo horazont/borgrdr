@@ -1,36 +1,22 @@
 use std::collections::HashMap;
-use std::collections::VecDeque;
-use std::fmt;
-use std::future::Future;
 use std::io;
-use std::pin::Pin;
 use std::result::Result as StdResult;
-use std::sync::Arc;
-use std::task::{Context, Poll};
 
 use bytes::Bytes;
 
-use futures::stream::{Stream, StreamExt};
+use futures::stream::StreamExt;
 use futures::SinkExt;
 
 use serde::{Deserialize, Serialize};
 use serde_with::{serde_as, Bytes as SerdeBytes};
 
 use tokio::io::{AsyncRead, AsyncWrite};
-use tokio::sync::{mpsc, oneshot};
 
 use tokio_util::codec;
 
-use crate::diag::{DiagnosticsSink, Progress};
 use crate::rmp_codec::AsymMpCodec;
-use crate::segments::Id;
-use crate::store::ObjectStore;
 
-use super::worker::{
-	CompletionStream, CompletionStreamItem, Error, MessageSendError, MessageSender, Result,
-	RpcInterfaceError, RpcItem, RpcMessage, RpcRequest, RpcResponse, RpcWorkerCommand,
-	RpcWorkerConfig, RpcWorkerMessage, TryMessageSendError,
-};
+use super::worker::{Error, RpcInterfaceError, RpcItem, RpcRequest, RpcResponse};
 
 #[serde_as]
 #[derive(Debug, Deserialize, Serialize)]
@@ -129,8 +115,6 @@ pub(super) enum BorgRpcResponse {
 		#[serde(rename = "i")]
 		msgid: u64,
 		#[serde_as(as = "SerdeBytes")]
-		exception_class: Vec<u8>,
-		#[serde_as(as = "SerdeBytes")]
 		exception_short: Vec<u8>,
 	},
 	Result {
@@ -171,19 +155,6 @@ impl From<BorgRpcResponse> for RpcItem {
 				id: msgid,
 				payload: result.into(),
 			},
-		}
-	}
-}
-
-macro_rules! match_rpc_response {
-	($x:expr => {
-		$($p:pat_param => $px:expr,)*
-	}) => {
-		match $x {
-			$($p => $px,)*
-			Ok(RpcResponse::Error(e)) => Err(Error::Remote(e)),
-			Ok(other) => Err(Error::UnexpectedResponse(other)),
-			Err(e) => Err(e),
 		}
 	}
 }

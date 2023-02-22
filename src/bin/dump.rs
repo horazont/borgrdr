@@ -88,10 +88,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 		}
 	}
 
-	/* if let Some(chunks) = chunks_to_extract {
+	if let Some(chunks) = chunks_to_extract {
 		let mut stream = repo.open_stream(chunks)?;
 		tokio::io::copy(&mut stream, &mut tokio::io::stdout()).await?;
-	} */
+	}
 
 	drop(repo);
 	let _: Result<_, _> = backend.wait_for_shutdown().await;

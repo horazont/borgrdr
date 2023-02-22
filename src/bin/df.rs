@@ -59,16 +59,20 @@ fn hash_content(buf: &[u8]) -> Bytes {
 
 #[derive(Debug)]
 enum FileData {
-	Regular { chunks: Vec<Chunk>, size: u64 },
+	Regular { chunks: Vec<Chunk> },
 	Symlink { target_path: Bytes },
 	Directory {},
 }
 
 #[derive(Debug)]
 struct Times {
+	#[allow(dead_code)]
 	atime: Option<DateTime<Utc>>,
+	#[allow(dead_code)]
 	mtime: Option<DateTime<Utc>>,
+	#[allow(dead_code)]
 	ctime: Option<DateTime<Utc>>,
+	#[allow(dead_code)]
 	birthtime: Option<DateTime<Utc>>,
 }
 
@@ -91,17 +95,23 @@ impl From<&ArchiveItem> for Times {
 
 #[derive(Debug)]
 struct Version {
+	#[allow(dead_code)]
 	name: String,
 	// TODO: convert to DateTime<Utc>
+	#[allow(dead_code)]
 	timestamp: String,
 }
 
 #[derive(Debug)]
 struct FileEntry {
 	path: Bytes,
+	#[allow(dead_code)]
 	mode: u32,
+	#[allow(dead_code)]
 	uid: u32,
+	#[allow(dead_code)]
 	gid: u32,
+	#[allow(dead_code)]
 	times: Times,
 	payload: FileData,
 }
@@ -129,7 +139,6 @@ impl TryFrom<ArchiveItem> for FileEntry {
 			// is regular
 			FileData::Regular {
 				chunks: other.chunks().into_iter().cloned().collect(),
-				size: other.size().unwrap_or(0),
 			}
 		} else {
 			// unsupported
@@ -190,19 +199,6 @@ enum VersionedNode {
 	},
 }
 
-fn split_path<'x>(a: &'x [u8]) -> (&'x [u8], Option<&'x [u8]>) {
-	for (i, b) in a.iter().enumerate() {
-		if *b == b'/' {
-			return (&a[..i], Some(&a[i + 1..]));
-		}
-	}
-	return (a, None);
-}
-
-fn has_dir_sep(a: &[u8]) -> bool {
-	return a.iter().find(|x| **x == b'/').is_some();
-}
-
 fn split_first_segment<'x>(a: &mut Bytes) -> Bytes {
 	for (i, b) in a.iter().enumerate() {
 		if *b == b'/' {
@@ -256,11 +252,6 @@ impl VersionedNode {
 			_ => panic!("node type conflict"),
 		}
 	}
-}
-
-struct VersionedTree {
-	version: Version,
-	root: VersionedNode,
 }
 
 impl fmt::Debug for VersionedNode {
@@ -425,16 +416,21 @@ impl fmt::Debug for HashedNodeData {
 
 enum MergedNodeData {
 	Directory {},
-	Regular { chunks: Vec<Chunk> },
-	Symlink { target: Bytes },
+	#[allow(dead_code)]
+	Regular {
+		chunks: Vec<Chunk>,
+	},
+	Symlink {
+		target: Bytes,
+	},
 }
 
 struct MergedNodeVersion {
 	data: MergedNodeData,
 	versions: Vec<Arc<Version>>,
 	osize: u64,
+	#[allow(dead_code)]
 	csize: u64,
-	unique_chunks: HashSet<Chunk>,
 }
 
 struct MergedNode {
@@ -468,14 +464,13 @@ impl MergedNode {
 					versions: vec![Arc::clone(&version)],
 					osize: node.osize,
 					csize: node.csize,
-					unique_chunks: node.unique_chunks,
 				});
 				children
 			}
 		};
 		if let Some(children) = children {
 			for (path, new_child) in children {
-				let mut own_child = match self.children.entry(path) {
+				let own_child = match self.children.entry(path) {
 					Entry::Occupied(o) => o.into_mut(),
 					Entry::Vacant(v) => v.insert(Self::new()),
 				};

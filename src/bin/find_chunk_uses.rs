@@ -4,29 +4,7 @@ use anyhow::{Context, Result};
 
 use futures::stream::StreamExt;
 
-use chrono::{DateTime, TimeZone, Utc};
-
 use borgrdr::{segments::Id, store::ObjectStore};
-
-fn mode_to_str(mode: u32) -> String {
-	let mut buf = String::with_capacity(10);
-	buf.push('?');
-	let mut shift = 9;
-	while shift > 0 {
-		shift -= 3;
-		let bits = (mode >> shift) & 0o7;
-		buf.push(if bits & 0o4 != 0 { 'r' } else { '-' });
-		buf.push(if bits & 0o2 != 0 { 'w' } else { '-' });
-		buf.push(if bits & 0o1 != 0 { 'x' } else { '-' });
-	}
-	buf
-}
-
-fn convert_ts(ts: i64) -> DateTime<Utc> {
-	let secs = ts / 1000000000;
-	let nanos = (ts % 1000000000) as u32;
-	Utc.timestamp(secs, nanos)
-}
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -47,7 +25,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 	}
 
 	let manifest = repo.manifest();
-	for (k, v) in manifest.archives().iter() {
+	for v in manifest.archives().values() {
 		let archive = repo.read_archive(v.id()).await?;
 		if v.id() == &needle {
 			println!("archive {:?} is described by {:?}", archive.name(), needle);

@@ -435,25 +435,6 @@ impl RequestContext {
 		}
 	}
 
-	pub async fn send_message(&self, payload: RpcMessage) -> Result<()> {
-		let lock = self.shared.read().await;
-		let msg_ch = &lock
-			.inner
-			.as_ref()
-			.expect("send_message cannot be called after reply()")
-			.msg_ch;
-		let (tx, rx) = oneshot::channel();
-		match msg_ch.send((payload, tx)).await {
-			Ok(_) => (),
-			Err(_) => return Err(Error::LostWorker),
-		};
-		match rx.await {
-			Ok(Ok(())) => Ok(()),
-			Ok(Err(e)) => Err(Error::Communication(e)),
-			Err(_) => Err(Error::LostWorker),
-		}
-	}
-
 	pub async fn reply(self, payload: RpcResponse) -> Result<()> {
 		let reply_ch = {
 			let mut lock = self.shared.write().await;
