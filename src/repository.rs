@@ -26,7 +26,7 @@ use super::rmp_codec::MpCodec;
 use super::segments::Id;
 use super::store::ObjectStore;
 use super::structs::{Archive, ArchiveItem, Manifest};
-use crate::pipeline::{Pipeline, PipelineStream, SegmentedStream};
+use crate::pipeline::{ObjectStream, Pipeline, PipelineStream, SegmentedStream};
 
 #[derive(Debug)]
 pub enum Error {
@@ -249,18 +249,23 @@ impl<S: ObjectStore + Send + Sync + Clone + 'static> Repository<S> {
 	pub fn open_stream<'x>(
 		&'x self,
 		ids: Vec<Id>,
-	) -> io::Result<StreamReader<'x, S, S::ObjectStream>> {
+	) -> io::Result<StreamReader<'x, S, ObjectStream<'x, S, std::vec::IntoIter<Id>>>> {
 		Ok(StreamReader {
 			repo: self,
 			curr: None,
-			src: self.store.stream_objects(ids)?,
+			src: ObjectStream::open(&self.store, ids.into_iter()),
 		})
 	}
 
 	pub fn archive_items<'x>(
 		&'x self,
 		ids: Vec<Id>,
-	) -> io::Result<FramedRead<StreamReader<'x, S, S::ObjectStream>, MpCodec<ArchiveItem>>> {
+	) -> io::Result<
+		FramedRead<
+			StreamReader<'x, S, ObjectStream<'x, S, std::vec::IntoIter<Id>>>,
+			MpCodec<ArchiveItem>,
+		>,
+	> {
 		Ok(FramedRead::new(self.open_stream(ids)?, MpCodec::new()))
 	}
 

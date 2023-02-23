@@ -84,6 +84,12 @@ pin_project_lite::pin_project! {
 	}
 }
 
+impl<M: Unpin, II: Iterator<Item = Id>> Default for Buffer<M, II> {
+	fn default() -> Self {
+		Self::new(8)
+	}
+}
+
 impl<M: Unpin, II: Iterator<Item = Id>> Buffer<M, II> {
 	fn new(depth: usize) -> Self {
 		Self {
@@ -164,7 +170,7 @@ impl<
 		Self {
 			store,
 			src,
-			buffer: Buffer::new(8),
+			buffer: Buffer::default(),
 		}
 	}
 }
@@ -268,5 +274,63 @@ impl<M: Unpin, I: Stream<Item = PipelineItem<M, Bytes>>> Stream for PipelineStre
 			}
 			Poll::Ready(Some(PipelineItem::Data(data))) => Poll::Ready(Some(data)),
 		}
+	}
+}
+
+pin_project_lite::pin_project! {
+	pub struct ObjectStream<'x, S, I> {
+		#[pin]
+		inner: PipelineStream<(), Pipeline<'x, S, (), I, std::iter::Once<((), I)>>>,
+		ready: bool,
+	}
+}
+
+impl<'x, S: ObjectStore + Send + Sync + Clone + 'static, I: Iterator<Item = Id> + Unpin>
+	ObjectStream<'x, S, I>
+{
+	pub fn open(store: &'x S, ids: I) -> Self {
+		Self {
+			inner: PipelineStream {
+				inner: Pipeline {
+					store,
+					src: std::iter::once(((), ids)),
+					buffer: Buffer::default(),
+				},
+				// the first poll will take care of that as we are ready = false
+				state: StreamState::Completed,
+			},
+			ready: false,
+		}
+	}
+}
+
+impl<'x, S: ObjectStore + Send + Sync + Clone + 'static, I: Iterator<Item = Id> + Unpin> Stream
+	for ObjectStream<'x, S, I>
+{
+	type Item = io::Result<Bytes>;
+
+	fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+		let mut this = self.project();
+		if !*this.ready {
+			let inner_proj = this.inner.as_mut().project();
+			match inner_proj.inner.poll_next(cx) {
+				Poll::Pending => return Poll::Pending,
+				Poll::Ready(None) => {
+					*inner_proj.state = StreamState::Completed;
+					*this.ready = true;
+					return Poll::Ready(None);
+				}
+				Poll::Ready(Some(PipelineItem::Delimiter(()))) => {
+					*inner_proj.state = StreamState::Running;
+					*this.ready = true;
+				}
+				Poll::Ready(Some(PipelineItem::Data(v))) => {
+					*inner_proj.state = StreamState::Running;
+					return Poll::Ready(Some(v));
+				}
+			}
+		}
+
+		this.inner.poll_next(cx)
 	}
 }

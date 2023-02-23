@@ -2,20 +2,15 @@ use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::fs;
-use std::future::Future;
 use std::io;
 use std::io::Seek;
 use std::path::{Path, PathBuf};
-use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::RwLock;
-use std::task::{Context, Poll};
 
 use log::{debug, trace};
 
 use configparser::ini::Ini;
-
-use futures::stream::Stream;
 
 use bytes::Bytes;
 
@@ -521,45 +516,6 @@ impl ObjectStore for Arc<FsStore> {
 				io::ErrorKind::InvalidData,
 				"segment file check found errors",
 			)),
-		}
-	}
-
-	type ObjectStream = ObjectStream;
-
-	fn stream_objects(&self, object_ids: Vec<Id>) -> io::Result<Self::ObjectStream> {
-		Ok(Self::ObjectStream {
-			ids: object_ids.into_iter(),
-			store: Arc::clone(self),
-			request: None,
-		})
-	}
-}
-
-pub struct ObjectStream {
-	store: Arc<FsStore>,
-	ids: std::vec::IntoIter<Id>,
-	request: Option<Pin<Box<dyn Future<Output = io::Result<Bytes>> + Send>>>,
-}
-
-impl Stream for ObjectStream {
-	type Item = io::Result<Bytes>;
-
-	fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
-		if self.request.is_none() {
-			let id = match self.ids.next() {
-				None => return Poll::Ready(None),
-				Some(id) => id,
-			};
-			let store = Arc::clone(&self.store);
-			self.request = Some(Box::pin(async move { store.retrieve(id).await }));
-		}
-
-		match self.request.as_mut().unwrap().as_mut().poll(cx) {
-			Poll::Pending => Poll::Pending,
-			Poll::Ready(v) => {
-				self.request = None;
-				Poll::Ready(Some(v))
-			}
 		}
 	}
 }

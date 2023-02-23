@@ -1,10 +1,7 @@
 use std::collections::VecDeque;
-use std::future::Future;
 use std::io;
-use std::pin::Pin;
 use std::result::Result as StdResult;
 use std::sync::Arc;
-use std::task::{Context, Poll};
 
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::sync::{mpsc, oneshot};
@@ -13,10 +10,9 @@ use bytes::Bytes;
 
 use futures::stream::{Stream, StreamExt};
 
-use tokio_util::sync::PollSender;
-
 use crate::diag;
 use crate::diag::{DiagnosticsSink, Progress};
+use crate::pipeline::ObjectStream;
 use crate::segments::Id;
 use crate::store::ObjectStore;
 
@@ -157,208 +153,6 @@ impl ObjectStore for RpcStoreClient {
 		}
 		.map_err(|x| x.into())
 	}
-
-	type ObjectStream = ObjectStream;
-
-	fn stream_objects(&self, object_ids: Vec<Id>) -> io::Result<ObjectStream> {
-		let backend = self.request_ch.clone();
-		let mut src = object_ids.into_iter().peekable();
-		let mut buffer = ObjectStreamBuffer::new(8);
-		let mut backend = PollSender::new(backend);
-		buffer.try_fill(
-			RpcRetrieveStarter {
-				backend: &mut backend,
-			},
-			&mut src,
-		)?;
-		Ok(ObjectStream {
-			backend,
-			src,
-			buffer,
-		})
-	}
-}
-
-struct RpcRetrieveStarter<'x> {
-	backend: &'x mut tokio_util::sync::PollSender<RpcWorkerCommand>,
-}
-
-impl<'x> RpcRetrieveStarter<'x> {
-	fn poll_start<I: Iterator<Item = Id>>(
-		&mut self,
-		id_iter: &mut std::iter::Peekable<I>,
-		cx: &mut Context<'_>,
-	) -> Poll<io::Result<ReceiverWrapper<RpcResponse>>> {
-		match self.backend.poll_reserve(cx) {
-			Poll::Pending => return Poll::Pending,
-			Poll::Ready(Err(_)) => return Poll::Ready(Err(Error::LostWorker.into())),
-			Poll::Ready(Ok(())) => (),
-		}
-		let id = id_iter.next().unwrap(); // peeked before
-		let (result_tx, result_rx) = oneshot::channel();
-		match self
-			.backend
-			.send_item((RpcRequest::RetrieveObject { id }, None, result_tx))
-		{
-			Ok(()) => Poll::Ready(Ok(result_rx.into())),
-			Err(_) => Poll::Ready(Err(Error::LostWorker.into())),
-		}
-	}
-
-	fn try_start<I: Iterator<Item = Id>>(
-		&self,
-		id_iter: &mut std::iter::Peekable<I>,
-	) -> Option<io::Result<ReceiverWrapper<RpcResponse>>> {
-		let backend = match self.backend.get_ref() {
-			Some(v) => v,
-			None => return Some(Err(Error::LostWorker.into())),
-		};
-		let permit = match backend.try_reserve() {
-			Ok(permit) => permit,
-			Err(mpsc::error::TrySendError::Closed(())) => {
-				return Some(Err(Error::LostWorker.into()))
-			}
-			Err(mpsc::error::TrySendError::Full(())) => return None,
-		};
-		let id = id_iter.next().unwrap(); // peeked before
-		let (result_tx, result_rx) = oneshot::channel();
-		permit.send((RpcRequest::RetrieveObject { id }, None, result_tx));
-		Some(Ok(result_rx.into()))
-	}
-}
-
-struct ObjectStreamBuffer {
-	inner: VecDeque<ReceiverWrapper<RpcResponse>>,
-}
-
-impl ObjectStreamBuffer {
-	fn new(depth: usize) -> Self {
-		Self {
-			inner: VecDeque::with_capacity(depth),
-		}
-	}
-
-	fn try_fill<I: Iterator<Item = Id>>(
-		&mut self,
-		starter: RpcRetrieveStarter<'_>,
-		src: &mut std::iter::Peekable<I>,
-	) -> Result<()> {
-		while self.inner.len() < self.inner.capacity() {
-			if src.peek().is_none() {
-				return Ok(());
-			}
-			match starter.try_start(src) {
-				None => break,
-				Some(fut) => self.inner.push_back(fut?),
-			}
-		}
-		Ok(())
-	}
-
-	fn poll_fill<I: Iterator<Item = Id>>(
-		&mut self,
-		mut starter: RpcRetrieveStarter<'_>,
-		src: &mut std::iter::Peekable<I>,
-		cx: &mut Context<'_>,
-	) -> Poll<Result<()>> {
-		while self.inner.len() < self.inner.capacity() {
-			if src.peek().is_none() {
-				return Poll::Ready(Ok(()));
-			}
-			match starter.poll_start(src, cx) {
-				Poll::Pending => break,
-				Poll::Ready(fut) => self.inner.push_back(fut?),
-			}
-		}
-		Poll::Pending
-	}
-
-	fn poll_front(&mut self, cx: &mut Context<'_>) -> Poll<Option<io::Result<RpcResponse>>> {
-		let item = match self.inner.front_mut() {
-			None => return Poll::Ready(None),
-			Some(item) => item,
-		};
-		match Pin::new(item).poll(cx) {
-			Poll::Pending => Poll::Pending,
-			Poll::Ready(result) => {
-				self.inner.pop_front();
-				Poll::Ready(Some(result))
-			}
-		}
-	}
-}
-
-pin_project_lite::pin_project! {
-	pub struct ObjectStream {
-		#[pin]
-		backend: tokio_util::sync::PollSender<RpcWorkerCommand>,
-		src: std::iter::Peekable<std::vec::IntoIter<Id>>,
-		buffer: ObjectStreamBuffer,
-	}
-}
-
-impl Stream for ObjectStream {
-	type Item = io::Result<Bytes>;
-
-	fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
-		//println!("ObjectStream asked for more");
-		let mut this = self.project();
-		// we ignore the result of *this* polling, because we only do this
-		// for opportunistic reasons.
-		let _: Poll<_> = this.buffer.poll_fill(
-			RpcRetrieveStarter {
-				backend: this.backend.as_mut().get_mut(),
-			},
-			this.src,
-			cx,
-		);
-		match this.buffer.poll_front(cx) {
-			Poll::Ready(Some(v)) => match v {
-				Ok(RpcResponse::DataReply(data)) => return Poll::Ready(Some(Ok(data))),
-				Ok(other) => {
-					return Poll::Ready(Some(Err(Error::UnexpectedResponse(other).into())))
-				}
-				Err(e) => return Poll::Ready(Some(Err(e))),
-			},
-			Poll::Pending => return Poll::Pending,
-			// nothing in the buffer right now, try to fill some again below.
-			Poll::Ready(None) => (),
-		};
-
-		match this.buffer.poll_fill(
-			RpcRetrieveStarter {
-				backend: this.backend.as_mut().get_mut(),
-			},
-			this.src,
-			cx,
-		) {
-			// there is nothing left in the buffer, and nothing in src.
-			Poll::Ready(Ok(())) => Poll::Ready(None),
-			// there is nothing left in the buffer, and we cannot fill it because of errors.
-			Poll::Ready(Err(e)) => Poll::Ready(Some(Err(e.into()))),
-			Poll::Pending => Poll::Pending,
-		}
-	}
-}
-
-struct ReceiverWrapper<T>(oneshot::Receiver<io::Result<T>>);
-
-impl<T> From<oneshot::Receiver<io::Result<T>>> for ReceiverWrapper<T> {
-	fn from(other: oneshot::Receiver<io::Result<T>>) -> Self {
-		Self(other)
-	}
-}
-
-impl<T> Future for ReceiverWrapper<T> {
-	type Output = io::Result<T>;
-
-	fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-		match Pin::new(&mut self.as_mut().get_mut().0).poll(cx) {
-			Poll::Pending => Poll::Pending,
-			Poll::Ready(Ok(v)) => Poll::Ready(v),
-			Poll::Ready(Err(_)) => Poll::Ready(Err(Error::LostWorker.into())),
-		}
-	}
 }
 
 struct BufferedSender {
@@ -454,7 +248,7 @@ pub struct RpcStoreServerWorker<S> {
 
 impl<S: ObjectStore + Sync + Send + 'static> RpcStoreServerWorker<S> {
 	async fn stream_objects(backend: Arc<S>, ids: Vec<Id>, ctx: MessageSender) -> Result<()> {
-		let mut stream = backend.stream_objects(ids)?;
+		let mut stream = ObjectStream::open(&backend, ids.into_iter());
 		while let Some(item) = stream.next().await {
 			let item = item?;
 			match ctx.send(RpcMessage::StreamedChunk(Ok(item))).await {
