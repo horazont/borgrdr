@@ -1,4 +1,5 @@
 //! Backend for accessing a borg repository
+use std::future::Future;
 use std::io;
 use std::sync::Arc;
 
@@ -14,7 +15,11 @@ pub enum PrefetchStreamItem<M, D> {
 
 #[async_trait::async_trait]
 pub trait ObjectStore {
-	async fn retrieve<K: AsRef<Id> + Send>(&self, id: K) -> io::Result<Bytes>;
+	type RetrieveFut<'x>: 'x + Future<Output = io::Result<Bytes>> + Send
+	where
+		Self: 'x;
+
+	fn retrieve<K: AsRef<Id> + Send>(&self, id: K) -> Self::RetrieveFut<'_>;
 	async fn contains<K: AsRef<Id> + Send>(&self, id: K) -> io::Result<bool>;
 	async fn find_missing_objects(&self, ids: Vec<Id>) -> io::Result<Vec<Id>>;
 	async fn get_repository_config_key(&self, key: &str) -> io::Result<Option<String>>;
@@ -26,8 +31,11 @@ pub trait ObjectStore {
 
 #[async_trait::async_trait]
 impl<S: ObjectStore + Send + Sync> ObjectStore for Arc<S> {
-	async fn retrieve<K: AsRef<Id> + Send>(&self, id: K) -> io::Result<Bytes> {
-		(**self).retrieve(id).await
+	type RetrieveFut<'x> = S::RetrieveFut<'x>
+		where Self: 'x;
+
+	fn retrieve<K: AsRef<Id> + Send>(&self, id: K) -> Self::RetrieveFut<'_> {
+		(**self).retrieve(id)
 	}
 
 	async fn contains<K: AsRef<Id> + Send>(&self, id: K) -> io::Result<bool> {

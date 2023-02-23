@@ -1,7 +1,10 @@
 use std::collections::VecDeque;
+use std::future::Future;
 use std::io;
+use std::pin::Pin;
 use std::result::Result as StdResult;
 use std::sync::Arc;
+use std::task::{Context, Poll};
 
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::sync::{mpsc, oneshot};
@@ -75,16 +78,130 @@ impl RpcStoreClient {
 	}
 }
 
+enum RpcState {
+	NotStarted {
+		req: RpcRequest,
+		message_sink: Option<mpsc::Sender<RpcMessage>>,
+		request_ch: tokio_util::sync::PollSender<RpcWorkerCommand>,
+	},
+	Pending {
+		response_rx: oneshot::Receiver<io::Result<RpcResponse>>,
+	},
+	Completed,
+}
+
+struct Rpc {
+	state: RpcState,
+}
+
+impl Rpc {
+	fn start(
+		request_ch: mpsc::Sender<RpcWorkerCommand>,
+		req: RpcRequest,
+		message_sink: Option<mpsc::Sender<RpcMessage>>,
+	) -> Self {
+		Self {
+			state: RpcState::NotStarted {
+				request_ch: tokio_util::sync::PollSender::new(request_ch),
+				req,
+				message_sink,
+			},
+		}
+	}
+}
+
+impl Future for Rpc {
+	type Output = Result<RpcResponse>;
+
+	fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+		if let RpcState::NotStarted { request_ch, .. } = &mut self.state {
+			match request_ch.poll_reserve(cx) {
+				Poll::Pending => return Poll::Pending,
+				Poll::Ready(Err(_)) => {
+					self.state = RpcState::Completed;
+					return Poll::Ready(Err(Error::LostWorker));
+				}
+				Poll::Ready(Ok(())) => (),
+			}
+			let mut state = RpcState::Completed;
+			std::mem::swap(&mut state, &mut self.state);
+			let (req, message_sink, mut request_ch) = match state {
+				RpcState::NotStarted {
+					req,
+					message_sink,
+					request_ch,
+				} => (req, message_sink, request_ch),
+				_ => unreachable!(),
+			};
+			let (response_tx, response_rx) = oneshot::channel();
+			match request_ch.send_item((req, message_sink, response_tx)) {
+				Ok(()) => (),
+				Err(_) => return Poll::Ready(Err(Error::LostWorker)),
+			};
+			self.state = RpcState::Pending { response_rx };
+		}
+
+		if let RpcState::Pending {
+			ref mut response_rx,
+		} = &mut self.state
+		{
+			return match Pin::new(response_rx).poll(cx) {
+				Poll::Pending => Poll::Pending,
+				Poll::Ready(v) => {
+					self.state = RpcState::Completed;
+					Poll::Ready(match v {
+						Ok(Ok(RpcResponse::Error(remote_err))) => Err(Error::Remote(remote_err)),
+						Ok(Ok(other)) => Ok(other),
+						Ok(Err(e)) => Err(Error::Communication(e)),
+						Err(_) => Err(Error::LostWorker),
+					})
+				}
+			};
+		}
+
+		panic!("invalid future state")
+	}
+}
+
+pin_project_lite::pin_project! {
+	pub struct DataRpc {
+		#[pin]
+		inner: Rpc,
+	}
+}
+
+impl Future for DataRpc {
+	type Output = io::Result<Bytes>;
+
+	fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+		let this = self.project();
+		match this.inner.poll(cx) {
+			Poll::Pending => Poll::Pending,
+			Poll::Ready(v) => Poll::Ready(
+				match_rpc_response! {
+					v => {
+						Ok(RpcResponse::DataReply(data)) => Ok(data),
+					}
+				}
+				.map_err(|x| x.into()),
+			),
+		}
+	}
+}
+
 #[async_trait::async_trait]
 impl ObjectStore for RpcStoreClient {
-	async fn retrieve<K: AsRef<Id> + Send>(&self, id: K) -> io::Result<Bytes> {
-		let id = id.as_ref().clone();
-		match_rpc_response! {
-			self.rpc_call(RpcRequest::RetrieveObject{id}, None).await => {
-				Ok(RpcResponse::DataReply(data)) => Ok(data),
-			}
+	type RetrieveFut<'x> = DataRpc;
+
+	fn retrieve<K: AsRef<Id> + Send>(&self, id: K) -> Self::RetrieveFut<'_> {
+		let id = *id.as_ref();
+		DataRpc {
+			inner: Rpc::start(
+				self.request_ch.clone(),
+				RpcRequest::RetrieveObject { id },
+				None,
+			),
 		}
-		.map_err(|x| x.into())
 	}
 
 	async fn contains<K: AsRef<Id> + Send>(&self, id: K) -> io::Result<bool> {

@@ -2,9 +2,11 @@ use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::fs;
+use std::future::Future;
 use std::io;
 use std::io::Seek;
 use std::path::{Path, PathBuf};
+use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::RwLock;
 
@@ -316,18 +318,14 @@ impl FsStore {
 		}
 		Ok(self.search_object(id)?.is_some())
 	}
-}
 
-#[async_trait::async_trait]
-impl ObjectStore for Arc<FsStore> {
-	async fn retrieve<K: AsRef<Id> + Send>(&self, id: K) -> io::Result<Bytes> {
-		let id = id.as_ref();
+	async fn retrieve_inner(&self, id: Id) -> io::Result<Bytes> {
 		match self
-			.try_on_disk_cache(id)
-			.or_else(|| self.try_in_memory_cache(id))
+			.try_on_disk_cache(&id)
+			.or_else(|| self.try_in_memory_cache(&id))
 		{
 			Some(Ok(Some((segment, offset)))) => {
-				return self.read_single_object(id, segment, offset)
+				return self.read_single_object(&id, segment, offset)
 			}
 			Some(Ok(None)) => {
 				return Err(io::Error::new(
@@ -339,7 +337,7 @@ impl ObjectStore for Arc<FsStore> {
 			// caches are all inconclusive, do exhaustive search
 			None => (),
 		}
-		match self.search_object(id)? {
+		match self.search_object(&id)? {
 			Some(v) => return Ok(v),
 			None => {
 				return Err(io::Error::new(
@@ -348,6 +346,17 @@ impl ObjectStore for Arc<FsStore> {
 				))
 			}
 		}
+	}
+}
+
+#[async_trait::async_trait]
+impl ObjectStore for Arc<FsStore> {
+	type RetrieveFut<'x> = Pin<Box<dyn Future<Output = io::Result<Bytes>> + Send + 'x>>
+		where Self: 'x;
+
+	fn retrieve<K: AsRef<Id> + Send>(&self, id: K) -> Self::RetrieveFut<'_> {
+		let id = *id.as_ref();
+		Box::pin(self.retrieve_inner(id))
 	}
 
 	async fn contains<K: AsRef<Id> + Send>(&self, id: K) -> io::Result<bool> {
