@@ -11,14 +11,14 @@ use bytes::Bytes;
 use crate::segments::Id;
 use crate::store::ObjectStore;
 
-enum BufferItem<M: Unpin> {
+enum BufferItem<'x, M: 'x + Unpin> {
 	Delimiter(M),
-	Future(Pin<Box<dyn Future<Output = io::Result<Bytes>> + Send + 'static>>),
+	Future(Pin<Box<dyn Future<Output = io::Result<Bytes>> + Send + 'x>>),
 	Completed(io::Result<Bytes>),
 	MovedOutFrom,
 }
 
-impl<M: Unpin> BufferItem<M> {
+impl<'x, M: 'x + Unpin> BufferItem<'x, M> {
 	fn is_ready(&self) -> bool {
 		match self {
 			Self::Delimiter(_) | Self::Completed(_) => true,
@@ -43,7 +43,7 @@ impl<M: Unpin> BufferItem<M> {
 	}
 }
 
-impl<M: Unpin> Future for BufferItem<M> {
+impl<'x, M: 'x + Unpin> Future for BufferItem<'x, M> {
 	type Output = PipelineItem<M, Bytes>;
 
 	fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
@@ -78,26 +78,28 @@ impl<M: Unpin> Future for BufferItem<M> {
 }
 
 pin_project_lite::pin_project! {
-	struct Buffer<M: Unpin, II> {
-		queue: VecDeque<BufferItem<M>>,
+	struct Buffer<'x, M: Unpin, II> {
+		queue: VecDeque<BufferItem<'x, M>>,
 		batch: Option<II>,
 	}
 }
 
-impl<M: Unpin, II: Iterator<Item = Id>> Default for Buffer<M, II> {
+impl<'x, M: 'x + Unpin, II> Default for Buffer<'x, M, II> {
 	fn default() -> Self {
 		Self::new(8)
 	}
 }
 
-impl<M: Unpin, II: Iterator<Item = Id>> Buffer<M, II> {
+impl<'x, M: 'x + Unpin, II> Buffer<'x, M, II> {
 	fn new(depth: usize) -> Self {
 		Self {
 			queue: VecDeque::with_capacity(depth),
 			batch: None,
 		}
 	}
+}
 
+impl<'x, M: 'x + Unpin, IdT: AsRef<Id>, II: Iterator<Item = IdT>> Buffer<'x, M, II> {
 	fn poll_fill(
 		&mut self,
 		store: &(impl ObjectStore + Send + Sync + Clone + 'static),
@@ -107,6 +109,7 @@ impl<M: Unpin, II: Iterator<Item = Id>> Buffer<M, II> {
 			match self.batch.as_mut().map(|x| x.next()).flatten() {
 				Some(id) => {
 					let store = store.clone();
+					let id = *id.as_ref();
 					let task = Box::pin(async move { store.retrieve(id).await });
 					self.queue.push_back(BufferItem::Future(task));
 				}
@@ -152,17 +155,18 @@ pub enum PipelineItem<M, D> {
 	Data(io::Result<D>),
 }
 
-pub struct Pipeline<'x, O, M: Unpin, II, IO> {
+pub struct Pipeline<'x, O, M: 'x + Unpin, II, IO> {
 	store: &'x O,
 	src: IO,
-	buffer: Buffer<M, II>,
+	buffer: Buffer<'x, M, II>,
 }
 
 impl<
 		'x,
 		O: ObjectStore + Send + Sync + Clone + 'static,
 		M: Unpin,
-		II: Iterator<Item = Id>,
+		IdT: AsRef<Id>,
+		II: Iterator<Item = IdT>,
 		IO: Iterator<Item = (M, II)> + Unpin,
 	> Pipeline<'x, O, M, II, IO>
 {
@@ -179,7 +183,8 @@ impl<
 		'x,
 		O: ObjectStore + Send + Sync + Clone + 'static,
 		M: Unpin,
-		II: Iterator<Item = Id>,
+		IdT: AsRef<Id>,
+		II: Iterator<Item = IdT>,
 		IO: Iterator<Item = (M, II)> + Unpin,
 	> Stream for Pipeline<'x, O, M, II, IO>
 {

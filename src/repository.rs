@@ -271,9 +271,10 @@ impl<S: ObjectStore + Send + Sync + Clone + 'static> Repository<S> {
 
 	pub async fn grouped_archive_items<
 		'x,
-		K: 'static + Send + Sync + Unpin,
-		II: 'static + Iterator<Item = Id> + Send + Sync + Unpin,
-		IO: 'static + Iterator<Item = (K, II)> + Send + Sync + Unpin,
+		K: 'x + Send + Sync + Unpin,
+		IdT: AsRef<Id>,
+		II: 'x + Iterator<Item = IdT> + Send + Sync + Unpin,
+		IO: 'x + Iterator<Item = (K, II)> + Send + Sync + Unpin,
 	>(
 		&'x self,
 		i: IO,

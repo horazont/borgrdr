@@ -307,25 +307,13 @@ async fn read_entries(
 		.grouped_archive_items(
 			prepared_archives
 				.iter()
-				.map(|(id, archive)| {
-					(
-						*id,
-						archive
-							.items()
-							.iter()
-							.map(|x| *x)
-							.collect::<Vec<_>>()
-							.into_iter(),
-					)
-				})
-				.collect::<Vec<_>>()
-				.into_iter(),
+				.map(|(id, archive)| (id, archive.items().iter())),
 		)
 		.await?;
 
 	let mut i = 0;
 	while let Some(id) = stream.next_segment() {
-		assert!(id == prepared_archives[i].0);
+		assert!(*id == prepared_archives[i].0);
 		let archive = &prepared_archives[i].1;
 		let timestamp =
 			match NaiveDateTime::parse_from_str(archive.start_time(), "%Y-%m-%dT%H:%M:%S%.6f") {
