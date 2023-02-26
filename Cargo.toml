@@ -39,6 +39,9 @@ env_logger = "^0.9"
 bincode = "^1"
 url = "^2"
 openat = { version = "^0.1"}
+nix = "^0.26"
+users = "^0.11"
+dirs = "^4"
 
 smartstring = { version = "^1", optional = true }
 cursive = { version = "^0.20", optional = true, features = ["markdown"] }

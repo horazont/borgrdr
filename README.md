@@ -95,9 +95,7 @@ The view in the interactive browser is split in two halves:
   Versions which have the same data are deduplicated and not shown.
   Press enter to extract that version.
 
-  **Note:** Currently, the file metadata is not restored
-  (timestamps, ownership, modes)
-  when extracting.
+  **Note:** Currently, xattrs are not restored when extracting.
 
 Use tab to switch focus between the views.
 Press F1 to display a description of the table columns.

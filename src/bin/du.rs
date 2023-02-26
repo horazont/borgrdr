@@ -19,8 +19,10 @@ use std::hash::{Hash, Hasher};
 use std::io;
 use std::io::Write;
 use std::ops::Deref;
+use std::os::unix::io::AsRawFd;
 use std::os::unix::{ffi::OsStrExt, fs::symlink};
 use std::path::MAIN_SEPARATOR;
+use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::rc::Rc;
 use std::sync::{atomic, atomic::AtomicBool, atomic::AtomicU64, Arc, Mutex, Weak};
@@ -35,7 +37,9 @@ use cursive::direction::Orientation;
 use cursive::event::{Event, EventResult};
 use cursive::theme::{BaseColor, Color, PaletteColor};
 use cursive::traits::*;
-use cursive::views::{Dialog, EditView, LinearLayout, OnEventView, Panel, ProgressBar, TextView};
+use cursive::views::{
+	Dialog, EditView, LinearLayout, ListView, OnEventView, Panel, ProgressBar, TextView,
+};
 use cursive::{Cursive, CursiveExt};
 
 use cursive_table_view::{TableView, TableViewItem};
@@ -199,6 +203,22 @@ impl Entity {
 			name: name.map(|x| String::from_utf8_lossy(x).into()),
 			numeric,
 		}
+	}
+
+	fn uid_with_lookup(&self) -> u32 {
+		self.name
+			.as_ref()
+			.and_then(|x| users::get_user_by_name(x.as_str()))
+			.map(|x| x.uid())
+			.unwrap_or(self.numeric)
+	}
+
+	fn gid_with_lookup(&self) -> u32 {
+		self.name
+			.as_ref()
+			.and_then(|x| users::get_group_by_name(x.as_str()))
+			.map(|x| x.gid())
+			.unwrap_or(self.numeric)
 	}
 }
 
@@ -1414,10 +1434,89 @@ impl Main {
 	}
 }
 
+enum Step {
+	Create,
+	Write,
+	Times,
+	Permissions,
+	Ownership,
+}
+
+impl fmt::Display for Step {
+	fn fmt<'f>(&self, f: &'f mut fmt::Formatter) -> fmt::Result {
+		match self {
+			Self::Create => f.write_str("creating"),
+			Self::Write => f.write_str("writing contents to"),
+			Self::Times => f.write_str("setting times of"),
+			Self::Permissions => f.write_str("setting permissions of"),
+			Self::Ownership => f.write_str("setting ownership of"),
+		}
+	}
+}
+
+fn ignore_eperm_errno(r: Result<(), nix::errno::Errno>) -> Result<(), nix::errno::Errno> {
+	match r {
+		Ok(v) => Ok(v),
+		Err(nix::errno::Errno::EPERM) => Ok(()),
+		Err(nix::errno::Errno::EACCES) => Ok(()),
+		Err(e) => Err(e),
+	}
+}
+
 struct ExtractProgress {
 	cancel_flag: AtomicBool,
 	extracted_nodes: AtomicU64,
 	extracted_bytes: AtomicU64,
+	issues: Mutex<Vec<(String, Step, Box<dyn std::error::Error + Send + 'static>)>>,
+}
+
+impl ExtractProgress {
+	fn log_any_error<
+		S: Into<String>,
+		F: FnOnce() -> S,
+		T,
+		E: std::error::Error + Send + 'static,
+	>(
+		&self,
+		path: F,
+		step: Step,
+		r: Result<T, E>,
+	) -> Option<T> {
+		let e = match r {
+			Ok(v) => return Some(v),
+			Err(e) => e,
+		};
+		let path = path().into();
+		let mut lock = self.issues.lock().unwrap();
+		lock.push((path, step, Box::new(e)));
+		None
+	}
+}
+
+struct PathBuilder<'x> {
+	node: &'x Arc<MergedNode>,
+	hold: Option<String>,
+}
+
+impl<'x> PathBuilder<'x> {
+	fn build(&mut self) -> &str {
+		if let Some(_) = self.hold.as_ref() {
+			// tricking borrowck
+			// <https://github.com/rust-lang/rfcs/blob/master/text/2094-nll.md#problem-case-3-conditional-control-flow-across-functions>
+			return self.hold.as_ref().unwrap();
+		}
+		let mut buf = String::from_utf8_lossy(&self.node.name).into_owned();
+		let mut node = Arc::clone(&self.node);
+		while let Some(parent) = node.parent.as_ref().and_then(|x| x.upgrade()) {
+			if parent.name != b"" {
+				buf.insert(0, std::path::MAIN_SEPARATOR);
+				buf.insert_str(0, &String::from_utf8_lossy(&parent.name));
+			}
+			node = parent;
+		}
+		self.hold = Some(buf);
+		self.hold.as_ref().map(|x| x.as_str()).unwrap()
+	}
 }
 
 #[async_recursion::async_recursion]
@@ -1428,6 +1527,10 @@ async fn extract(
 	dest: &openat::Dir,
 	progress: &ExtractProgress,
 ) -> Result<bool, anyhow::Error> {
+	let mut path_builder = PathBuilder {
+		node: &subtree,
+		hold: None,
+	};
 	let v = match subtree.version_group_of(&version) {
 		None => {
 			// there is nothing here in this version, skip
@@ -1441,63 +1544,124 @@ async fn extract(
 		return Ok(true);
 	}
 	let name = OsStr::from_bytes(&subtree.name);
-	match &v.data {
+	let is_ok = match &v.data {
 		MergedNodeData::Directory {} => {
 			// directory, we need to mkdir, and then recurse
 			// create with minimal permissions before we recurse, only then we actually set the correct permissions
-			dest.create_dir(name, 0o700)
-				.with_context(|| format!("creating output directory: {:?}", name))?;
-			let subdest = dest
-				.sub_dir(name)
-				.with_context(|| format!("failed to open freshly-created directory: {:?}", name))?;
-			for (_, node) in subtree.children.iter() {
-				if !extract(repo, version, Arc::clone(node), &subdest, progress).await? {
-					// cancelled
-					return Ok(false);
+			if progress
+				.log_any_error(
+					|| path_builder.build(),
+					Step::Create,
+					dest.create_dir(name, 0o700),
+				)
+				.is_some()
+			{
+				let subdest = dest.sub_dir(name).with_context(|| {
+					format!("failed to open freshly-created directory: {:?}", name)
+				})?;
+				for (_, node) in subtree.children.iter() {
+					if !extract(repo, version, Arc::clone(node), &subdest, progress).await? {
+						// cancelled
+						return Ok(false);
+					}
 				}
+				true
+			} else {
+				false
 			}
-			// TODO: extract metadata
 		}
 		MergedNodeData::Regular { chunks, .. } => {
 			// file, we need to extract
 			// same re permissions as above
-			let mut out = dest
-				.write_file(name, 0o600)
-				.with_context(|| format!("opening destination file {:?}", name))?;
-			if progress.cancel_flag.load(atomic::Ordering::Relaxed) {
-				return Ok(false);
-			}
-			let mut reader = repo
-				.open_stream(chunks.clone())
-				.with_context(|| format!("opening source stream for {:?}", name))?;
-			let mut buffer = Box::new([0u8; 8192]);
-			loop {
+			if let Some(mut out) = progress.log_any_error(
+				|| path_builder.build(),
+				Step::Create,
+				dest.write_file(name, 0o600),
+			) {
 				if progress.cancel_flag.load(atomic::Ordering::Relaxed) {
 					return Ok(false);
 				}
-				let data = match reader
-					.read(&mut buffer[..])
-					.await
-					.with_context(|| format!("reading source data for {:?}", name))?
-				{
-					0 => break,
-					n => &buffer[..n],
-				};
-				progress
-					.extracted_bytes
-					.fetch_add(data.len() as u64, atomic::Ordering::Relaxed);
-				out.write_all(data)
-					.with_context(|| format!("writing data to {:?}", name))?;
+				let mut reader = repo
+					.open_stream(chunks.clone())
+					.with_context(|| format!("opening source stream for {:?}", name))?;
+				let mut buffer = Box::new([0u8; 8192]);
+				loop {
+					if progress.cancel_flag.load(atomic::Ordering::Relaxed) {
+						return Ok(false);
+					}
+					let data = match reader
+						.read(&mut buffer[..])
+						.await
+						.with_context(|| format!("reading source data for {:?}", name))?
+					{
+						0 => break,
+						n => &buffer[..n],
+					};
+					progress
+						.extracted_bytes
+						.fetch_add(data.len() as u64, atomic::Ordering::Relaxed);
+					out.write_all(data)
+						.with_context(|| format!("writing data to {:?}", name))?;
+				}
+				true
+			} else {
+				false
 			}
-			// TODO: extract metadata
 		}
 		MergedNodeData::Symlink { target, .. } => {
 			// symlink, need to create that
 			let target = OsStr::from_bytes(&target);
-			dest.symlink(name, target)
-				.with_context(|| format!("creating symlink to {:?} at {:?}", target, name))?;
+			progress
+				.log_any_error(
+					|| path_builder.build(),
+					Step::Create,
+					dest.symlink(name, target),
+				)
+				.is_some()
 		}
 	};
+	if is_ok {
+		progress.log_any_error(
+			|| path_builder.build(),
+			Step::Permissions,
+			nix::sys::stat::fchmodat(
+				Some(dest.as_raw_fd()),
+				&subtree.name[..],
+				nix::sys::stat::Mode::from_bits_truncate(v.metadata.permissions as u32),
+				nix::sys::stat::FchmodatFlags::NoFollowSymlink,
+			),
+		);
+		let mtime = v.metadata.times.mtime.unwrap_or_else(Utc::now);
+		let atime = v.metadata.times.atime.unwrap_or_else(Utc::now);
+		progress.log_any_error(
+			|| path_builder.build(),
+			Step::Times,
+			nix::sys::stat::utimensat(
+				Some(dest.as_raw_fd()),
+				&subtree.name[..],
+				&nix::sys::time::TimeSpec::new(
+					atime.timestamp(),
+					atime.timestamp_subsec_nanos() as i64,
+				),
+				&nix::sys::time::TimeSpec::new(
+					mtime.timestamp(),
+					mtime.timestamp_subsec_nanos() as i64,
+				),
+				nix::sys::stat::UtimensatFlags::NoFollowSymlink,
+			),
+		);
+		progress.log_any_error(
+			|| path_builder.build(),
+			Step::Ownership,
+			ignore_eperm_errno(nix::unistd::fchownat(
+				Some(dest.as_raw_fd()),
+				&subtree.name[..],
+				Some(v.metadata.owner.uid_with_lookup().into()),
+				Some(v.metadata.group.gid_with_lookup().into()),
+				nix::unistd::FchownatFlags::NoFollowSymlink,
+			)),
+		);
+	}
 	progress
 		.extracted_nodes
 		.fetch_add(1, atomic::Ordering::Relaxed);
@@ -1509,7 +1673,7 @@ async fn extract(
 
 enum WorkerCommand {
 	Extract {
-		dest_path: String,
+		dest_path: PathBuf,
 		subtree: Arc<MergedNode>,
 		version: Version,
 		progress: Arc<ExtractProgress>,
@@ -1562,6 +1726,15 @@ fn apply_extraction_progress(siv: &mut Cursive, progress: &ExtractProgress, osiz
 			pb.set_value(safescale(bytes, osize));
 		});
 	}
+	siv.call_on_name("extract_errors", |lv: &mut ListView| {
+		let mut lock = progress.issues.lock().unwrap();
+		for (path, step, error) in lock.drain(..) {
+			lv.add_child(
+				"",
+				TextView::new(format!("{} {} failed: {}", step, path, error)),
+			);
+		}
+	});
 }
 
 fn main() -> Result<(), anyhow::Error> {
@@ -1672,7 +1845,7 @@ fn main() -> Result<(), anyhow::Error> {
 							subtree,
 							progress,
 							reply,
-						} => reply(match openat::Dir::open(dest_path) {
+						} => reply(match openat::Dir::open(&dest_path) {
 							Ok(dir) => extract(&repo, &version, subtree, &dir, &progress).await,
 							Err(e) => Err(e.into()),
 						}),
@@ -1873,11 +2046,12 @@ fn main() -> Result<(), anyhow::Error> {
 		let cmdtx = cmdtx.clone();
 		let version = group.versions[0].clone();
 		let group = Arc::clone(&group);
-		let extract = move |siv: &mut Cursive, s: &str| {
+		let extract = move |siv: &mut Cursive, s: &Path| {
 			let progress = Arc::new(ExtractProgress {
 				cancel_flag: AtomicBool::new(false),
 				extracted_nodes: AtomicU64::new(0),
 				extracted_bytes: AtomicU64::new(0),
+				issues: Mutex::new(Vec::new()),
 			});
 			siv.pop_layer();
 			let osize = if group.sizes_done.load(atomic::Ordering::Acquire) {
@@ -1893,7 +2067,7 @@ fn main() -> Result<(), anyhow::Error> {
 							TextView::new("0")
 								.h_align(HAlign::Right)
 								.with_name("extracted_nodes")
-								.fixed_width(20),
+								.min_width(20),
 						),
 				)
 				.child(
@@ -1903,7 +2077,7 @@ fn main() -> Result<(), anyhow::Error> {
 							TextView::new("0")
 								.h_align(HAlign::Right)
 								.with_name("extracted_bytes")
-								.fixed_width(20),
+								.min_width(20),
 						),
 				);
 			if let Some(osize) = osize {
@@ -1914,6 +2088,9 @@ fn main() -> Result<(), anyhow::Error> {
 						.with_name("extract_progress"),
 				);
 			}
+			progress_layout.add_child(
+				ListView::new().with_name("extract_errors")
+			);
 			let progress_dialog = {
 				let progress = Arc::clone(&progress);
 				Dialog::new()
@@ -1953,13 +2130,22 @@ fn main() -> Result<(), anyhow::Error> {
 										siv.pop_layer();
 									});
 								});
+								let len = siv.call_on_name("extract_errors", |lv: &mut ListView| {
+									lv.len()
+								});
+								if len.unwrap_or(0) > 0 {
+									siv.add_layer(Dialog::new()
+										.title("Extraction failed")
+										.content(TextView::new("Some data or metadata could not be restored accurately. Please review the errors carefully!"))
+										.dismiss_button("Ok"));
+								}
 							}
 							Err(e) => {
 								siv.pop_layer();
 								siv.add_layer(
 									Dialog::new()
 										.title("Extraction failed")
-										.content(TextView::new(e.to_string()))
+										.content(TextView::new(format!("{:#}", e)))
 										.dismiss_button("Close"),
 								);
 							}
@@ -1970,51 +2156,64 @@ fn main() -> Result<(), anyhow::Error> {
 		};
 
 		let try_extract =
-			move |siv: &mut Cursive, s: Rc<String>| match std::fs::metadata(s.as_str()) {
-				Ok(metadata) if metadata.is_dir() => {
-					extract(siv, s.as_str());
-				}
-				Ok(_) => {
-					siv.add_layer(
-						Dialog::new()
-							.title("Error")
-							.content(TextView::new("Output path exists, but is not a directory"))
-							.dismiss_button("Ok"),
-					);
-				}
-				Err(e) if e.kind() == io::ErrorKind::NotFound => {
-					let extract = extract.clone();
-					siv.add_layer(
-						Dialog::new()
-							.title("Create output directory?")
-							.content(TextView::new("Output directory does not exist.\nCreate?"))
-							.button("No", |siv| {
-								siv.pop_layer();
-							})
-							.button("Yes", move |siv| match std::fs::create_dir(s.as_str()) {
-								Ok(_) => {
+			move |siv: &mut Cursive, s: Rc<String>| {
+				let mut path: PathBuf = if s.starts_with("~/") {
+					match dirs::home_dir() {
+						Some(mut v) => {
+							v.push(&s[2..]);
+							v
+						}
+						None => (&*s).into(),
+					}
+				} else {
+					(&*s).into()
+				};
+				match std::fs::metadata(&path) {
+					Ok(metadata) if metadata.is_dir() => {
+						extract(siv, &path);
+					}
+					Ok(_) => {
+						siv.add_layer(
+							Dialog::new()
+								.title("Error")
+								.content(TextView::new("Output path exists, but is not a directory"))
+								.dismiss_button("Ok"),
+						);
+					}
+					Err(e) if e.kind() == io::ErrorKind::NotFound => {
+						let extract = extract.clone();
+						siv.add_layer(
+							Dialog::new()
+								.title("Create output directory?")
+								.content(TextView::new("Output directory does not exist.\nCreate?"))
+								.button("No", |siv| {
 									siv.pop_layer();
-									extract(siv, s.as_str());
-								}
-								Err(e) => {
-									siv.pop_layer();
-									siv.add_layer(
-										Dialog::new()
-											.title("Error")
-											.content(TextView::new(e.to_string()))
-											.dismiss_button("Ok"),
-									);
-								}
-							}),
-					);
-				}
-				Err(e) => {
-					siv.add_layer(
-						Dialog::new()
-							.title("Error")
-							.content(TextView::new("Cannot access output path"))
-							.dismiss_button("Ok"),
-					);
+								})
+								.button("Yes", move |siv| match std::fs::create_dir(&path) {
+									Ok(_) => {
+										siv.pop_layer();
+										extract(siv, &path);
+									}
+									Err(e) => {
+										siv.pop_layer();
+										siv.add_layer(
+											Dialog::new()
+												.title("Error")
+												.content(TextView::new(e.to_string()))
+												.dismiss_button("Ok"),
+										);
+									}
+								}),
+						);
+					}
+					Err(e) => {
+						siv.add_layer(
+							Dialog::new()
+								.title("Error")
+								.content(TextView::new("Cannot access output path"))
+								.dismiss_button("Ok"),
+						);
+					}
 				}
 			};
 
@@ -2031,7 +2230,8 @@ fn main() -> Result<(), anyhow::Error> {
 								.on_submit(move |siv, s| {
 									try_extract_on_submit(siv, Rc::new(s.to_string()))
 								})
-								.with_name("extract_to"),
+								.with_name("extract_to")
+								.min_width(50),
 						),
 				)
 				.button("Ok", move |siv| {
