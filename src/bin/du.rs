@@ -1,3 +1,13 @@
+#![deny(unsafe_op_in_unsafe_fn)]
+/*!
+things to display:
+
+- local dsize: deduplicated size of the subtree within an archive
+- local usage: size of chunks not used outside that subtree within an archive
+- global dsize: deduplicated size of the subtree in the repository
+- global usage: size of chunks not used outside that subtree in any archives
+- churn: summed size of all chunks only used within that subtree *and* not in all versions
+*/
 use std::borrow::Cow;
 use std::cmp::Ordering;
 use std::collections::hash_map::Entry;
@@ -12,16 +22,6 @@ use std::ops::Deref;
 use std::os::unix::{ffi::OsStrExt, fs::symlink};
 use std::path::MAIN_SEPARATOR;
 use std::pin::Pin;
-#[deny(unsafe_op_in_unsafe_fn)]
-/*
-things to display:
-
-- local dsize: deduplicated size of the subtree within an archive
-- local usage: size of chunks not used outside that subtree within an archive
-- global dsize: deduplicated size of the subtree in the repository
-- global usage: size of chunks not used outside that subtree in any archives
-- churn: summed size of all chunks only used within that subtree *and* not in all versions
-*/
 use std::rc::Rc;
 use std::sync::{atomic, atomic::AtomicBool, atomic::AtomicU64, Arc, Mutex, Weak};
 use std::time::Instant;
