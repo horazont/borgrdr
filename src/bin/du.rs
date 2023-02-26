@@ -1425,7 +1425,7 @@ async fn extract(
 	repo: &Repository<RpcStoreClient>,
 	version: &Version,
 	subtree: Arc<MergedNode>,
-	dest_path: &OsString,
+	dest: &openat::Dir,
 	progress: &ExtractProgress,
 ) -> Result<bool, anyhow::Error> {
 	let v = match subtree.version_group_of(&version) {
@@ -1441,19 +1441,17 @@ async fn extract(
 		return Ok(true);
 	}
 	let name = OsStr::from_bytes(&subtree.name);
-	let mut path = dest_path.clone();
-	// TODO: use MAIN_SEPARATOR_STR once it stabilizes
-	let mut buf = String::new();
-	buf.push(MAIN_SEPARATOR);
-	path.push(&buf);
-	path.push(&name);
 	match &v.data {
 		MergedNodeData::Directory {} => {
 			// directory, we need to mkdir, and then recurse
-			std::fs::create_dir(&path)
-				.with_context(|| format!("creating output directory: {:?}", path))?;
+			// create with minimal permissions before we recurse, only then we actually set the correct permissions
+			dest.create_dir(name, 0o700)
+				.with_context(|| format!("creating output directory: {:?}", name))?;
+			let subdest = dest
+				.sub_dir(name)
+				.with_context(|| format!("failed to open freshly-created directory: {:?}", name))?;
 			for (_, node) in subtree.children.iter() {
-				if !extract(repo, version, Arc::clone(node), &path, progress).await? {
+				if !extract(repo, version, Arc::clone(node), &subdest, progress).await? {
 					// cancelled
 					return Ok(false);
 				}
@@ -1462,13 +1460,16 @@ async fn extract(
 		}
 		MergedNodeData::Regular { chunks, .. } => {
 			// file, we need to extract
-			let mut out = std::fs::File::create(&path)?;
+			// same re permissions as above
+			let mut out = dest
+				.write_file(name, 0o600)
+				.with_context(|| format!("opening destination file {:?}", name))?;
 			if progress.cancel_flag.load(atomic::Ordering::Relaxed) {
 				return Ok(false);
 			}
 			let mut reader = repo
 				.open_stream(chunks.clone())
-				.with_context(|| format!("opening source stream for {:?}", path))?;
+				.with_context(|| format!("opening source stream for {:?}", name))?;
 			let mut buffer = Box::new([0u8; 8192]);
 			loop {
 				if progress.cancel_flag.load(atomic::Ordering::Relaxed) {
@@ -1477,7 +1478,7 @@ async fn extract(
 				let data = match reader
 					.read(&mut buffer[..])
 					.await
-					.with_context(|| format!("reading source data for {:?}", path))?
+					.with_context(|| format!("reading source data for {:?}", name))?
 				{
 					0 => break,
 					n => &buffer[..n],
@@ -1486,15 +1487,15 @@ async fn extract(
 					.extracted_bytes
 					.fetch_add(data.len() as u64, atomic::Ordering::Relaxed);
 				out.write_all(data)
-					.with_context(|| format!("writing data to {:?}", path))?;
+					.with_context(|| format!("writing data to {:?}", name))?;
 			}
 			// TODO: extract metadata
 		}
 		MergedNodeData::Symlink { target, .. } => {
 			// symlink, need to create that
-			let target = OsString::from(OsStr::from_bytes(&target));
-			symlink(&target, &path)
-				.with_context(|| format!("creating symlink to {:?} at {:?}", target, path))?;
+			let target = OsStr::from_bytes(&target);
+			dest.symlink(name, target)
+				.with_context(|| format!("creating symlink to {:?} at {:?}", target, name))?;
 		}
 	};
 	progress
@@ -1671,10 +1672,10 @@ fn main() -> Result<(), anyhow::Error> {
 							subtree,
 							progress,
 							reply,
-						} => {
-							let path = dest_path.into();
-							reply(extract(&repo, &version, subtree, &path, &progress).await);
-						}
+						} => reply(match openat::Dir::open(dest_path) {
+							Ok(dir) => extract(&repo, &version, subtree, &dir, &progress).await,
+							Err(e) => Err(e.into()),
+						}),
 					}
 				}
 			});
