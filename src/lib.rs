@@ -15,6 +15,3 @@ pub mod structs;
 pub mod pipeline;
 
 pub mod cliutil;
-
-#[cfg(feature = "cursive")]
-pub mod tuiutil;
