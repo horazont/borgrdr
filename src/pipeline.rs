@@ -1,4 +1,5 @@
 use std::collections::VecDeque;
+use std::fmt;
 use std::future::Future;
 use std::io;
 use std::pin::Pin;
@@ -92,6 +93,7 @@ impl<'x, M: 'x + Unpin, II> Default for Buffer<'x, M, II> {
 
 impl<'x, M: 'x + Unpin, II> Buffer<'x, M, II> {
 	fn new(depth: usize) -> Self {
+		// TODO: VecDeque may actually allocate more than requested, which means we need to cap the depth ourselves if we want to avoid going deeper than we planned here.
 		Self {
 			queue: VecDeque::with_capacity(depth),
 			batch: None,
@@ -106,29 +108,54 @@ impl<'x, M: 'x + Unpin, IdT: AsRef<Id>, II: Iterator<Item = IdT>> Buffer<'x, M, 
 		mut src: impl Iterator<Item = (M, II)>,
 	) -> Poll<()> {
 		while self.queue.len() < self.queue.capacity() {
+			log::trace!(
+				"poll_fill: len={}/cap={}",
+				self.queue.len(),
+				self.queue.capacity()
+			);
 			match self.batch.as_mut().map(|x| x.next()).flatten() {
 				Some(id) => {
+					log::trace!("poll_fill: current batch has item");
 					let store = store.clone();
 					let id = *id.as_ref();
 					let task = Box::pin(async move { store.retrieve(id).await });
 					self.queue.push_back(BufferItem::Future(task));
+					log::trace!(
+						"poll_fill: len={}/cap={} (item from current batch)",
+						self.queue.len(),
+						self.queue.capacity()
+					);
 				}
 				None => {
+					log::trace!("poll_fill: current batch empty");
 					// no more items in current batch, need to get next batch
 					let (metadata, batch) = match src.next() {
 						// no more batches
-						None => return Poll::Ready(()),
+						None => {
+							log::trace!("poll_fill: source depleted, exiting");
+							return Poll::Ready(());
+						}
 						Some(v) => v,
 					};
 					self.batch = Some(batch);
 					self.queue.push_back(BufferItem::Delimiter(metadata));
+					log::trace!(
+						"poll_fill: len={}/cap={} (delimiter)",
+						self.queue.len(),
+						self.queue.capacity()
+					);
 				}
 			}
 		}
+		log::trace!(
+			"poll_fill: len={}/cap={} (at capacity)",
+			self.queue.len(),
+			self.queue.capacity()
+		);
 		Poll::Pending
 	}
 
-	fn poll_next(&mut self, cx: &mut Context<'_>) -> Poll<Option<PipelineItem<M, Bytes>>> {
+	fn poll_front(&mut self, cx: &mut Context<'_>) -> Poll<PipelineItem<M, Bytes>> {
 		// we need to drive all futures in the queue in order to allow them to advance
 		for item in self.queue.iter_mut() {
 			// we don't care about the poll result, as drive is idempotent and we gather the true result later.
@@ -137,7 +164,7 @@ impl<'x, M: 'x + Unpin, IdT: AsRef<Id>, II: Iterator<Item = IdT>> Buffer<'x, M, 
 		if self.queue.front().map(|x| x.is_ready()).unwrap_or(false) {
 			let mut item = self.queue.pop_front().unwrap();
 			match Pin::new(&mut item).poll(cx) {
-				Poll::Ready(v) => Poll::Ready(Some(v)),
+				Poll::Ready(v) => Poll::Ready(v),
 				Poll::Pending => {
 					// this absolutely should not happen...
 					self.queue.push_front(item);
@@ -153,6 +180,16 @@ impl<'x, M: 'x + Unpin, IdT: AsRef<Id>, II: Iterator<Item = IdT>> Buffer<'x, M, 
 pub enum PipelineItem<M, D> {
 	Delimiter(M),
 	Data(io::Result<D>),
+}
+
+impl<M, D> fmt::Debug for PipelineItem<M, D> {
+	fn fmt<'f>(&self, f: &'f mut fmt::Formatter) -> fmt::Result {
+		match self {
+			Self::Delimiter(_) => f.write_str("PipelineItem::Delimiter(..)"),
+			Self::Data(Ok(_)) => f.write_str("PipelineItem::Data(Ok(..))"),
+			Self::Data(Err(e)) => write!(f, "PipelineItem::Data(Err({:?}))", e),
+		}
+	}
 }
 
 pub struct Pipeline<'x, O, M: 'x + Unpin, II, IO> {
@@ -193,14 +230,24 @@ impl<
 	fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
 		let this = self.as_mut().get_mut();
 		let _: Poll<_> = this.buffer.poll_fill(this.store, &mut this.src);
-		match this.buffer.poll_next(cx) {
-			Poll::Ready(v) => return Poll::Ready(v),
-			Poll::Pending => (),
-		}
+		let r = match this.buffer.poll_front(cx) {
+			Poll::Ready(v) => {
+				log::trace!("Pipeline: item ready: {:?}", v);
+				Some(Poll::Ready(Some(v)))
+			}
+			Poll::Pending => {
+				if this.buffer.queue.len() > 0 {
+					Some(Poll::Pending)
+				} else {
+					// if there is nothing in the buffer
+					None
+				}
+			}
+		};
 		match this.buffer.poll_fill(this.store, &mut this.src) {
-			Poll::Pending => Poll::Pending,
-			// = end of stream
-			Poll::Ready(()) => Poll::Ready(None),
+			Poll::Pending => r.unwrap_or(Poll::Pending),
+			// = end of stream, but only return that if we don't have an authoritative result from above'
+			Poll::Ready(()) => r.unwrap_or(Poll::Ready(None)),
 		}
 	}
 }
@@ -294,6 +341,7 @@ impl<'x, S: ObjectStore + Send + Sync + Clone + 'static, I: Iterator<Item = Id> 
 	ObjectStream<'x, S, I>
 {
 	pub fn open(store: &'x S, ids: I) -> Self {
+		log::trace!("ObjectStream opened");
 		Self {
 			inner: PipelineStream {
 				inner: Pipeline {
@@ -317,25 +365,32 @@ impl<'x, S: ObjectStore + Send + Sync + Clone + 'static, I: Iterator<Item = Id> 
 	fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
 		let mut this = self.project();
 		if !*this.ready {
+			log::trace!("ObjectStream not ready yet, polling first item");
 			let inner_proj = this.inner.as_mut().project();
 			match inner_proj.inner.poll_next(cx) {
 				Poll::Pending => return Poll::Pending,
 				Poll::Ready(None) => {
 					*inner_proj.state = StreamState::Completed;
 					*this.ready = true;
+					log::trace!("ObjectStream at EOF before readiness");
 					return Poll::Ready(None);
 				}
 				Poll::Ready(Some(PipelineItem::Delimiter(()))) => {
 					*inner_proj.state = StreamState::Running;
 					*this.ready = true;
+					log::trace!("ObjectStream received delimiter, marking as ready");
 				}
 				Poll::Ready(Some(PipelineItem::Data(v))) => {
 					*inner_proj.state = StreamState::Running;
+					log::trace!("ObjectStream received data as first thing, a bit odd, but returning and marking as ready");
+					*this.ready = true;
 					return Poll::Ready(Some(v));
 				}
 			}
 		}
 
-		this.inner.poll_next(cx)
+		let r = this.inner.poll_next(cx);
+		log::trace!("ObjectStream polled: {:?}", r);
+		r
 	}
 }

@@ -250,6 +250,7 @@ impl<S: ObjectStore + Send + Sync + Clone + 'static> Repository<S> {
 		&'x self,
 		ids: Vec<Id>,
 	) -> io::Result<StreamReader<'x, S, ObjectStream<'x, S, std::vec::IntoIter<Id>>>> {
+		log::trace!("opening stream for {}", ids.len());
 		Ok(StreamReader {
 			repo: self,
 			curr: None,
