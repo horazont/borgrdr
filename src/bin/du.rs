@@ -13,17 +13,15 @@ use std::cmp::Ordering;
 use std::collections::hash_map::Entry;
 use std::collections::{HashMap, HashSet};
 use std::env::args;
-use std::ffi::{OsStr, OsString};
+use std::ffi::OsStr;
 use std::fmt;
 use std::hash::{Hash, Hasher};
 use std::io;
 use std::io::Write;
 use std::ops::Deref;
+use std::os::unix::ffi::OsStrExt;
 use std::os::unix::io::AsRawFd;
-use std::os::unix::{ffi::OsStrExt, fs::symlink};
-use std::path::MAIN_SEPARATOR;
 use std::path::{Path, PathBuf};
-use std::pin::Pin;
 use std::rc::Rc;
 use std::sync::{atomic, atomic::AtomicBool, atomic::AtomicU64, Arc, Mutex, Weak};
 use std::time::Instant;
@@ -34,7 +32,8 @@ use chrono::{DateTime, NaiveDateTime, TimeZone, Utc};
 
 use cursive::align::HAlign;
 use cursive::direction::Orientation;
-use cursive::event::{Event, EventResult};
+use cursive::event::Event;
+#[allow(unused_imports)]
 use cursive::theme::{BaseColor, Color, PaletteColor};
 use cursive::traits::*;
 use cursive::views::{
@@ -77,7 +76,7 @@ fn hash_content(buf: &[u8]) -> ContentHash {
 
 #[derive(Debug)]
 enum FileData {
-	Regular { chunks: Vec<Chunk>, size: u64 },
+	Regular { chunks: Vec<Chunk> },
 	Symlink { target_path: Bytes },
 	Directory {},
 }
@@ -86,8 +85,8 @@ enum FileData {
 struct Times {
 	atime: Option<DateTime<Utc>>,
 	mtime: Option<DateTime<Utc>>,
-	ctime: Option<DateTime<Utc>>,
-	birthtime: Option<DateTime<Utc>>,
+	//ctime: Option<DateTime<Utc>>,
+	//birthtime: Option<DateTime<Utc>>,
 }
 
 impl Default for Times {
@@ -95,8 +94,6 @@ impl Default for Times {
 		Self {
 			atime: None,
 			mtime: None,
-			ctime: None,
-			birthtime: None,
 		}
 	}
 }
@@ -119,8 +116,6 @@ impl From<&ArchiveItem> for Times {
 		Self {
 			atime: other.atime().map(convert_ts),
 			mtime: other.mtime().map(convert_ts),
-			ctime: other.ctime().map(convert_ts),
-			birthtime: other.birthtime().map(convert_ts),
 		}
 	}
 }
@@ -271,7 +266,6 @@ impl TryFrom<ArchiveItem> for FileEntry {
 			// is regular
 			FileData::Regular {
 				chunks: other.chunks().into_iter().cloned().collect(),
-				size: other.size().unwrap_or(0),
 			}
 		} else {
 			// unsupported
@@ -305,15 +299,17 @@ async fn read_entries(
 ) -> anyhow::Result<Repository<RpcStoreClient>> {
 	let manifest = repo.manifest();
 	let narchives = manifest.archives().len();
-	cb_sink.send(Box::new(move |siv: &mut Cursive| {
-		siv.call_on_name("progress", |pb: &mut ProgressBar| {
-			ArchiveProgress::ReadingArchives {
-				done: 0,
-				total: narchives,
-			}
-			.apply_to(pb)
-		});
-	}));
+	cb_sink
+		.send(Box::new(move |siv: &mut Cursive| {
+			siv.call_on_name("progress", |pb: &mut ProgressBar| {
+				ArchiveProgress::ReadingArchives {
+					done: 0,
+					total: narchives,
+				}
+				.apply_to(pb)
+			});
+		}))
+		.expect("send to main thread");
 	let mut prepared_archives: Vec<(Id, borgrdr::structs::Archive)> = Vec::new();
 	for (k, v) in manifest.archives().iter() {
 		let archive = repo
@@ -362,23 +358,27 @@ async fn read_entries(
 			item_sink.send(item).await.unwrap();
 		}
 		i += 1;
-		cb_sink.send(Box::new(move |siv: &mut Cursive| {
-			siv.call_on_name("progress", |pb: &mut ProgressBar| {
-				ArchiveProgress::ReadingArchives {
-					done: i,
-					total: narchives,
-				}
-				.apply_to(pb)
-			});
-		}));
+		cb_sink
+			.send(Box::new(move |siv: &mut Cursive| {
+				siv.call_on_name("progress", |pb: &mut ProgressBar| {
+					ArchiveProgress::ReadingArchives {
+						done: i,
+						total: narchives,
+					}
+					.apply_to(pb)
+				});
+			}))
+			.expect("send to main thread");
 	}
 	drop(stream);
 
-	cb_sink.send(Box::new(move |siv: &mut Cursive| {
-		siv.call_on_name("progress", |pb: &mut ProgressBar| {
-			ArchiveProgress::Done.apply_to(pb)
-		});
-	}));
+	cb_sink
+		.send(Box::new(move |siv: &mut Cursive| {
+			siv.call_on_name("progress", |pb: &mut ProgressBar| {
+				ArchiveProgress::Done.apply_to(pb)
+			});
+		}))
+		.expect("send to main thread");
 	Ok(repo)
 }
 
@@ -516,6 +516,7 @@ struct FileMetadata {
 	permissions: u16,
 	owner: Entity,
 	group: Entity,
+	#[allow(dead_code)]
 	xattrs: Vec<(Vec<u8>, Option<Vec<u8>>)>,
 }
 
@@ -1054,8 +1055,6 @@ async fn hasher(
 	}
 }
 
-type GroupKey = Bytes;
-
 trait SizeEstimate: Sized {
 	fn content_size(&self) -> usize;
 
@@ -1116,6 +1115,7 @@ enum VersionItem {
 	VersionGroup {
 		group: Arc<MergedNodeVersionGroup>,
 	},
+	#[allow(dead_code)]
 	Version {
 		version: Version,
 		group: Arc<MergedNodeVersionGroup>,
@@ -1255,13 +1255,14 @@ async fn prepare(
 	cb_sink: cursive::CbSink,
 ) -> Result<
 	(
+		Box<dyn borgrdr::cliutil::Backend>,
 		Repository<RpcStoreClient>,
 		Arc<MergedNode>,
 		Arc<Mutex<ChunkSizeMap>>,
 	),
 	anyhow::Error,
 > {
-	let (mut backend, repo) = borgrdr::cliutil::open_url_str(&url)
+	let (backend, repo) = borgrdr::cliutil::open_url_str(&url)
 		.await
 		.with_context(|| format!("failed to open repository"))?;
 
@@ -1286,7 +1287,7 @@ async fn prepare(
 	hasher.await.unwrap();
 	let repo = reader.await.unwrap()?;
 
-	Ok((repo, merged, chunk_index))
+	Ok((backend, repo, merged, chunk_index))
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
@@ -1436,6 +1437,7 @@ impl Main {
 
 enum Step {
 	Create,
+	#[allow(dead_code)]
 	Write,
 	Times,
 	Permissions,
@@ -1757,19 +1759,21 @@ fn main() -> Result<(), anyhow::Error> {
 			let t0 = Instant::now();
 			let rt = tokio::runtime::Runtime::new().unwrap();
 			rt.block_on(async move {
-				let (repo, data, chunk_index) = match prepare(argv.remove(1), sender.clone()).await
-				{
-					Ok(v) => v,
-					Err(e) => {
-						let msg = format!("{:#}", e);
-						sender
-							.send(Box::new(|siv: &mut Cursive| {
-								siv.add_layer(Dialog::text(msg).button("Quit", |siv| siv.quit()))
-							}))
-							.unwrap();
-						return;
-					}
-				};
+				let (mut backend, repo, data, chunk_index) =
+					match prepare(argv.remove(1), sender.clone()).await {
+						Ok(v) => v,
+						Err(e) => {
+							let msg = format!("{:#}", e);
+							sender
+								.send(Box::new(|siv: &mut Cursive| {
+									siv.add_layer(
+										Dialog::text(msg).button("Quit", |siv| siv.quit()),
+									)
+								}))
+								.unwrap();
+							return;
+						}
+					};
 				std::thread::spawn(move || {
 					let total_chunk_count = {
 						let lock = chunk_index.lock().unwrap();
@@ -1780,58 +1784,67 @@ fn main() -> Result<(), anyhow::Error> {
 					let duration = t1.duration_since(t0);
 					{
 						let data = Arc::clone(&data);
-						sender.send(Box::new(move |siv: &mut Cursive| {
-							let item = siv
-								.call_on_name(
-									"contents",
-									|table: &mut TableView<Arc<MergedNode>, FileListColumn>| {
-										table.set_items(data.children.values().cloned().collect());
-										table.set_selected_row(0);
-										table
-											.borrow_item(table.item().unwrap_or(0))
-											.map(|x| Arc::clone(x))
-									},
-								)
-								.unwrap();
-							if let Some(item) = item {
-								siv.call_on_name(
-									"versions",
-									move |table: &mut TableView<VersionItem, VersionColumn>| {
-										fill_versions(table, &item);
-									},
-								);
-							}
-							siv.call_on_name("statusbar_text", |tv: &mut TextView| {
-								let seconds = duration.as_secs_f64();
-								let minutes = (seconds / 60.0).floor();
-								let seconds = seconds - minutes * 60.0;
-								tv.set_content(format!(
-									"Repository read in {:.0}min {:.2}s",
-									minutes, seconds
-								));
-							});
-							siv.pop_layer();
-							siv.set_fps(1);
-							siv.add_global_callback(Event::Refresh, |siv| {
-								siv.call_on_name("statusbar_progress", |pb: &mut ProgressBar| {
-									apply_finalisation_progress(pb);
+						sender
+							.send(Box::new(move |siv: &mut Cursive| {
+								let item = siv
+									.call_on_name(
+										"contents",
+										|table: &mut TableView<Arc<MergedNode>, FileListColumn>| {
+											table.set_items(
+												data.children.values().cloned().collect(),
+											);
+											table.set_selected_row(0);
+											table
+												.borrow_item(table.item().unwrap_or(0))
+												.map(|x| Arc::clone(x))
+										},
+									)
+									.unwrap();
+								if let Some(item) = item {
+									siv.call_on_name(
+										"versions",
+										move |table: &mut TableView<VersionItem, VersionColumn>| {
+											fill_versions(table, &item);
+										},
+									);
+								}
+								siv.call_on_name("statusbar_text", |tv: &mut TextView| {
+									let seconds = duration.as_secs_f64();
+									let minutes = (seconds / 60.0).floor();
+									let seconds = seconds - minutes * 60.0;
+									tv.set_content(format!(
+										"Repository read in {:.0}min {:.2}s",
+										minutes, seconds
+									));
 								});
-							});
-						}));
+								siv.pop_layer();
+								siv.set_fps(1);
+								siv.add_global_callback(Event::Refresh, |siv| {
+									siv.call_on_name(
+										"statusbar_progress",
+										|pb: &mut ProgressBar| {
+											apply_finalisation_progress(pb);
+										},
+									);
+								});
+							}))
+							.expect("send to main thread");
 					}
 					let total_chunks = data.global_chunk_map(total_chunk_count);
 					data.calculate_sizes_inner(&total_chunks, &chunk_index);
 					drop(total_chunks);
 					drop(chunk_index);
-					sender.send(Box::new(move |siv: &mut Cursive| {
-						siv.set_fps(0);
-						siv.clear_global_callbacks(Event::Refresh);
-						siv.call_on_name("statusbar_progress", |pb: &mut ProgressBar| {
-							// ensure this shows 100% when done :-)
-							pb.set_range(0, 1);
-							pb.set_value(1);
-						});
-					}));
+					sender
+						.send(Box::new(move |siv: &mut Cursive| {
+							siv.set_fps(0);
+							siv.clear_global_callbacks(Event::Refresh);
+							siv.call_on_name("statusbar_progress", |pb: &mut ProgressBar| {
+								// ensure this shows 100% when done :-)
+								pb.set_range(0, 1);
+								pb.set_value(1);
+							});
+						}))
+						.expect("send to main thread");
 				});
 				loop {
 					let item = match cmdrx.recv().await {
@@ -1851,6 +1864,8 @@ fn main() -> Result<(), anyhow::Error> {
 						}),
 					}
 				}
+				// dropping result, we cannot do anything about it anyway
+				let _: Result<_, _> = backend.wait_for_shutdown().await;
 			});
 			rt.shutdown_background();
 		});
@@ -1916,7 +1931,7 @@ fn main() -> Result<(), anyhow::Error> {
 			}
 		});
 	}
-	table.set_on_select(move |siv: &mut Cursive, row: usize, index: usize| {
+	table.set_on_select(move |siv: &mut Cursive, _row: usize, index: usize| {
 		let item = siv
 			.call_on_name(
 				"contents",
@@ -2112,7 +2127,7 @@ fn main() -> Result<(), anyhow::Error> {
 
 			// now we actually have to EXTRACT things *gasp*
 			let ch = siv.cb_sink().clone();
-			cmdtx.send(WorkerCommand::Extract {
+			match cmdtx.send(WorkerCommand::Extract {
 				dest_path: s.into(),
 				version: version.clone(),
 				subtree: Arc::clone(&subtree),
@@ -2150,14 +2165,25 @@ fn main() -> Result<(), anyhow::Error> {
 								);
 							}
 						}
-					}));
+					})).expect("send to main thread");
 				}),
-			});
+			}) {
+				Ok(_) => (),
+				Err(_) => {
+					siv.pop_layer();
+					siv.add_layer(
+						Dialog::new()
+							.title("Extraction failed")
+							.content(TextView::new("Failed to communicate with extraction worker task (crashed?)"))
+							.dismiss_button("Close"),
+					);
+				}
+			}
 		};
 
 		let try_extract =
 			move |siv: &mut Cursive, s: Rc<String>| {
-				let mut path: PathBuf = if s.starts_with("~/") {
+				let path: PathBuf = if s.starts_with("~/") {
 					match dirs::home_dir() {
 						Some(mut v) => {
 							v.push(&s[2..]);
@@ -2210,7 +2236,7 @@ fn main() -> Result<(), anyhow::Error> {
 						siv.add_layer(
 							Dialog::new()
 								.title("Error")
-								.content(TextView::new("Cannot access output path"))
+								.content(TextView::new(format!("Cannot access output path: {}", e)))
 								.dismiss_button("Ok"),
 						);
 					}
