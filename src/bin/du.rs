@@ -301,22 +301,40 @@ async fn read_entries(
 	let narchives = manifest.archives().len();
 	cb_sink
 		.send(Box::new(move |siv: &mut Cursive| {
-			siv.call_on_name("progress", |pb: &mut ProgressBar| {
-				ArchiveProgress::ReadingArchives {
-					done: 0,
-					total: narchives,
-				}
-				.apply_to(pb)
-			});
+			ArchiveProgress::ReadingArchiveMetadata {
+				done: 0,
+				total: narchives,
+				total_nfiles: Some(0),
+			}
+			.apply_to(siv)
 		}))
 		.expect("send to main thread");
 	let mut prepared_archives: Vec<(Id, borgrdr::structs::Archive)> = Vec::new();
-	for (k, v) in manifest.archives().iter() {
+	let mut total_nfiles = Some(0);
+	for (i, (k, v)) in manifest.archives().iter().enumerate() {
 		let archive = repo
 			.read_archive(v.id())
 			.await
 			.with_context(|| format!("while reading archive info for {:?}", k))?;
+		match archive.nfiles() {
+			Some(archive_nfiles) => {
+				total_nfiles.as_mut().map(|x| *x += archive_nfiles);
+			}
+			None => {
+				total_nfiles = None;
+			}
+		}
 		prepared_archives.push((*v.id(), archive));
+		cb_sink
+			.send(Box::new(move |siv: &mut Cursive| {
+				ArchiveProgress::ReadingArchiveMetadata {
+					done: i + 1,
+					total: narchives,
+					total_nfiles,
+				}
+				.apply_to(siv)
+			}))
+			.expect("send to main thread");
 	}
 
 	let mut stream = repo
@@ -327,7 +345,24 @@ async fn read_entries(
 		)
 		.await?;
 
+	let t0 = Instant::now();
+	cb_sink
+		.send(Box::new(move |siv: &mut Cursive| {
+			ArchiveProgress::ReadingArchives {
+				done: 0,
+				total: narchives,
+				nfiles: 0,
+				total_nfiles,
+				t0,
+				last_archive_done: None,
+			}
+			.apply_to(siv)
+		}))
+		.expect("send to main thread");
+	let mut nfiles: u64 = 0;
 	let mut i = 0;
+	let mut last_update = Instant::now();
+	let mut last_archive_done = None;
 	while let Some(id) = stream.next_segment() {
 		assert!(*id == prepared_archives[i].0);
 		let archive = &prepared_archives[i].1;
@@ -348,6 +383,7 @@ async fn read_entries(
 		while let Some(item) = stream.next().await {
 			let item = item
 				.with_context(|| format!("while reading item from archive {:?}", version.name))?;
+			nfiles += 1;
 			let item: FileEntry = match item.try_into() {
 				Ok(v) => v,
 				Err((e, item)) => {
@@ -356,17 +392,40 @@ async fn read_entries(
 				}
 			};
 			item_sink.send(item).await.unwrap();
+			if nfiles % 512 == 0 {
+				let now = Instant::now();
+				if now.duration_since(last_update).as_secs() >= 1 {
+					cb_sink
+						.send(Box::new(move |siv: &mut Cursive| {
+							ArchiveProgress::ReadingArchives {
+								done: i,
+								nfiles,
+								total: narchives,
+								total_nfiles,
+								t0,
+								last_archive_done,
+							}
+							.apply_to(siv)
+						}))
+						.expect("send to main thread");
+					last_update = now;
+				}
+			}
 		}
 		i += 1;
+		last_update = Instant::now();
+		last_archive_done = Some(last_update);
 		cb_sink
 			.send(Box::new(move |siv: &mut Cursive| {
-				siv.call_on_name("progress", |pb: &mut ProgressBar| {
-					ArchiveProgress::ReadingArchives {
-						done: i,
-						total: narchives,
-					}
-					.apply_to(pb)
-				});
+				ArchiveProgress::ReadingArchives {
+					done: i,
+					nfiles,
+					total: narchives,
+					total_nfiles,
+					t0,
+					last_archive_done,
+				}
+				.apply_to(siv)
 			}))
 			.expect("send to main thread");
 	}
@@ -374,9 +433,10 @@ async fn read_entries(
 
 	cb_sink
 		.send(Box::new(move |siv: &mut Cursive| {
-			siv.call_on_name("progress", |pb: &mut ProgressBar| {
-				ArchiveProgress::Done.apply_to(pb)
-			});
+			ArchiveProgress::Done {
+				total_files: nfiles,
+			}
+			.apply_to(siv)
 		}))
 		.expect("send to main thread");
 	Ok(repo)
@@ -1262,6 +1322,11 @@ async fn prepare(
 	),
 	anyhow::Error,
 > {
+	cb_sink
+		.send(Box::new(move |siv: &mut Cursive| {
+			ArchiveProgress::GettingManifest.apply_to(siv)
+		}))
+		.expect("send to main thread");
 	let (backend, repo) = borgrdr::cliutil::open_url_str(&url)
 		.await
 		.with_context(|| format!("failed to open repository"))?;
@@ -1378,39 +1443,146 @@ impl TableViewItem<FileListColumn> for Arc<MergedNode> {
 }
 
 enum ArchiveProgress {
-	Opening,
-	ReadingArchives { done: usize, total: usize },
-	Done,
+	GettingManifest,
+	ReadingArchiveMetadata {
+		done: usize,
+		total: usize,
+		total_nfiles: Option<u64>,
+	},
+	ReadingArchives {
+		done: usize,
+		total: usize,
+		nfiles: u64,
+		total_nfiles: Option<u64>,
+		t0: Instant,
+		last_archive_done: Option<Instant>,
+	},
+	Done {
+		total_files: u64,
+	},
 }
 
 impl ArchiveProgress {
-	fn apply_to(self, pb: &mut ProgressBar) {
+	fn apply_to(self, siv: &mut Cursive) {
 		match self {
-			Self::Opening => {
-				pb.set_label(|_, _| "opening...".to_string());
-				pb.set_range(0, 1);
-				pb.set_value(0);
-			}
-			Self::ReadingArchives { done, total } => {
-				pb.set_label(|value, (min, max)| {
-					format!(
-						"{:.0}%",
-						(value - min) as f64 / ((max - min).max(1) as f64) * 100.
-					)
+			Self::GettingManifest => {
+				siv.call_on_name("init_step", |tv: &mut TextView| {
+					tv.set_content("(1/3) Reading repo manifest...");
 				});
-				pb.set_range(0, total);
-				pb.set_value(done);
 			}
-			Self::Done => {
-				pb.set_range(0, 1);
-				pb.set_value(1);
+			Self::ReadingArchiveMetadata {
+				done,
+				total,
+				total_nfiles,
+			} => {
+				siv.call_on_name("init_step", |tv: &mut TextView| {
+					tv.set_content("(2/3) Reading archive metadata...");
+				});
+				siv.call_on_name("progress", |pb: &mut ProgressBar| {
+					pb.set_label(|value, (min, max)| {
+						format!(
+							"{:.0}%",
+							(value - min) as f64 / ((max - min).max(1) as f64) * 100.
+						)
+					});
+					pb.set_range(0, total);
+					pb.set_value(done);
+				});
+				siv.call_on_name("init_archives_read", |tv: &mut TextView| {
+					tv.set_content(format!("{}/{}", done, total));
+				});
+				siv.call_on_name("init_nfiles_read", |tv: &mut TextView| {
+					tv.set_content(match total_nfiles {
+						Some(v) => v.to_string(),
+						None => "(missing info)".to_string(),
+					});
+				});
+			}
+			Self::ReadingArchives {
+				done,
+				nfiles,
+				total,
+				total_nfiles,
+				t0,
+				last_archive_done,
+			} => {
+				siv.call_on_name("init_step", |tv: &mut TextView| {
+					tv.set_content("(3/3) Reading file metadata...");
+				});
+				siv.call_on_name("progress", |pb: &mut ProgressBar| {
+					pb.set_label(|value, (min, max)| {
+						format!(
+							"{:.0}%",
+							(value - min) as f64 / ((max - min).max(1) as f64) * 100.
+						)
+					});
+					match total_nfiles {
+						Some(total_nfiles) if nfiles <= total_nfiles => {
+							pb.set_range(0, safescale(total_nfiles, total_nfiles));
+							pb.set_value(safescale(nfiles, total_nfiles));
+						}
+						_ => {
+							pb.set_range(0, total);
+							pb.set_value(done);
+						}
+					}
+				});
+				siv.call_on_name("init_archives_read", |tv: &mut TextView| {
+					tv.set_content(format!("{}/{}", done, total));
+				});
+				siv.call_on_name("init_nfiles_read", |tv: &mut TextView| {
+					tv.set_content(nfiles.to_string());
+				});
+				let (curr, max, last_done, note) = match total_nfiles {
+					Some(total_nfiles) => (nfiles, total_nfiles, Some(Instant::now()), ""),
+					None => (
+						done as u64,
+						total as u64,
+						last_archive_done,
+						"(low accuracy) ",
+					),
+				};
+				if let Some(dt) = last_done
+					.and_then(|x| x.checked_duration_since(t0))
+					.map(|x| x.as_secs_f32())
+				{
+					if let Some(remaining) = max.checked_sub(curr) {
+						let rate = curr as f32 / dt;
+						if rate > 0.001 {
+							let mut time_remaining = remaining as f32 / rate;
+							let hours_remaining = (time_remaining / 3600.0).floor();
+							time_remaining -= hours_remaining * 3600.0;
+							let minutes_remaining = (time_remaining / 60.0).floor();
+							time_remaining -= minutes_remaining * 60.0;
+							let seconds_remaining = time_remaining.round();
+							siv.call_on_name("init_eta", |tv: &mut TextView| {
+								tv.set_content(format!(
+									"{} {}:{:>02}:{:>02}",
+									note, hours_remaining, minutes_remaining, seconds_remaining
+								));
+							});
+						} else {
+							siv.call_on_name("init_eta", |tv: &mut TextView| {
+								tv.set_content("stalled");
+							});
+						}
+					} else {
+						siv.call_on_name("init_eta", |tv: &mut TextView| {
+							tv.set_content("any second now");
+						});
+					}
+				}
+			}
+			Self::Done { total_files } => {
+				siv.call_on_name("progress", |pb: &mut ProgressBar| {
+					pb.set_range(0, 1);
+					pb.set_value(1);
+				});
+				siv.call_on_name("init_nfiles_read", |tv: &mut TextView| {
+					tv.set_content(total_files.to_string());
+				});
 			}
 		}
-	}
-
-	fn applied(self, mut pb: ProgressBar) -> ProgressBar {
-		self.apply_to(&mut pb);
-		pb
 	}
 }
 
@@ -2300,19 +2472,47 @@ fn main() -> Result<(), anyhow::Error> {
 
 	siv.add_layer(
 		Dialog::new()
-			.title("Loading")
+			.title("Reading archives")
 			.content(
 				LinearLayout::new(Orientation::Vertical)
+					.child(TextView::new("Opening...").with_name("init_step"))
 					.child(
-						TextView::new("Reading archives")
-							.with_name("progress_step")
-							.fixed_height(1),
-					)
-					.child(
-						ArchiveProgress::Opening
-							.applied(ProgressBar::new())
+						ProgressBar::new()
+							.min(0)
+							.max(1)
+							.with_label(|_, _| "opening...".to_string())
 							.with_name("progress")
 							.min_width(16),
+					)
+					.child(
+						LinearLayout::new(Orientation::Horizontal)
+							.child(
+								TextView::new("0")
+									.h_align(HAlign::Right)
+									.with_name("init_archives_read")
+									.min_width(30),
+							)
+							.child(TextView::new(" archives")),
+					)
+					.child(
+						LinearLayout::new(Orientation::Horizontal)
+							.child(
+								TextView::new("0")
+									.h_align(HAlign::Right)
+									.with_name("init_nfiles_read")
+									.min_width(30),
+							)
+							.child(TextView::new(" inodes")),
+					)
+					.child(
+						LinearLayout::new(Orientation::Horizontal)
+							.child(
+								TextView::new("(estimating)")
+									.h_align(HAlign::Right)
+									.with_name("init_eta")
+									.min_width(30),
+							)
+							.child(TextView::new(" ETC")),
 					),
 			)
 			.button("Cancel", |siv| {

@@ -180,6 +180,7 @@ pub struct Archive {
 	time_end: String,
 	comment: Option<String>,
 	chunker_params: Option<ChunkerParams>,
+	nfiles: Option<u64>,
 	pub(crate) items: Vec<Id>,
 }
 
@@ -222,6 +223,10 @@ impl Archive {
 
 	pub fn items(&self) -> &[Id] {
 		&self.items
+	}
+
+	pub fn nfiles(&self) -> Option<u64> {
+		self.nfiles
 	}
 }
 
